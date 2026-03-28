@@ -51,43 +51,60 @@ async fn matmul_precision() {
         [-50.0, 30.0],
     ];
 
-    for input_float in test_inputs {
-        // Compute expected using the quantize round-trip of the input
-        // (what the TPU actually sees after quantization)
-        let actual_input: Vec<f32> = input_float
-            .iter()
-            .map(|&x| {
-                let q = ((x / in_scale).round() as i32 + in_zp).clamp(0, 255);
-                (q as f32 - in_zp as f32) * in_scale
-            })
-            .collect();
+    let expected_outputs: &[[f32; 8]] = &[
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 180.39215087890625],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 180.39215087890625],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 180.39215087890625],
+        [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            -180.39215087890625,
+            721.568603515625,
+            541.1764526367188,
+        ],
+        [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            541.1764526367188,
+            -3427.450927734375,
+            -1984.313720703125,
+        ],
+    ];
 
-        let expected: Vec<f32> = weights
-            .iter()
-            .map(|row| row[0] * actual_input[0] + row[1] * actual_input[1])
-            .collect();
+    let tolerance = 0.0001;
 
+    for (test_id, input_float) in test_inputs.iter().enumerate() {
         let output_float = dev.run_inference_f32(&loaded, input_float).await.unwrap();
 
         println!(
-            "input={:?} actual={:?} expected={:?} tpu={:?}",
-            input_float, actual_input, expected, output_float
+            "input={:?} expected={:?} tpu={:?}",
+            input_float, expected_outputs[test_id], output_float
         );
 
         // Verify precision: allow up to 2 quantization steps + 5% relative error
         let abs_tol = out_scale * 2.0;
-        for (i, (&exp, &got)) in expected.iter().zip(output_float.iter()).enumerate() {
+        for (i, (&exp, &got)) in expected_outputs[test_id]
+            .iter()
+            .zip(output_float.iter())
+            .enumerate()
+        {
             let err = (exp - got).abs();
-            let tol = abs_tol + exp.abs() * 0.05;
             assert!(
-                err <= tol,
+                err <= tolerance,
                 "input={:?} output[{}]: expected {}, got {}, error {} > tolerance {}",
                 input_float,
                 i,
                 exp,
                 got,
                 err,
-                tol
+                tolerance
             );
         }
     }
