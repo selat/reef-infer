@@ -1,0 +1,38 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "reef-infer"
+version = "1.0.0"
+requires-python = ">=3.9"
+description = "Python bindings for the reef-infer Edge TPU runtime"
+license = {text = "MIT"}
+authors = [{name = "Ulad", email = "selatnick@gmail.com"}]
+readme = "README.md"
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Hardware",
+]
+
+[project.urls]
+Repository = "https://github.com/selatnick/reef-infer"
+Changelog = "https://github.com/selatnick/reef-infer/blob/main/CHANGELOG.md"
+
+[tool.maturin]
+# Pass this feature when building the Python extension so that PyO3 does not
+# try to link against libpython (required for cdylib .so files).
+features = ["extension-module"]
+
+[dependency-groups]
+dev = [
+    "tensorflow>=2.20.0",
+    "flatbuffers>=2.0",
+    "numpy",
+    "pillow",
+    "opencv-python",
+]

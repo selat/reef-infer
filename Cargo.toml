@@ -1,0 +1,34 @@
+[package]
+name = "reef-infer"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Pure-Rust runtime for the Google Coral Edge TPU USB Accelerator"
+license = "MIT"
+authors = ["Ulad <selatnick@gmail.com>"]
+repository = "https://github.com/selatnick/reef-infer"
+readme = "README.md"
+keywords = ["coral", "edge-tpu", "tflite", "inference", "usb"]
+categories = ["hardware-support", "science", "embedded"]
+
+[lib]
+name = "reef_infer"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Build PyO3 bindings only when explicitly requested.
+# Use `maturin develop --features extension-module` to build the Python module.
+python = ["dep:pyo3"]
+extension-module = ["python", "pyo3/extension-module"]
+usb = []
+
+[dependencies]
+nusb = {version = "0.2.3", features = ["tokio"]}
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+flatbuffers = "25"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+flexbuffers = "25.12.19"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+pyo3 = { version = "0.28", optional = true }

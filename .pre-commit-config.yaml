@@ -1,0 +1,45 @@
+repos:
+- repo: local
+  hooks:
+  - id: cargo-fmt
+    name: cargo fmt
+    entry: cargo fmt --check
+    language: system
+    types: [rust]
+    pass_filenames: false
+  - id: cargo-clippy
+    name: cargo clippy
+    entry: cargo clippy -- -D warnings
+    language: system
+    types: [rust]
+    pass_filenames: false
+  - id: cargo-check
+    name: cargo check
+    entry: cargo check
+    language: system
+    types: [rust]
+    pass_filenames: false
+  - id: cargo-doc
+    name: cargo doc
+    entry: cargo doc --no-deps
+    language: system
+    types: [rust]
+    pass_filenames: false
+  - id: gitleaks
+    name: gitleaks
+    entry: gitleaks git --pre-commit --staged --verbose
+    language: golang
+    pass_filenames: false
+    additional_dependencies: [github.com/zricethezav/gitleaks/v8@v8.30.0]
+  - id: ruff-format
+    name: Ruff format
+    entry: ruff format
+    language: python
+    types: [python]
+    additional_dependencies: [ruff==0.15.2]
+  - id: ruff-check
+    name: Ruff lint (auto-fix)
+    entry: ruff check --fix
+    language: python
+    types: [python]
+    additional_dependencies: [ruff==0.15.2]

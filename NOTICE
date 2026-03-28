@@ -1,0 +1,5 @@
+This product includes the following third-party components:
+  apex_latest_single_ep.bin (Google Coral Edge TPU firmware)
+    Source: https://github.com/google-coral/libedgetpu
+    Copyright 2019 Google LLC
+    License: Apache License 2.0 (https://www.apache.org/licenses/LICENSE-2.0)
