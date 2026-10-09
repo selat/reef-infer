@@ -89,6 +89,11 @@ read output) until an interrupt signals completion. The program itself emits
 these requests as host DMA descriptors (4 words: address lo, address hi,
 length, tag) pushed from scalar-core bundles.
 
+Output activations arrive in tile order; each output layer's `OutputLayout`
+(tile-id maps and per-tile offsets) says how to gather them into y-x-z order.
+The runner does this since 2026-10-10 (before, multi-tile outputs came back
+permuted).
+
 Known runner gaps (from `REVIEW.md`): pending transfers grow per call, input
 size is not validated, int8 outputs are read in the wrong domain by examples,
 multi-output order follows arrival, fixed round caps. The runner also sends
@@ -161,14 +166,18 @@ level is a signed increment, count - 1 and a 2-bit mode); a datapath block.
 
 ### 5.4 Numerics
 
-Verified by tinycoral on hardware:
+Verified on hardware (tinycoral; stage order and saturation by us,
+2026-10-10, bit-exact over all 256 inputs):
 
-- uint8 x uint8 -> int32, + bias, x f32 multiplier, round half to even,
-  clamp, + output zero point.
+- uint8 x uint8 -> int32 (weights minus a per-channel zero point), + bias,
+  x f32 multiplier, **clamp, then** round half to even, + output zero point,
+  saturate to uint8.
 - The multiplier is `in_scale * w_scale / out_scale`, computed as
-  `F(F(x) * F(1/s_out))` in float32. Float64 reproduces the compiler's
-  constants only ~60% of the time.
+  `F(F(in_scale * w_scale) * F(1/s_out))` in float32 (64/64 FC channels).
+  Float64 reproduces the compiler's constants only ~60% of the time.
 - Clamps are `[-out_zp, 255 - out_zp]`; fused RELU sets the minimum to 0.
+  For uint8 FC the compiler moves both one ulp toward zero (130.99998), which
+  is harmless because the clamp precedes rounding.
 - LOGISTIC is a fixed 8-segment quartic spline (identical in every program).
 - ADD/SUB weights are the best rational approximation of the scale ratio
   with terms <= 32767 (tinycoral for ADD; we confirmed the SUB encoding,
@@ -196,12 +205,20 @@ tinycoral's on all 17,901 instructions of the 54 original models.
 | `infeed.loop_en` | 13 | Loopback infeed; with constants `loop_k168` = 1, `loop_k308` = 3, `loop_k315` = 3 | Verified 92/92 |
 | `pop.buf_off` | 13-23 | Staging offset a parameter pop writes; the next parameter infeed reads the same `buf_off` | Verified 39/39; advance rule 34/37, wrap unclear |
 | `op.w_zp_hi` | 1862-1869 | In SUB ops, `w_zp \| w_zp_hi << 8` is a 16-bit weight: numerator of `Fraction(s_b / s_a).limit_denominator(32767)` | Verified 4/4 models |
-| `op.row_a`, `row_m`, `row_c` | 1886-1896, 1898-1899, 1910-1920 | 16.0 only, in FC/conv/depthwise ops. Values fit wide-memory rows (0-2047). `row_c = row_a` if `row_m = 1`, else `row_a - row_m` | Provisional (633/634) |
+| `op.row_a`, `row_c` | 1886-1896, 1910-1920 | 16.0 only, in FC/conv/depthwise ops: wide-memory row of the per-channel weight zero points. `row_c = row_a` if `row_m = 1`, else `row_a - row_m` | **Verified on hardware** (FC: moving the zero points works iff these follow) |
+| `op.row_m` | 1898-1899 | Unknown; 1 in FC | Provisional |
+| `op.cfg4` | 2093 | Add bias (0 in no-bias FC; `cfg4 = 0` equals the zero-bias result on hardware) | **Verified on hardware** |
 | `op.row_cfg` | 2094-2096 | 1 exactly when the row fields are used | Strong 1803/1805 |
 
 `row_a` is 2047 for small convs and drops by the input width (W = 48, 64),
 by `4k^2` for conv kernels k >= 6 and by `2k^2` for depthwise k >= 5. FC gives
 1-3. It does not equal the op's parameter or partial-sum base row.
+
+Bits that **hang the TPU when cleared** (2026-10-10): `wideToNarrow` bit 543
+(set with `skip_en0`), `narrowToWide.tail_lvl`, `wideToNarrow.tail_en870` in
+the FC input copy, and the caching `ringConsumer` bits 286-287 / 319. The FC
+parameter blob and stream rules are in `CODEGEN_RESEARCH.md` and
+`src/codegen/fc.rs`.
 
 ### 6.2 Program-level rules
 
@@ -237,6 +254,8 @@ missing bits are our leading explanation. **Untested on hardware.**
 
 - 16.0 FC ops use `cfg0 0x65`, `dp_mode 1` and set the row fields; 14.1 uses
   `cfg0 0xA5`, `dp_mode 3`, and none of its 3,400 FC ops set the row fields.
+- The 14.1 op bits on a 16.0 parameter blob give saturated garbage on
+  hardware, so the two forms also differ in parameter layout.
 - So tinycoral's FC generator (14.1-exact) does not reproduce our 16.0
   models; the difference is structural (an extra transfer stage, different
   padding). Both are Google's output, so both should run.
@@ -290,8 +309,8 @@ perturbation on the device.
 |---|---|
 | Decoder / encoder in Rust (`src/isa/`) | Done; all bitstreams round-trip |
 | Corpus tooling (`tools/isa_corpus/`, `examples/isa_check.rs`) | Done |
-| Port tinycoral's FC generator (~700 lines Python: program, weight blob, quant constants) | Not started; a few days |
-| End-to-end on device | Blocked on hardware being connected |
+| Generators in Rust (`src/codegen/`): element-wise requant (1x16x16x32), FC (K <= 64, N <= 64) | Done; byte-identical to 16.0 (FC parameters included), bit-exact on device |
+| FC beyond one pass / one tile, conv | Next |
 | Conv, then scheduler/allocator for multi-layer graphs | Weeks to months |
 | PyTorch front end (`torch.export`, int8) | After the above |
 
@@ -299,14 +318,13 @@ Our runner is compatible with generated programs: it is event-driven and
 tinycoral programs need no relocation. Generated programs can be handed to it
 as in-memory executables.
 
-**First hardware experiments, in order:**
+**Hardware experiments:**
 
-1. Run tinycoral-generated FC bytes through our runner.
+1. ~~Perturb `row_a` / `row_m` / `row_c`~~: done on FC (2026-10-10); conv not yet.
 2. Run a compiled depthwise model, then clear the loopback bits and rerun
    (does it reproduce tinycoral's stale-data failure?).
 3. Minimal loopback: tile 0 -> scalar memory -> all tiles -> host.
-4. Perturb `row_a` / `row_m` / `row_c` in a compiled conv and observe.
-5. Load custom spline coefficients and compare with a host model.
+4. Load custom spline coefficients and compare with a host model.
 
 The fastest end-to-end path for PyTorch today is PyTorch -> ONNX -> onnx2tf
 -> int8 TFLite -> `edgetpu_compiler` -> reef-infer. It depends on Google's
@@ -322,6 +340,17 @@ cargo run --example isa_check -- [--disasm] [--dump DIR] model_edgetpu.tflite...
 # Hardware-free round-trip and rule checks
 REEF_ISA_MODELS=~/projects/tpu:~/projects/pycoral-test:target/isa_corpus \
   cargo test --test isa_roundtrip
+
+# Generated programs on the TPU vs host reference and the compiler
+.venv/bin/python tools/isa_corpus/fc_ref.py   # FC weights for the parameter comparison
+cargo run --features usb --example codegen_hw
+cargo test --test codegen; cargo test --features usb --test codegen_hw
+
+# Perturbation experiments on hardware (filter by name substring)
+cargo run --features usb --example isa_probe [-- 'fc row']
+
+# Field diff of two compiled models
+cargo run --example isa_diff -- a_edgetpu.tflite b_edgetpu.tflite
 
 # Build the corpus with the 16.0 compiler
 EDGETPU_COMPILER=~/projects/tpu/edgetpu_compiler.sh .venv/bin/python tools/isa_corpus/gen.py

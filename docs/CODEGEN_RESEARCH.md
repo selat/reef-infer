@@ -279,3 +279,73 @@ ring, then back in to every tile.
 ops, 5 values), `wideToNarrow` bits 643-645 and 490-493, and single-instance
 bits in MobileNet programs. The rest likely needs targeted sweeps (multi-input
 elementwise, stride-2 depthwise, streamed weights) or perturbation on hardware.
+
+## First generated programs on hardware (2026-10-10)
+
+Coral USB Accelerator, compiler 16.0 corpus as reference. Code:
+`src/codegen/` (assembler, `elementwise`, `fc`), checks in
+`examples/codegen_hw.rs`, perturbations in `examples/isa_probe.rs`, tests in
+`tests/codegen.rs` (offline, byte equality when the corpus is present) and
+`tests/codegen_hw.rs` (on device).
+
+**Programs generated from Rust run correctly.** Every instruction is
+encoded from named fields by `codegen::Asm`; no compiler bytes are copied.
+
+| Program | vs compiler | On TPU vs host reference |
+|---|---|---|
+| Element-wise requant, 1x16x16x32 (RELU layout) | Byte-identical bitstream, relocations and output layout | 0 mismatches over 8192 values, 8 parameter sets including ones the compiler never emits (negative multiplier, nonzero `out_zp`, fractional clamps) |
+| FC, PARAMETER_CACHING + EXECUTION_ONLY | Byte-identical bitstreams **and parameter blob** for K = N = 64 uint8 | 0 mismatches for random int8 weights, K in {8, 16, 24, 32, 40, 56, 64}, N in {16, 32, 48, 64}, with and without RELU |
+
+**Runner bug found and fixed.** Output activations arrive in tile order. The
+DarwiNN `OutputLayer.layout` (`OutputLayout`: tile-id maps, per-tile byte
+offsets, local x/y offsets) tells the host how to gather them back into
+y-x-z order, as libedgetpu does. `model.rs` did not parse it and the runner
+returned raw tile order, so any output spread over several tiles came back
+permuted (for 16x16x32: 128 B blocks transposed 4x4 within each 2 KiB). The
+existing matmul test fits one tile and never showed it. `LayerInfo` now
+carries the dims and layout, and `run_inference` relayouts each output layer.
+
+**Numerics, verified bit-exactly:**
+
+- Output stage: `sat_u8(round_half_even(clamp((x - in_zp) * mult, lo, hi)) + out_zp)`.
+  The **clamp comes before rounding** (clamp_max 40.7 gives 41), which is
+  why the compiler emits bounds one ulp inside the integer (130.99998 for
+  131). Results above 255 or below 0 saturate.
+- Ties round to even (exact x.5 cases at multiplier 0.5).
+- FC per-channel multiplier is `F(F(s_in * s_w) * F(1 / s_out))`: 64/64
+  channels match the compiler, `s_in * s_w / s_out` only 40/64. FC ops
+  ignore `op.mult_bits` (setting it to 2.0 changes nothing).
+
+**FC parameter blob (16.0):** `[f32 mult x N][i32 bias x N][i32 weight
+zero point x N][uint8 weights, [K/4][N][4]]`. Weights are `W + 128` for int8
+`W`. Without bias the bias block is dropped. Small N is padded to 16
+channels. Parameter stream rules: units = N(12 + K)/64, `pop.rows_neg` =
+32768 - floor(units / 2), `pop.b183` = units even, `infeed.f438` = N/16 - 1.
+A one-unit (8 B) input transfer clears the pop/infeed loop fields (count,
+limits, strides, `k157` / `k203`); encoding it as a count of one hangs.
+
+**Fields decoded by perturbation:**
+
+| Field | Finding |
+|---|---|
+| `op.row_a` / `row_c` | Wide-memory row of the per-channel **weight zero-point vector**. Moving the zero points to row 1 works iff `row_a = row_c = 1`; zeroing them or pointing elsewhere gives wrong results. FC: row 2, or row 1 without bias (compiler agrees) |
+| Weight zero point | Per channel, arbitrary: storing channel `o` as `W + 60 + o` with zero point `60 + o` is exact |
+| `op.cfg4` | Bias enable: `cfg4 = 0` equals the zero-bias result exactly; the compiler's no-bias FC sets 0 |
+| `op.row_cfg` | Needed: clearing it alone gives wrong (saturated) output |
+
+**Bits that hang the TPU when cleared** (all were "unexplained" or defaults):
+`wideToNarrow` bit 543 (`rsv543`, set with `skip_en0`), `narrowToWide.tail_lvl`
+(1 in FC/RELU copies), `wideToNarrow.tail_en870` in the FC input copy (the
+RELU program emits 0 and runs with either), and the caching
+`ringConsumer` bits 286-287 / 319 (`rsv286` = header rows - 1 with bias 2,
+without 1). A hang is recoverable by reopening the device (chip re-init);
+no replug was needed.
+
+**14.1 FC form** (`cfg0 0xa5`, `dp_mode 3`, `reduce_mask 0b101`, no row
+fields) on the 16.0 parameter layout runs but gives saturated garbage, so the
+two forms differ in parameter layout too, not only in op bits.
+
+**Still open:** `row_m`; `scsync.thr5` in the epilogue (16 after 16
+outfeeds, 2 after one); the constant setup in the RELU program (mesh fills of
+one-hot words and a copy op); the caching `ringConsumer` aux fields beyond
+the rules above; K, N > 64 (multi-pass, multiple tiles).

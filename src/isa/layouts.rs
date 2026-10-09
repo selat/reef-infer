@@ -124,10 +124,11 @@ fn op() -> Layout {
         .u("w_zp_hi", 1862, 8)
         .u("in_zp", 1870, 8)
         // Compiler 16.0 only (never set by 14.1); nonzero in FC/conv/dwconv
-        // ops. Values fit a tile's 2048 wide-memory rows of 256 B and fall as
-        // kernel area and input width grow, so they look like wide-memory row
-        // bounds. Observed: row_c = row_a when row_m = 1, else row_a - row_m
-        // (633/634). Names and meaning are provisional.
+        // ops. row_a / row_c: the wide-memory row (256 B) holding the
+        // per-channel weight zero points (verified on hardware 2026-10-10:
+        // moving the zero points to another row works iff row_a / row_c
+        // follow; FC uses row 2, or row 1 without bias). Observed: row_c =
+        // row_a when row_m = 1, else row_a - row_m (633/634). row_m unknown.
         .u("row_a", 1886, 11)
         .u("row_m", 1898, 2)
         .u("row_c", 1910, 11)
@@ -135,11 +136,17 @@ fn op() -> Layout {
         .u("reduce_mask", 1926, 8)
         .u("out_ch_last", 1934, 6)
         .u("out_ch", 1940, 6)
+        // Output stage, verified on hardware (2026-10-10):
+        // sat_u8(round_half_even(clamp((x - in_zp) * mult, min, max)) + out_zp).
+        // The clamp precedes rounding. Per-channel FC ops ignore mult_bits
+        // and use the multipliers in the parameters.
         .u("mult_bits", 1949, 32)
         .u("clamp_max_bits", 1981, 32)
         .u("clamp_min_bits", 2013, 32)
         .s("offset", 2045, 32)
         .u("out_zp", 2077, 8)
+        // 1: add the per-channel bias (0 in FC models without bias; on
+        // hardware cfg4 = 0 gives exactly the zero-bias result).
         .u("cfg4", 2093, 1)
         // 1 exactly when row_a/row_m/row_c are used (1803/1805).
         .u("row_cfg", 2094, 3);
@@ -205,6 +212,8 @@ fn wide_to_narrow() -> Layout {
         .u("skip_end", 578, 16);
     f = dma_sync(f, 611, true)
         .u("tail_f867", 867, 1)
+        // Required in FC input DMAs (0 hangs the TPU); in the RELU program
+        // the compiler emits 0 and 1 works as well.
         .u("tail_en870", 870, 1)
         .u("tail_f871", 871, 1);
     Layout::new(
@@ -234,6 +243,7 @@ fn narrow_to_wide() -> Layout {
         .u("wide_rows", 491, 11);
     f = dma_sync(f, 543, false)
         .u("tail_f799", 799, 1)
+        // 0 instead of the compiler's 1 hangs the TPU (FC, both copies).
         .u("tail_lvl", 801, 2);
     Layout::new(
         "narrowToWide",
