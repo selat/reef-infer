@@ -3,3 +3,8 @@ This product includes the following third-party components:
     Source: https://github.com/google-coral/libedgetpu
     Copyright 2019 Google LLC
     License: Apache License 2.0 (https://www.apache.org/licenses/LICENSE-2.0)
+
+  src/isa/ instruction field layouts (ported from coral/isa/)
+    Source: https://github.com/FrederikRogalski/tinycoral
+    Copyright (c) 2026 Frederik Rogalski
+    License: MIT License (https://opensource.org/licenses/MIT)

@@ -1,0 +1,281 @@
+# Research notes: generating Edge TPU programs ourselves
+
+> The consolidated reference is [`EDGE_TPU.md`](EDGE_TPU.md). This file is
+> the dated research log behind it.
+
+Date: 2026-10-05. Goal: make reef-infer end-to-end, i.e. produce DarwiNN
+instruction bitstreams for the Coral Edge TPU without `edgetpu_compiler`.
+
+## Verdict
+
+Realistic, and already demonstrated by others. Two public projects have done
+most of the reverse engineering; one of them generates programs from scratch
+and runs a whole transformer on the USB accelerator. We would build on their
+findings rather than start from zero.
+
+## Prior art
+
+| Project | License | What it provides |
+|---|---|---|
+| [tinycoral](https://github.com/FrederikRogalski/tinycoral) | MIT | Decoded ISA with field layouts, encoders/decoders and builders for every instruction it emits; a code generator; a tinygrad backend; USB driver. Generated programs are byte-identical to `edgetpu_compiler` output where an equivalent exists. Emits FULLY_CONNECTED, CONV_2D, SOFTMAX, L2_NORMALIZATION, SUM/MEAN; chains of VALID stride-1 convs (odd kernels up to 5x5), 2x2 max pools, final linear layer. Runs all 6 layers of TinyStories-15M on-chip (1,815 tok/s at batch 256; 176.7 tok/s single token). Docs: `docs/ARCHITECTURE.md`, `docs/isa/*.md`, `NOTES.md`, `STORY.md`. |
+| [libredgetpu](https://github.com/ricardodeazambuja/libredgetpu) | Apache 2.0 | Pure-Python driver. Does **not** generate instructions; patches weights into `edgetpu_compiler`-produced templates. `docs/HARDWARE_ANALYSIS.md` (~1400 lines) covers registers, DarwiNN executable format, SRAM limits (largest cached square matrix ~2896x2896), DMA/USB protocol, patent cross-references. |
+| [edgetpuxray](https://github.com/geohot/edgetpuxray) | (check repo) | Earlier decompiler / register-map work both projects built on. |
+| [libedgetpu](https://github.com/google-coral/libedgetpu) | Apache 2.0 | `executable.fbs` (what we already parse), CSR offsets, register bitfield headers, driver sequencing. Our `chip.rs` run-control registers (infeed, outfeed, avDataPop, parameterPop, ring bus, mesh bus) are the DMA-unit names from the patents. |
+
+Google patents describing the architecture:
+
+- [US9836691B1](https://patents.google.com/patent/US9836691B1/de) and
+  [US20180197068A1](https://patents.google.com/patent/US20180197068A1/en),
+  "Neural network instruction set architecture": TensorOp and DMAOp
+  instructions, narrow/wide memory, ring bus, mesh bus, tile instruction
+  buffers (mesh inbound/outbound, narrow-wide DMA, wide-narrow DMA, ring-bus
+  DMA).
+- [US20200005128A1](https://patents.google.com/patent/US20200005128A1/en),
+  "Neural network accelerator with parameters resident on chip": the
+  mechanism behind the PARAMETER_CACHING executable we already drive.
+- libredgetpu also cites US20190050717A1, GB2558980A, US20210373895A1.
+
+## Architecture facts (from tinycoral docs unless noted)
+
+- **Not RISC-V.** The core is a custom design, internally "DarwiNN". The only
+  conventional CPU on the chip is an **8051** microcontroller running the USB
+  firmware we upload over DFU (`apex_latest_single_ep.bin`); `chip.rs` sets
+  its clock bit. The RISC-V rumour most likely comes from libredgetpu
+  advertising RISC-V *host* support, or from Sophgo SoCs that pair a TPU with
+  RISC-V cores.
+- **Instruction words:** 128-bit; variable-length instructions of 1-17 words;
+  opcode in bits 6-11 of the first word. Matches the 16-byte words
+  `src/parser.rs` already decodes.
+- **Scalar core:** 32 registers, 8 predicates; ALU ops (ADD ... MOV with an
+  immediate form); runs the program and issues DMAs.
+- **Tiles:** 4x4 grid (16 PEs). Per tile: 192 KiB narrow memory
+  (activations), 512 KiB wide memory (weights) -> 8 MiB weight storage total.
+  Peak 4 TOPS int8 at ~500 MHz (libredgetpu: 64x64 systolic array at
+  480 MHz).
+- **Sync:** 19 sync counters per tile (AVDATA, PARAMETERS, MESH_IN/OUT,
+  RING_*); a sync instruction waits until a counter reaches a value; every
+  tile-dispatched instruction carries a sequence number.
+- **Interconnect / DMA:** ring bus (scalar -> tiles), mesh bus (N/E/S/W
+  neighbours); DMA units infeed, outfeed, avDataPop, parameterPop.
+- **Requantization pipeline:** uint8 x uint8 -> int32, add bias, scale by a
+  float32 multiplier, round half-to-even (found empirically), clamp, add zero
+  point.
+- **Still unknown publicly:** RTL, exact systolic organisation inside a tile,
+  complete DMA descriptor format.
+- **No signing or checksum** on bitstreams: any program the host sends runs.
+  Bad programs stall the chip; recovery is re-init or replug.
+
+## How it was reverse engineered
+
+Differential analysis of `edgetpu_compiler` output: build many small models
+varying one parameter at a time, diff the bitstreams, infer fields; use
+byte-identical reproduction as the development oracle and the hardware as the
+final oracle. Disassembling the compiler binary was not needed by the prior
+projects; if considered, check the Coral software licence terms first.
+
+## Proposed plan for reef-infer
+
+1. **Decoder.** Replace `src/parser.rs` (magic-number heuristics) with a full
+   decoder ported from tinycoral's field layouts (MIT, licence-compatible).
+   Validate by round-tripping every compiler-produced bitstream we have
+   (`tests/models/*_edgetpu.tflite`) and asserting decode -> encode is
+   byte-identical.
+   *Done 2026-10-08:* `src/isa/` decodes and encodes all 23 opcodes seen in
+   86 bitstreams from 53 compiled models (17,942 instructions). Every
+   bitstream round-trips byte for byte, and the decoded fields match
+   tinycoral's Python decoder on all 17,901 instructions it covers. Run
+   `cargo run --example isa_check -- <models>` for coverage and unexplained
+   bits. Largest unexplained region: TensorOp bits 1878-1922 (set in ~40% of
+   ops, 21 distinct values).
+2. **Encoder + builders.** Emit single-op programs (FULLY_CONNECTED first,
+   then CONV_2D) and verify byte-identical output against `edgetpu_compiler`
+   on generated models. Keep the compiler as a test oracle in CI-less local
+   tests, cached like tinycoral's `.compile/`.
+3. **Scheduler / allocator (the hard part).** Tile memory allocation, DMA
+   chunking, sync-counter sequencing for multi-layer graphs. We do not need
+   to match the compiler's choices, only produce valid programs.
+4. **Front end.** Lower TFLite ops (or a small internal graph IR) to the
+   builders. Produce the same `Package`/`Executable` FlatBuffers so the
+   existing runner needs no changes.
+
+## Effort estimate
+
+- Dense + conv + pool chains with tinycoral as reference: weeks to a few
+  months.
+- MobileNet-class coverage (depthwise conv, residual adds, quantization
+  corner cases): many months.
+
+## Open questions
+
+- Licence of edgetpuxray (verify before borrowing code).
+
+Answered 2026-10-08 from tinycoral's README and `NOTES.md`:
+
+- **Parameter caching:** tinycoral emits stand-alone programs and keeps every
+  weight matrix resident by placing weights itself. It does not generate
+  PARAMETER_CACHING executables. Wide buffers are clobbered on every call, so
+  it tracks a per-tile address floor across programs.
+- **Multi-tile:** its placer shifts compute tiles to `[s, s+T)` while the
+  input gather stays on tile 0, a layout `edgetpu_compiler` never emits. So
+  multi-tile placement works for FC; conv is less clear.
+- **Google at runtime:** none. `edgetpu_compiler` is only an offline
+  byte-for-byte oracle during development.
+- **Known generator limits:** 1x1 conv only up to 256 positions x 3840 bytes;
+  output groups under 64 read wrong weights at >= 256 KiB (pad to 64).
+- **Status:** Python, MIT, a handful of commits, single developer. Treat it as
+  a reference, not a dependency.
+
+## Removing Google entirely
+
+| Piece | Status | Removable? |
+|---|---|---|
+| `edgetpu_compiler` | Not used at runtime | Yes, this is the codegen project. Golden bitstreams can be captured once and vendored as test fixtures. |
+| TFLite / TensorFlow | Model input format and dev dependency for test models | Yes, with a PyTorch (`torch.export`) front end. |
+| DarwiNN `executable.fbs` | Container the runner parses | Optional. It is only a schema (Apache 2.0); the runner could take an internal program struct instead. |
+| `apex_latest_single_ep.bin` | 8051 USB firmware uploaded over DFU | Not realistically. No source exists; replacing it means writing 8051 firmware for undocumented hardware. It is Apache 2.0 and redistributable, so vendoring it is a licence formality, not a runtime dependency. |
+
+## Instruction set and supported operations (from tinycoral `docs/isa/*.md`)
+
+Two-level ISA: a scalar core runs the program and moves data; 16 tiles do the
+arithmetic. Opcode is bits 6-11 of the first 128-bit word. All figures are
+verified by byte-exact round-trip against compiler output in tinycoral.
+
+### Scalar core
+
+| Opcode | Mnemonic | Words | Role |
+|---|---|---|---|
+| 0x3e | start | 1 | Program header |
+| 0x21 | halt | 1 | Terminator (tail is always `halt; nop x4; end`) |
+| 0x3f | end | 1 | Final marker |
+| 0x1a | sync | 1 | Tile fence/barrier; 12 known variants |
+| 0x24 | scsync | 2 | Scalar fence; 10 known variants |
+| 0x25 | pop | 2 | Host DMA -> staging buffer (activation stream, 8 B units, 128 KiB; parameter stream, 64 B units, 128 KiB) |
+| 0x26 | infeed | 4 | Staging -> tiles over ring bus, destination tile bitmap |
+| 0x27 | outfeed | 2 | Ring -> host (4-word descriptor: addr lo/hi, length, tag 1=input 2=param 3=output 4-7=interrupt) or ring -> scalar memory |
+| 0x20 | ALU | 1 | ADD ... MOV (immediate form); 32 registers, 8 predicates |
+
+Sync: 19 tile counters (AVDATA, PARAMETERS, PARTIAL_SUMS, MESH_{N,E,S,W}_{IN,OUT},
+WIDE_TO_NARROW, WIDE_TO_SCALING, NARROW_TO_WIDE, RING_READ_{A,B}, RING_WRITE,
+RING_PRODUCER_{A,B}); 9 scalar counters. Every tile-dispatched instruction
+carries a global sequence number (bits 46-59 / [28,43) depending on class).
+
+### Tile data movement (each carries its own loop nest: (increment, count) per level)
+
+| Opcode | Mnemonic | Words | Role |
+|---|---|---|---|
+| 0x13 | narrowToWide | 7 | Narrow mem (4 B units) -> wide mem / ring FIFO (64 B units); 6-level narrow + 4-level wide TTU |
+| 0x14 | wideToNarrow | 7 | Wide mem / ring FIFO -> narrow mem; modes: ring, sub-row select, bias/scaling |
+| 0x10 | ringProducer | 4 | Multicast to 17-bit bitmap (bit t = tile t, bit 16 = scalar core/outfeed) |
+| 0x11 / 0x12 | ringBusConsumer0/1 | 4 | Receive ring data |
+| 0x15 / 0x16 / 0x17 / 0x18 | mesh S / W / N / E | 6 | To 4-neighbour tile in row-major 4x4 grid (t+4, t-1, t-4, t+1) |
+| 0x19 | LUT load | 13 | 40 f32 coefficients + 7 breakpoints for LOGISTIC (8-segment quartic) |
+
+### Tile compute
+
+- **0x01 TensorOp**, 17 words (2176 bits): header; 8 main loop counters;
+  four 8-deep tensor traversal units (input read, output write, parameter
+  read, partial-sum read; each level = signed inc, count-1, 2-bit mode);
+  datapath block (flags, sync slots, zero points w_zp/in_zp/out_zp, reduce
+  mask, channel count, f32 multiplier, f32 clamp min/max).
+- Narrow memory: 4-byte-aligned base, increments in 32-bit words. Wide
+  memory: base in 64 B units, increments in 256 B rows, one row = 256 MACs
+  per tile per step.
+- Operation selected by `dp_mode` + `reduce_mask`:
+
+| Operation | dp_mode | reduce_mask |
+|---|---|---|
+| Fully connected (64 outputs per pass, bias row in weights) | 3 | 0b101 |
+| RELU / RELU6 / RELU_N1_TO_1 / QUANTIZE / ABS (requantize) | 1 | 0 |
+| Copy / reformat pass before conv | 4 | 0 |
+| Conv 3x3, split-K 1x1 (weight FIFO, K-chunked) | 4 | 0b1011 |
+| Depthwise conv (per-channel weights) | 3 | 0b11 |
+| Average pooling | 4 | 0b11 |
+| ADD / SUB / MAX / MIN / MUL | 5 | 0b11 |
+
+- **0x02 MAX_POOL_2D**: separate opcode, pooling window laid out in wide memory.
+- ADD uses a 16-bit mode with rational weight approximation; MUL is a two-step
+  multiply then pack with operand B streamed through a 1-4 row FIFO.
+- Output stage (fixed): uint8 x uint8 -> int32, + bias, x f32 multiplier
+  (`in_scale * w_scale / out_scale` computed as `F(F(x) * F(1/s_out))` in
+  float32), round half-to-even, clamp (`255 - out_zp` / `-out_zp`, RELU sets
+  min to 0), + out_zp. Float64 reproduces the compiler's constants only ~60%
+  of the time.
+
+### What this means for an op set
+
+Everything in the public Edge TPU op list reduces to: dense, conv, depthwise,
+pooling, elementwise arithmetic, a few activations, and reshapes expressed as
+DMA loop nests. No general scalar math, no float path, tiles talk only to
+neighbours or over the ring. Softmax, L2 norm and attention in tinycoral are
+compositions of these with the host doing the rest.
+
+Remaining public unknowns: per-dimension TTU mode bits, exact sync counter
+semantics (set vs wait, `sync_val` values), wide address space range, some
+header bits (`sync.b43`, `halt.code`, `end.length`).
+
+## Compiler 16.0 corpus findings (2026-10-08)
+
+Corpus: `tools/isa_corpus/gen.py` builds 158 single-op models (FC, conv,
+depthwise, elementwise, pooling, activations, misc), each varying one
+parameter around a base config, and compiles them with edgetpu_compiler
+16.0.384591198 (156 compile; reshape and nearest resize fail). Analysis:
+`tools/isa_corpus/analyze.py` over an `isa_check --dump`. Together with the
+54 earlier models: 359 bitstreams from 210 models, all round-tripping.
+
+**Compiler 16.0 emits a different FC op than 14.1.** 16.0 FC ops use
+`cfg0 = 0x65`, `dp_mode = 1`; tinycoral's 14.1 table uses `cfg0 = 0xA5`,
+`dp_mode = 3`. This is why tinycoral's FC generator does not reproduce our
+16.0-compiled models. Both forms come from Google's compiler, so both should
+be valid on hardware, but our models cannot serve as byte-exact references
+for a 14.1-style generator.
+
+**Decoded:**
+
+| Field | Bits | Rule | Evidence |
+|---|---|---|---|
+| `wideToNarrow.tail_words` (signed) | 526-541 | `n_lim0 + 1 - (head_words_m1 + 1)` with a head, else 0. tinycoral's `head_tail16` is bits 4-7 of it | 1375/1375, asserted in `tests/isa_roundtrip.rs` |
+| `op.row_a`, `op.row_m`, `op.row_c` (provisional) | 1886-1896, 1898-1899, 1910-1920 | 16.0 only; nonzero exactly in FC/conv/dwconv ops. `row_c = row_a` if `row_m = 1`, else `row_a - row_m` | 633/634 |
+
+`row_a` behaves like a wide-memory row bound (a tile has 2048 rows of 256 B):
+2047 for small convs, minus the input width for W = 48/64, minus `4*k^2` for
+conv k >= 6 and `2*k^2` for depthwise k >= 5; FC gives 1-3. It does not equal
+the op's `par_base` or `psum_base` row. Meaning unconfirmed; needs a hardware
+experiment (perturb it and observe).
+
+Second pass (same day), with program-level rules checked in
+`tests/isa_roundtrip.rs::check_program`:
+
+| Field | Bits | Rule | Evidence |
+|---|---|---|---|
+| `outfeed.loop_en`, `loop_row`, `loop_cfg` | 214, 188-198, 178-187 | Loopback outfeed: rows go to an on-chip ring of rows 1024..2047 instead of the host. First use is row 2046; each one advances `loop_row` by `d1_limit + 1`, wrapping to 1024. `loop_cfg` is 17 in 90/92 | ring rule 64/66 |
+| `infeed.loop_en` (+ constants `loop_k168` = 1, `loop_k308` = 3, `loop_k315` = 3) | 13, 168, 308-309, 315-316 | The infeed that reads a loopback outfeed's rows back into all tiles: issued before it, same d0/d1/d2 limits | 92/92 pairs |
+| `pop.buf_off` | 13-23 | Staging-buffer offset a parameter pop writes to; the next parameter infeed's `buf_off` equals it. Usually advances by `count_m1 + 1`, but the wrap is not understood (two misses differ by exactly 1024) | 39/39 pairs; advance 34/37 |
+| `op.w_zp_hi` | 1862-1869 | In SUB ops, `w_zp \| w_zp_hi << 8` is a 16-bit operand weight: the numerator of `Fraction(s_b/s_a).limit_denominator(32767)` | 4/4 models |
+| `op.row_cfg` | 2094-2096 | 1 exactly when `row_a`/`row_m`/`row_c` are used | 1803/1805 |
+
+The loopback path matters for code generation. It is how 16.0 moves data
+between tiles in depthwise and MobileNet programs: out of the tiles onto the
+ring, then back in to every tile.
+
+**Correlations, not yet decoded:**
+
+- `narrowToWide` bits 589-756: four extra sync-like records at 589 + 42k.
+  Each has a 5-bit id at +4 (20 or 4; 24 in one MobileNet op), a 2-bit level
+  at +9, a 19-bit value at +13 (2048 or 4095) and bit +40 set. Seen in binary
+  elementwise and MobileNet programs, with near-constant values.
+- `mesh` bits 249-254 / 454-459: the same offset (249) in each half as
+  `ringConsumer.gstride`. Values 34/50 for 3-level moves and 5/9 for 2-level
+  moves; maybe 2 bits per level. No relation to the instruction's own fields.
+- `op` bit 1525: set in 152 of the 157 copy-class ops (`dp_mode` 0, `cfg0` 0).
+- `infeed` bits 353-368 and 391: SSDLite streamed-parameter infeeds only. The
+  low 6 bits are always 0x25; the upper bits grow through the program.
+
+- `wideToNarrow` bit 543 equals `skip_en0` in 1374/1375 instances.
+- `ringConsumer` bits 286-287 and 319 accompany `aux_en0` / `aux_en1` (the
+  caching relocation records) in the corpus, but only ~70-90% of the time in
+  MobileNet/SSD programs.
+
+**Still open:** the correlations above, `op` bits 1946-1948 (activation
+ops, 5 values), `wideToNarrow` bits 643-645 and 490-493, and single-instance
+bits in MobileNet programs. The rest likely needs targeted sweeps (multi-input
+elementwise, stride-2 depthwise, streamed weights) or perturbation on hardware.

@@ -1,6 +1,7 @@
 pub mod chip;
 #[allow(warnings)]
 pub mod executable_generated;
+pub mod isa;
 pub mod model;
 pub mod parser;
 pub mod runner;

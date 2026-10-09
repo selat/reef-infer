@@ -221,7 +221,46 @@ pub fn load_tflite_model(path: &str) -> Result<TfliteModel, Box<dyn std::error::
     }
     let operator = subgraph.operators().unwrap().get(0);
     let custom_options: &[u8] = operator.custom_options().map(|v| v.bytes()).unwrap_or(&[]);
+    let executables = parse_custom_options(custom_options)?;
 
+    tracing::debug!("loaded {}: {} executable(s)", path, executables.len());
+    for (i, e) in executables.iter().enumerate() {
+        tracing::debug!(
+            "  [{}] type={:?}  chunks={}  params={}B  in={} out={}",
+            i,
+            e.exec_type,
+            e.instruction_chunks.len(),
+            e.parameters.len(),
+            e.input_layers.len(),
+            e.output_layers.len(),
+        );
+        for l in &e.input_layers {
+            tracing::debug!(
+                "      input  {:?}  {}B  zp={}  dq={}",
+                l.name,
+                l.size_bytes,
+                l.zero_point,
+                l.dequantization_factor
+            );
+        }
+        for l in &e.output_layers {
+            tracing::debug!(
+                "      output {:?}  {}B  zp={}  dq={}",
+                l.name,
+                l.size_bytes,
+                l.zero_point,
+                l.dequantization_factor
+            );
+        }
+    }
+
+    Ok(TfliteModel { executables })
+}
+
+/// Parses an `edgetpu-custom-op`'s `custom_options` into its executables.
+fn parse_custom_options(
+    custom_options: &[u8],
+) -> Result<Vec<ExecInfo>, Box<dyn std::error::Error>> {
     // custom_options is a FlexBuffer map (libedgetpu/tflite/custom_op_data.h).
     // Key "4" holds the serialized DarwiNN Package FlatBuffer as a byte string.
     let flex_root = flexbuffers::Reader::get_root(BinaryBuffer(custom_options))
@@ -257,36 +296,33 @@ pub fn load_tflite_model(path: &str) -> Result<TfliteModel, Box<dyn std::error::
         executables.push(parse_executable(exec));
     }
 
-    tracing::debug!("loaded {}: {} executable(s)", path, executables.len());
-    for (i, e) in executables.iter().enumerate() {
-        tracing::debug!(
-            "  [{}] type={:?}  chunks={}  params={}B  in={} out={}",
-            i,
-            e.exec_type,
-            e.instruction_chunks.len(),
-            e.parameters.len(),
-            e.input_layers.len(),
-            e.output_layers.len(),
-        );
-        for l in &e.input_layers {
-            tracing::debug!(
-                "      input  {:?}  {}B  zp={}  dq={}",
-                l.name,
-                l.size_bytes,
-                l.zero_point,
-                l.dequantization_factor
-            );
-        }
-        for l in &e.output_layers {
-            tracing::debug!(
-                "      output {:?}  {}B  zp={}  dq={}",
-                l.name,
-                l.size_bytes,
-                l.zero_point,
-                l.dequantization_factor
-            );
+    Ok(executables)
+}
+
+/// Returns the executables of every `edgetpu-custom-op` operator in a model,
+/// one entry per operator. Unlike [`load_tflite_model`], this accepts models
+/// that also contain CPU operators (e.g. SSD post-processing). Useful for
+/// inspecting instruction bitstreams; the runner still needs a single-op model.
+pub fn load_edgetpu_ops(path: &str) -> Result<Vec<TfliteModel>, Box<dyn std::error::Error>> {
+    let tflite_buf = std::fs::read(path)?;
+    let model = root_as_model(&tflite_buf)?;
+    let codes = model
+        .operator_codes()
+        .ok_or("model has no operator codes")?;
+    let mut out = Vec::new();
+    for subgraph in model.subgraphs().into_iter().flatten() {
+        for op in subgraph.operators().into_iter().flatten() {
+            let idx = op.opcode_index() as usize;
+            if idx < codes.len() && codes.get(idx).custom_code() == Some("edgetpu-custom-op") {
+                let opts: &[u8] = op.custom_options().map(|v| v.bytes()).unwrap_or(&[]);
+                out.push(TfliteModel {
+                    executables: parse_custom_options(opts)?,
+                });
+            }
         }
     }
-
-    Ok(TfliteModel { executables })
+    if out.is_empty() {
+        return Err("model contains no edgetpu-custom-op operator".into());
+    }
+    Ok(out)
 }
