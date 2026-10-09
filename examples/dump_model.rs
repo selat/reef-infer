@@ -38,7 +38,10 @@ fn dump_model(path: &str) {
 
         // List every field offset across all chunks.
         for (ci, chunk) in exec.instruction_chunks.iter().enumerate() {
-            println!("     chunk [{ci}] field_offsets: {}", chunk.field_offsets.len());
+            println!(
+                "     chunk [{ci}] field_offsets: {}",
+                chunk.field_offsets.len()
+            );
             for fo in &chunk.field_offsets {
                 println!(
                     "       bit={:7}  {:?}  {:?}  name={:?}",
@@ -69,29 +72,35 @@ fn dump_model(path: &str) {
     if let Ok(tfl) = root_as_model(&raw) {
         if let Some(subgraphs) = tfl.subgraphs() {
             let sg = subgraphs.get(0);
-            println!("\n  TFLite tensors ({} total):", sg.tensors().map(|t| t.len()).unwrap_or(0));
+            println!(
+                "\n  TFLite tensors ({} total):",
+                sg.tensors().map(|t| t.len()).unwrap_or(0)
+            );
             if let Some(tensors) = sg.tensors() {
                 for i in 0..tensors.len() {
                     let t = tensors.get(i);
-                    let name  = t.name().unwrap_or("?");
-                    let shape: Vec<i32> = t.shape()
+                    let name = t.name().unwrap_or("?");
+                    let shape: Vec<i32> = t
+                        .shape()
                         .map(|s| (0..s.len()).map(|j| s.get(j)).collect())
                         .unwrap_or_default();
                     let dtype = match t.type_() {
-                        TensorType::FLOAT32  => "f32",
-                        TensorType::FLOAT16  => "f16",
-                        TensorType::INT32    => "i32",
-                        TensorType::UINT8    => "u8",
-                        TensorType::INT64    => "i64",
-                        TensorType::INT64    => "i64",
-                        _                    => "?",
+                        TensorType::FLOAT32 => "f32",
+                        TensorType::FLOAT16 => "f16",
+                        TensorType::INT32 => "i32",
+                        TensorType::UINT8 => "u8",
+                        TensorType::INT64 => "i64",
+                        TensorType::INT64 => "i64",
+                        _ => "?",
                     };
                     let q = t.quantization();
-                    let (zp, scale) = q.and_then(|q| {
-                        let zp = q.zero_point()?.get(0);
-                        let sc = q.scale()?.get(0);
-                        Some((zp, sc))
-                    }).unwrap_or((0, 0.0));
+                    let (zp, scale) = q
+                        .and_then(|q| {
+                            let zp = q.zero_point()?.get(0);
+                            let sc = q.scale()?.get(0);
+                            Some((zp, sc))
+                        })
+                        .unwrap_or((0, 0.0));
                     println!(
                         "    [{i:3}] {name:55}  {dtype:5}  {shape:?}  zp={zp}  scale={scale:.8}"
                     );
@@ -99,8 +108,14 @@ fn dump_model(path: &str) {
             }
 
             // Print subgraph inputs / outputs by tensor index.
-            let in_idx: Vec<i32>  = sg.inputs().map(|v| (0..v.len()).map(|j| v.get(j)).collect()).unwrap_or_default();
-            let out_idx: Vec<i32> = sg.outputs().map(|v| (0..v.len()).map(|j| v.get(j)).collect()).unwrap_or_default();
+            let in_idx: Vec<i32> = sg
+                .inputs()
+                .map(|v| (0..v.len()).map(|j| v.get(j)).collect())
+                .unwrap_or_default();
+            let out_idx: Vec<i32> = sg
+                .outputs()
+                .map(|v| (0..v.len()).map(|j| v.get(j)).collect())
+                .unwrap_or_default();
             println!("  Subgraph inputs:  {in_idx:?}");
             println!("  Subgraph outputs: {out_idx:?}");
         }

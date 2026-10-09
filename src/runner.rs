@@ -364,7 +364,10 @@ impl Device {
         // requests.  Otherwise fall back to the cached weight buffer so that
         // models without inline execution params continue to work.
         let (exec_params, exec_params_addr) = if exec.parameters.is_empty() {
-            (loaded.params_buf.as_slice(), loaded.params_buf.as_ptr() as u64)
+            (
+                loaded.params_buf.as_slice(),
+                loaded.params_buf.as_ptr() as u64,
+            )
         } else {
             (exec.parameters.as_slice(), exec.parameters.as_ptr() as u64)
         };
@@ -380,10 +383,7 @@ impl Device {
         self.events.submit(self.events.allocate(512));
         self.interrupts.submit(self.interrupts.allocate(64));
 
-        debug!(
-            "sending EXEC instructions ({} chunk(s))",
-            exec_instrs.len()
-        );
+        debug!("sending EXEC instructions ({} chunk(s))", exec_instrs.len());
         for instr in &exec_instrs {
             single_ep_send(&self.iface, DescriptorTag::Instructions, instr).await?;
         }

@@ -146,9 +146,7 @@ pub async fn chip_init(
     if (ctrl3 >> 22) & 0x3 != 0x3 {
         let ctrl3_new = (ctrl3 & !(0x3 << 22)) | (0x3 << 22);
         write_register32(iface, REG_SCU_CTRL_3, ctrl3_new).await?;
-        debug!(
-            "enable_reset: scu_ctrl_3 -> 0x{ctrl3_new:08x}  waiting for cur_pwr_state=2..."
-        );
+        debug!("enable_reset: scu_ctrl_3 -> 0x{ctrl3_new:08x}  waiting for cur_pwr_state=2...");
         poll_field(iface, REG_SCU_CTRL_3, 8, 0x3, 0x2, 1000).await?;
         let ctrl3_after = read_register32(iface, REG_SCU_CTRL_3).await?;
         debug!("enable_reset: cur_pwr_state reached: scu_ctrl_3=0x{ctrl3_after:08x}");

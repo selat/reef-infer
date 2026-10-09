@@ -257,11 +257,7 @@ pub fn load_tflite_model(path: &str) -> Result<TfliteModel, Box<dyn std::error::
         executables.push(parse_executable(exec));
     }
 
-    tracing::debug!(
-        "loaded {}: {} executable(s)",
-        path,
-        executables.len()
-    );
+    tracing::debug!("loaded {}: {} executable(s)", path, executables.len());
     for (i, e) in executables.iter().enumerate() {
         tracing::debug!(
             "  [{}] type={:?}  chunks={}  params={}B  in={} out={}",
@@ -275,13 +271,19 @@ pub fn load_tflite_model(path: &str) -> Result<TfliteModel, Box<dyn std::error::
         for l in &e.input_layers {
             tracing::debug!(
                 "      input  {:?}  {}B  zp={}  dq={}",
-                l.name, l.size_bytes, l.zero_point, l.dequantization_factor
+                l.name,
+                l.size_bytes,
+                l.zero_point,
+                l.dequantization_factor
             );
         }
         for l in &e.output_layers {
             tracing::debug!(
                 "      output {:?}  {}B  zp={}  dq={}",
-                l.name, l.size_bytes, l.zero_point, l.dequantization_factor
+                l.name,
+                l.size_bytes,
+                l.zero_point,
+                l.dequantization_factor
             );
         }
     }

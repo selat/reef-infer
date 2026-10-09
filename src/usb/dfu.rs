@@ -75,7 +75,8 @@ pub async fn dfu_download(device: &nusb::Device) -> Result<(), Box<dyn std::erro
 
     tracing::debug!(
         "DFU: interface={}, transfer_size={}",
-        info.interface_number, info.transfer_size
+        info.interface_number,
+        info.transfer_size
     );
 
     let iface = device.claim_interface(info.interface_number).await?;
