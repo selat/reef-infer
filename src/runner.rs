@@ -457,7 +457,16 @@ impl Device {
             return Err(DeviceError::NoOutput);
         }
 
-        Ok(output_chunks.into_iter().flatten().collect())
+        let raw: Vec<u8> = output_chunks.into_iter().flatten().collect();
+        let mut out = Vec::with_capacity(raw.len());
+        let mut offset = 0;
+        for layer in &exec.output_layers {
+            let end = (offset + layer.size_bytes as usize).min(raw.len());
+            out.extend(layer.relayout_output(&raw[offset..end]));
+            offset = end;
+        }
+        out.extend_from_slice(&raw[offset..]);
+        Ok(out)
     }
 
     /// Runs one inference with automatic quantization/dequantization.

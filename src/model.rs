@@ -119,6 +119,62 @@ pub struct LayerInfo {
     pub size_bytes: i32,
     pub zero_point: i32,
     pub dequantization_factor: f32,
+    /// Logical tensor dimensions (y = height, x = width, z = channels).
+    pub y_dim: i32,
+    pub x_dim: i32,
+    pub z_dim: i32,
+    /// Where each (y, x) position of an output layer sits in the bytes the
+    /// device sends. `None` for input layers and outputs without a layout.
+    pub output_layout: Option<OutputLayoutInfo>,
+}
+
+/// DarwiNN `OutputLayout`: output activations arrive grouped by tile, and the
+/// host must gather them back into y-x-z order (libedgetpu does the same).
+#[derive(Debug, Clone, Default)]
+pub struct OutputLayoutInfo {
+    pub y_coordinate_to_linear_tile_id_map: Vec<i32>,
+    pub x_coordinate_to_linear_tile_id_map: Vec<i32>,
+    pub linearized_tile_byte_offset: Vec<i32>,
+    pub x_coordinate_to_local_byte_offset: Vec<i32>,
+    pub y_coordinate_to_local_y_offset: Vec<i32>,
+    pub x_coordinate_to_local_y_row_size: Vec<i32>,
+}
+
+impl LayerInfo {
+    /// Reorders an output layer's bytes from the device's tile order into
+    /// y-x-z order using its [`OutputLayoutInfo`] (as libedgetpu does).
+    /// Layers without a layout are returned unchanged.
+    pub fn relayout_output(&self, raw: &[u8]) -> Vec<u8> {
+        let Some(l) = &self.output_layout else {
+            return raw.to_vec();
+        };
+        let (ny, nx, nz) = (
+            self.y_dim as usize,
+            self.x_dim as usize,
+            self.z_dim as usize,
+        );
+        if ny * nx * nz == 0 || l.y_coordinate_to_linear_tile_id_map.len() < ny {
+            return raw.to_vec();
+        }
+        let elem = (self.size_bytes as usize / (ny * nx * nz)).max(1);
+        let row = nz * elem;
+        let mut out = vec![0u8; ny * nx * row];
+        for y in 0..ny {
+            for x in 0..nx {
+                let tile = (l.y_coordinate_to_linear_tile_id_map[y]
+                    + l.x_coordinate_to_linear_tile_id_map[x]) as usize;
+                let src = l.linearized_tile_byte_offset[tile] as usize
+                    + l.x_coordinate_to_local_byte_offset[x] as usize
+                    + (l.y_coordinate_to_local_y_offset[y] * l.x_coordinate_to_local_y_row_size[x])
+                        as usize;
+                let dst = (y * nx + x) * row;
+                if let Some(s) = raw.get(src..src + row) {
+                    out[dst..dst + row].copy_from_slice(s);
+                }
+            }
+        }
+        out
+    }
 }
 
 // ── DarwiNN Package parsing ────────────────────────────────────────────────
@@ -130,11 +186,28 @@ fn parse_layer_info(
         .numerics()
         .map(|n| (n.zero_point(), n.dequantization_factor()))
         .unwrap_or((0, 0.0));
+    let v =
+        |x: Option<flatbuffers::Vector<'_, i32>>| x.map(|v| v.iter().collect()).unwrap_or_default();
+    let output_layout = layer
+        .any_layer_as_output_layer()
+        .and_then(|o| o.layout())
+        .map(|l| OutputLayoutInfo {
+            y_coordinate_to_linear_tile_id_map: v(l.y_coordinate_to_linear_tile_id_map()),
+            x_coordinate_to_linear_tile_id_map: v(l.x_coordinate_to_linear_tile_id_map()),
+            linearized_tile_byte_offset: v(l.linearized_tile_byte_offset()),
+            x_coordinate_to_local_byte_offset: v(l.x_coordinate_to_local_byte_offset()),
+            y_coordinate_to_local_y_offset: v(l.y_coordinate_to_local_y_offset()),
+            x_coordinate_to_local_y_row_size: v(l.x_coordinate_to_local_y_row_size()),
+        });
     LayerInfo {
         name: layer.name().unwrap_or("").to_string(),
         size_bytes: layer.size_bytes(),
         zero_point: zp,
         dequantization_factor: dq,
+        y_dim: layer.y_dim(),
+        x_dim: layer.x_dim(),
+        z_dim: layer.z_dim(),
+        output_layout,
     }
 }
 
