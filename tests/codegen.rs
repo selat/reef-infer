@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use reef_infer::codegen::Quant;
+use reef_infer::codegen::conv::Conv;
 use reef_infer::codegen::elementwise::{self, Requant};
 use reef_infer::codegen::fc::Fc;
 use reef_infer::isa;
@@ -168,5 +169,140 @@ fn fc_matches_compiler() {
             compiled.executables[i].instruction_chunks[0].bitstream,
             "executable {i}"
         );
+    }
+}
+
+/// Every corpus CONV_2D model `codegen::conv` supports: instructions,
+/// relocations and output layout, and the parameter blob when the weights
+/// are exported (`tools/isa_corpus/conv_ref.py`).
+#[test]
+fn conv_matches_compiler() {
+    let models = [
+        (
+            "k1_padsame_stride1",
+            "Cin16_Cout32",
+            "actnone_in_range4p0",
+            1,
+            false,
+        ),
+        (
+            "k3_padsame_stride1",
+            "Cin16_Cout32",
+            "actnone_in_range4p0",
+            3,
+            false,
+        ),
+        (
+            "k3_padsame_stride1",
+            "Cin16_Cout16",
+            "actnone_in_range4p0",
+            3,
+            false,
+        ),
+        (
+            "k3_padsame_stride1",
+            "Cin16_Cout8",
+            "actnone_in_range4p0",
+            3,
+            false,
+        ),
+        (
+            "k3_padsame_stride1",
+            "Cin16_Cout32",
+            "actnone_in_range0p5",
+            3,
+            false,
+        ),
+        (
+            "k3_padsame_stride1",
+            "Cin16_Cout32",
+            "actnone_in_range16p0",
+            3,
+            false,
+        ),
+        (
+            "k3_padsame_stride1",
+            "Cin16_Cout32",
+            "actrelu_in_range4p0",
+            3,
+            true,
+        ),
+        (
+            "k3_padsame_stride1",
+            "Cin16_Cout32",
+            "actrelu6_in_range4p0",
+            3,
+            false,
+        ),
+    ];
+    let mut checked = 0;
+    for (kind, ch, act, k, relu) in models {
+        let Some(path) = corpus(&format!("conv/conv_{ch}_H16_W16_{act}_{kind}")) else {
+            continue;
+        };
+        let compiled = load_tflite_model(&path).unwrap();
+        let e = &compiled.executables[0];
+        let (cin, cout) = (16, e.output_layers[0].z_dim as usize);
+        // weights from tools/isa_corpus/conv_ref.py, if exported
+        let r: Option<serde_json::Value> =
+            std::fs::read_to_string(PathBuf::from(&path).with_file_name("conv_ref.json"))
+                .ok()
+                .map(|s| serde_json::from_str(&s).unwrap());
+        let nums = |key: &str| -> Option<Vec<f64>> {
+            r.as_ref().map(|r| {
+                r[key]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_f64().unwrap())
+                    .collect()
+            })
+        };
+        let conv = Conv {
+            cin,
+            cout,
+            k,
+            weights: nums("weights").map_or(vec![1; cout * k * k * cin], |v| {
+                v.iter().map(|&x| x as i8).collect()
+            }),
+            w_scale: nums("w_scale")
+                .map_or(vec![0.01; cout], |v| v.iter().map(|&x| x as f32).collect()),
+            bias: nums("bias").map_or(vec![0; cout], |v| v.iter().map(|&x| x as i32).collect()),
+            input: quant(&e.input_layers[0]),
+            output: quant(&e.output_layers[0]),
+            relu,
+        };
+        let ours = conv.build().unwrap();
+        for i in 0..2 {
+            let (a, b) = (&ours.executables[i], &compiled.executables[i]);
+            assert_eq!(a.exec_type, b.exec_type);
+            assert_eq!(
+                a.instruction_chunks[0].bitstream, b.instruction_chunks[0].bitstream,
+                "{path}: executable {i}"
+            );
+            let offs = |e: &ExecInfo| -> Vec<i32> {
+                e.instruction_chunks[0]
+                    .field_offsets
+                    .iter()
+                    .map(|f| f.offset_bit)
+                    .collect()
+            };
+            assert_eq!(offs(a), offs(b), "{path}: relocations, executable {i}");
+        }
+        if r.is_some() {
+            assert_eq!(
+                ours.executables[1].parameters, compiled.executables[1].parameters,
+                "{path}: parameters"
+            );
+        }
+        assert_eq!(
+            format!("{:?}", ours.executables[0].output_layers[0].output_layout),
+            format!("{:?}", e.output_layers[0].output_layout),
+            "{path}: output layout"
+        );
+        checked += 1;
+    }
+    if checked == 0 {
+        eprintln!("ISA corpus not found; skipping");
     }
 }

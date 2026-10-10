@@ -434,3 +434,65 @@ All in-loop USB transfers in `runner.rs` now time out after 2 s
 **Still open:** a consumer that lands the stream linearly; why only 384 of
 512 B arrive (row size vs consumer slots); what `loop_k168` selects.
 
+## CONV_2D generated (2026-10-10)
+
+`codegen::conv::Conv`, checked by `examples/conv_check.rs` and
+`tests/codegen.rs::conv_matches_compiler` (byte equality of both
+executables, relocations, output layout and parameter blob, weights from
+`tools/isa_corpus/conv_ref.py`) and `tests/codegen_hw.rs` (bit-exact on
+the TPU against a host reference, random weights, ReLU, zero points 3-250).
+**Byte-identical on 8 corpus models:** 16x16, Cin 16, same padding,
+stride 1, k 1 (Cout 32) and k 3 (Cout 8, 16, 32; four quantizations, ReLU,
+ReLU6). `examples/isa_emit.rs` prints a compiled bitstream as `emit` calls
+to transcribe from.
+
+**Program shape** (one EXECUTION_ONLY + one PARAMETER_CACHING, all models
+with same padding and H, W multiples of 4: 3 TensorOps, one multicast):
+
+1. Element-wise skeleton: prologue, one-hot constants, input over 4 rows of
+   4 tiles (4x4 pixel patch per tile), two copy ops into the compute layout.
+2. Halo exchange (k > 1): mesh moves north (0x17), south (0x15), then west
+   (0x16) and east (0x18) over the full padded height, so corners follow.
+   Each move is three instructions by tile row / column: receive only, send
+   and receive, send and fill own halo with the input zero point. Mesh
+   addresses are byte offsets in the padded patch, increments are words.
+   Column moves carry sync flags 6 / 0xa (value 6 for 1-pixel halos at
+   Cin >= 8; 5 at Cin <= 4; 7 for 2-3 pixel halos).
+3. Weight multicast: tile 0's ringProducer sends the cached blob straight to
+   `dest = 0xffff` (no scalar memory); every tile's ringConsumer (opcode
+   0x12) puts the 3 header rows in its aux rows (0x1fe8..) and weight rows
+   in slots of 8 address units below; the epilogue waits for the words on
+   counter 6 (`thr6` = 3 + K/4) and not on counter 5.
+4. One conv TensorOp per tile, then the element-wise output path.
+
+**Rules found:**
+
+- Address-generator increments apply from the last element of the inner
+  loops (`inc = stride - span(inner)`); one helper (`walk`) produces every
+  mesh and TensorOp walk.
+- Narrow layout in bytes, `tb` = 16 Cin, `tp` = padded patch: compute input
+  at 0 (padded), landing at `tp`, constants at `tp + 2 tb`, conv output at
+  `tp`. The copy-op formulas (`codegen::copy_op`) fit element-wise and conv
+  k = 1..7.
+- k = 1: one pass, `loop0` = Cin/4 words. k = 3: one pass per 4 input
+  channels (`loop2 = Cin/4 - 1`) over the 9 taps with partial sums
+  (`psum_base` = slots - 64); the consumer refills its 9 slots each pass, so
+  weight rows stream as `[Cin/4][ky][kx]` (confirmed by blob equality).
+  k = 2, 4-5, 6-7 and Cin < 16 use other loop schemes.
+- Cout < 16 is padded to 16 in the blob with zero multiplier, bias, weight
+  zero point and weight bytes.
+- **Clamp bounds** are `((q - zp) * s) * (1 / s)` in f32 (q = 0, 255):
+  119/119 corpus conv, FC and depthwise models. FC now uses it too (it had
+  a "one ulp towards zero" approximation that matched the one model).
+- A tile output of one wide word (Cout <= 16) uses the circular
+  single-row narrowToWide form; larger outputs use `w_lim0`.
+
+**Hardware check of the halo:** with the reference's border padding set to
+0 instead of the zero point, 1881 of 8192 values differ (the border
+pixels); with the zero point all match. Interior tile edges, which depend
+on the neighbour moves, are exact.
+
+**Still open:** Cin 32-128 (input lands in a circular buffer with Cin/16
+slots), Cout >= 64 (1 KiB per tile, a different narrow arrangement), stride
+2, k = 2 and 4-7, sizes other than 16x16, valid padding.
+

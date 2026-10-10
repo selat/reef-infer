@@ -138,7 +138,7 @@ All 23 opcodes seen in 359 compiled bitstreams decode fully
 | 0x11, 0x12 | ringConsumer | 4 | Ring -> memory (consumer 0 / 1) |
 | 0x13 | narrowToWide | 7 | Narrow -> wide memory or ring FIFO |
 | 0x14 | wideToNarrow | 7 | Wide memory or ring FIFO -> narrow (mode 2: bias store) |
-| 0x15-0x18 | mesh | 6 | Neighbour move south, west, north, east; can fill constants (edge padding) |
+| 0x15-0x18 | mesh | 6 | Neighbour move south, west, north, east; can fill constants (edge padding). Convolution halo exchange decoded and reproduced (section 8) |
 | 0x19 | nlu | 13 | Load the spline: 40 f32 coefficients, 7 breakpoints, mode |
 
 Sync counters: 19 per tile (AVDATA, PARAMETERS, PARTIAL_SUMS, MESH in/out x4,
@@ -355,8 +355,10 @@ perturbation on the device.
 | Corpus tooling (`tools/isa_corpus/`, `examples/isa_check.rs`) | Done |
 | Generators in Rust (`src/codegen/`): element-wise requant (1x16x16x32), FC (K <= 64, N <= 64) | Done; byte-identical to 16.0 (FC parameters included), bit-exact on device |
 | On-chip loopback broadcast (`elementwise::build_broadcast`) | Done; bit-exact on device; landing layout is the compiler's depthwise one |
-| FC beyond one pass / one tile, conv | Next |
-| Conv, then scheduler/allocator for multi-layer graphs | Weeks to months |
+| CONV_2D (`codegen::conv`): same padding, stride 1, 16x16, Cin 16; k 1 (Cout 32) and k 3 (Cout 8 / 16 / 32) | Done; byte-identical to 16.0 on 8 corpus models (parameters included), bit-exact on device |
+| Conv: Cin 32-128 (circular input buffer), Cout 64+ (other narrow layout), stride 2, other k, other sizes | Next |
+| FC beyond one pass / one tile | Next |
+| Scheduler/allocator for multi-layer graphs | Weeks to months |
 | PyTorch front end (`torch.export`, int8) | After the above |
 
 Our runner is compatible with generated programs: it is event-driven and
@@ -400,6 +402,13 @@ cargo run --release --features usb --example loopback_probe -- [model] [filter]
 
 # Generated loopback broadcast, every tile checked (PARTS=hex bisects pieces)
 cargo run --release --features usb --example broadcast_hw -- [src...]
+
+# A compiled bitstream as codegen::Asm::emit calls (transcription start)
+cargo run --example isa_emit -- model_edgetpu.tflite [executable]
+
+# Generated conv vs every supported corpus model, field by field
+.venv/bin/python tools/isa_corpus/conv_ref.py   # weights for the parameter comparison
+cargo run --example conv_check -- [filter]
 
 # Field diff of two compiled models
 cargo run --example isa_diff -- a_edgetpu.tflite b_edgetpu.tflite

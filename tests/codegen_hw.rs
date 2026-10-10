@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use reef_infer::codegen::Quant;
+use reef_infer::codegen::conv::Conv;
 use reef_infer::codegen::elementwise::{self, Requant, SIZE};
 use reef_infer::codegen::fc::Fc;
 use reef_infer::runner::Device;
@@ -90,6 +91,51 @@ async fn generated_programs_on_tpu() {
             let x = bytes(&mut seed, k);
             let got = dev.run_inference(&loaded, x.clone()).await.unwrap();
             assert_eq!(got, fc.reference(&x), "fc K={k} N={n} relu={relu}");
+        }
+    }
+
+    // Convolutions with random weights: 1x1, and 3x3 (halo exchange, zero
+    // point padding at the image border).
+    for (k, cout, relu, in_zp, out_zp) in [
+        (1, 32, false, 127, 131),
+        (1, 32, true, 100, 0),
+        (3, 32, false, 127, 130),
+        (3, 16, true, 3, 0),
+        (3, 8, false, 250, 20),
+    ] {
+        let cin = 16;
+        let w = bytes(&mut seed, cout * k * k * cin);
+        let conv = Conv {
+            cin,
+            cout,
+            k,
+            weights: w.iter().map(|&b| b as i8).collect(),
+            w_scale: (0..cout).map(|i| 0.0007 + 0.0001 * i as f32).collect(),
+            bias: (0..cout).map(|i| 300 * i as i32 - 4000).collect(),
+            input: Quant {
+                scale: 0.03,
+                zero_point: in_zp,
+            },
+            output: Quant {
+                scale: 0.2,
+                zero_point: out_zp,
+            },
+            relu,
+        };
+        let loaded = dev
+            .load_params(Arc::new(conv.build().unwrap()))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            let x = bytes(&mut seed, 16 * 16 * cin);
+            let got = dev.run_inference(&loaded, x.clone()).await.unwrap();
+            let want = conv.reference(&x);
+            let bad = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+            assert!(
+                bad == 0,
+                "conv k={k} Cout={cout} relu={relu} zp {in_zp}/{out_zp}: {bad}/{} wrong",
+                want.len()
+            );
         }
     }
 

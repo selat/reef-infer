@@ -61,19 +61,14 @@ impl Fc {
         self.input.scale * self.w_scale[n] * (1.0 / self.output.scale)
     }
 
-    /// Clamp bounds: the uint8 range relative to `out_zp`, pulled one ulp
-    /// towards zero as the compiler emits them (RELU clamps at 0).
+    /// Clamp bounds as the compiler computes them, in f32:
+    /// `((q - out_zp) * s) * (1 / s)` for q = 0 and 255 (RELU: 0). Matches
+    /// every FC, conv and depthwise model in the corpus; the result sits on
+    /// or one ulp inside the integer bound.
     pub fn clamp(&self) -> (f32, f32) {
-        let zp = self.output.zero_point as f32;
-        let toward_zero = |v: f32| {
-            if v == 0.0 {
-                v
-            } else {
-                f32::from_bits(v.to_bits() - 1)
-            }
-        };
-        let lo = if self.relu { 0.0 } else { toward_zero(-zp) };
-        (lo, toward_zero(255.0 - zp))
+        let (s, zp) = (self.output.scale, self.output.zero_point as f32);
+        let bound = |q: f32| ((q - zp) * s) * (1.0 / s);
+        (if self.relu { 0.0 } else { bound(0.0) }, bound(255.0))
     }
 
     pub fn parameters(&self) -> Vec<u8> {
@@ -146,61 +141,12 @@ impl Fc {
 
     /// Streams the parameter blob from the host into tile 0's wide memory.
     fn caching_program(&self, bytes: usize) -> Result<ChunkInfo, IsaError> {
-        use Description as D;
-        use Position as P;
-        let units = (bytes / 64) as i64; // the parameter stream moves 64 B units
         let kq = (self.k / 4) as i64;
         let mut a = Asm::new();
-        a.emit(
-            OP_SYNC,
-            &[
-                ("tiles", ALL_TILES),
-                ("b43", 1),
-                ("counters", 0x7ffff),
-                ("units", 0x3ff),
-                ("signal", 1),
-            ],
-        )?;
-        a.emit(
-            OP_SCSYNC,
-            &[
-                ("tiles", ALL_TILES),
-                ("smask", 0x1ff),
-                ("tokwait", 1),
-                ("tmask", ALL_TILES),
-                ("sunits", 0x1f),
-            ],
-        )?;
-        a.mov_addr(1, D::BASE_ADDRESS_PARAMETER, P::LOWER_32BIT, "")?;
-        a.mov_addr(0, D::BASE_ADDRESS_PARAMETER, P::UPPER_32BIT, "")?;
-        // descriptor {s3 = s1, s2 = s0, bytes, TAG_PARAMS} via s4..s7
-        mov_reg(&mut a, 3, 1)?;
-        mov_reg(&mut a, 2, 0)?;
-        param_descriptor(&mut a, bytes as i64, TAG_PARAMS)?;
-        let mut pop = vec![
-            ("d0_stride", 1),
-            ("d0_limit", 0x3ff),
-            ("d1_stride", 0xfc01),
-            ("d2_stride", 0xfc01),
-            ("k121", 1),
-            ("k124", 1),
-            ("par136", 1),
-            ("count_m1", units - 1),
-            ("k157", 1),
-            ("count_neg", 0x400 - units),
-            ("k174", 1),
-            ("par177", 1),
-            ("k178", 1),
-            ("rows_neg", 0x8000 - units / 2),
-            ("k199", 1),
-            ("k215", 1),
-        ];
-        if units % 2 == 0 {
-            pop.push(("b183", 1));
-        }
-        a.emit(OP_POP, &pop)?;
-        a.emit(
-            OP_RING_CONSUMER,
+        param_caching(
+            &mut a,
+            bytes,
+            (self.n / 16) as i64 - 1, // 16-channel groups - 1
             &[
                 ("tile_mask", 1),
                 ("addr", 0xe),
@@ -218,44 +164,6 @@ impl Fc {
                 ("rsv319", 1),
             ],
         )?;
-        a.emit(
-            OP_INFEED,
-            &[
-                ("d0_stride", 1),
-                ("d0_limit", 0x3ff),
-                ("d1_stride", 0x1ffc01),
-                ("d2_stride", 0x1ffc01),
-                ("k157", 1),
-                ("k160", 1),
-                ("par172", 1),
-                ("count_m1", units - 1),
-                ("k203", 1),
-                ("count_neg", 0x400 - units),
-                ("k311", 1),
-                ("par314", 1),
-                ("pop_wait", 1),
-                ("k336", 1),
-                ("k352", 1),
-                ("k392", 1),
-                ("tiles", 1),
-                ("k434", 0xf),
-                ("f438", (self.n / 16) as i64 - 1), // 16-channel groups - 1
-            ],
-        )?;
-        a.emit(
-            OP_SYNC,
-            &[
-                ("tiles", ALL_TILES),
-                ("b43", 1),
-                ("units", 0x3ff),
-                ("signal", 1),
-                ("f109", 3),
-            ],
-        )?;
-        wait_tiles(&mut a)?;
-        a.mov(2, 0)?;
-        a.mov(3, 0)?;
-        param_descriptor(&mut a, 0, TAG_DONE)?;
         a.finish()
     }
 
@@ -521,39 +429,6 @@ impl Fc {
         epilogue(&mut a, 2, 0)?;
         a.finish()
     }
-}
-
-/// Descriptor `{s3, s2, len, tag}` built in s4..s7 (the caching program's
-/// register choice; [`descriptor_send`] uses s6..s9).
-fn param_descriptor(a: &mut Asm, len: i64, tag: i64) -> Result<(), IsaError> {
-    mov_reg(a, 4, 3)?;
-    mov_reg(a, 5, 2)?;
-    a.emit(OP_SCALAR, &[("v_op", 0xa), ("vs_reg", 4)])?;
-    a.emit(
-        OP_SCALAR,
-        &[
-            ("v_op", 0xa),
-            ("v_offset", 1),
-            ("vs_reg", 5),
-            ("s_op", 0x2f),
-            ("s_x", 6),
-            ("imm_scalar", len),
-        ],
-    )?;
-    a.emit(
-        OP_SCALAR,
-        &[
-            ("v_op", 0xa),
-            ("v_offset", 2),
-            ("vs_reg", 6),
-            ("s_op", 0x2f),
-            ("s_x", 7),
-            ("imm_scalar", tag),
-        ],
-    )?;
-    a.emit(OP_SCALAR, &[("v_op", 0xa), ("v_offset", 3), ("vs_reg", 7)])?;
-    a.emit(OP_SCALAR, &[("v_op", 0xc)])?;
-    Ok(())
 }
 
 fn ring_consumer(a: &mut Asm) -> Result<(), IsaError> {

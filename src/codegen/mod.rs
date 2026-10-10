@@ -6,6 +6,7 @@
 //! result into an [`ExecInfo`] that [`crate::runner::Device`] runs like a
 //! compiled model.
 
+pub mod conv;
 pub mod elementwise;
 pub mod fc;
 
@@ -16,9 +17,16 @@ use crate::model::{ChunkInfo, ExecInfo, LayerInfo, OffsetInfo, OutputLayoutInfo,
 pub const OP_TENSOR: u8 = 0x01;
 pub const OP_RING_PRODUCER: u8 = 0x10;
 pub const OP_RING_CONSUMER: u8 = 0x11;
+/// ringConsumer variant the compiler uses for a weight multicast.
+pub const OP_RING_CONSUMER2: u8 = 0x12;
 pub const OP_NARROW_TO_WIDE: u8 = 0x13;
 pub const OP_WIDE_TO_NARROW: u8 = 0x14;
+/// Mesh moves between neighbouring tiles (halo exchange): data goes to
+/// the tile to the north / south / west / east (0x17 also fills).
+pub const OP_MESH_S: u8 = 0x15;
+pub const OP_MESH_W: u8 = 0x16;
 pub const OP_MESH_N: u8 = 0x17;
+pub const OP_MESH_E: u8 = 0x18;
 pub const OP_SYNC: u8 = 0x1a;
 pub const OP_SCALAR: u8 = 0x20;
 pub const OP_HALT: u8 = 0x21;
@@ -285,13 +293,14 @@ pub fn descriptor_send(a: &mut Asm, len: i64, tag: i64) -> Result<(), IsaError> 
 }
 
 /// Drains the tiles and the outfeed, then sends the completion event.
-/// `outfeed_thr` is the compiler's `scsync.thr5` (16 after 16 outfeeds, 2
-/// after one; not decoded). A program with a loopback of `loop_rows` rows
-/// also waits on counter 6 for them, and they count towards counter 5
-/// (compiled dwconv: 16 outfeeds + 6 rows -> `thr5` 22, `thr6` 6).
-pub fn epilogue(a: &mut Asm, outfeed_thr: i64, loop_rows: i64) -> Result<(), IsaError> {
+/// `thr5` is the compiler's `scsync.thr5`: the outfeeds (16 after 16, 2
+/// after one), plus the rows of an on-chip loopback (compiled dwconv: 16 + 6
+/// -> 22). `thr6` (0 for none) waits on counter 6 for rows that went tile ->
+/// tiles: loopback rows (dwconv 6) or a weight multicast's words (conv 1x1
+/// Cout 32: 7).
+pub fn epilogue(a: &mut Asm, thr5: i64, thr6: i64) -> Result<(), IsaError> {
     sync(a, 0x1ffff, 0x3ff, false)?;
-    let (mask, counters) = if loop_rows > 0 {
+    let (mask, counters) = if thr6 > 0 {
         (0x60, 0x60000)
     } else {
         (0x20, 0x20000)
@@ -299,12 +308,12 @@ pub fn epilogue(a: &mut Asm, outfeed_thr: i64, loop_rows: i64) -> Result<(), Isa
     let mut f = vec![
         ("tiles", ALL_TILES),
         ("smask", mask),
-        ("thr5", outfeed_thr + loop_rows),
+        ("thr5", thr5),
         ("wait", mask),
         ("sunits", 0xc),
     ];
-    if loop_rows > 0 {
-        f.push(("thr6", loop_rows));
+    if thr6 > 0 {
+        f.push(("thr6", thr6));
     }
     a.emit(OP_SCSYNC, &f)?;
     sync(a, counters, 0x3ff, true)?;
@@ -322,11 +331,282 @@ pub fn epilogue(a: &mut Asm, outfeed_thr: i64, loop_rows: i64) -> Result<(), Isa
     done(a)
 }
 
+/// PARAMETER_CACHING program: streams `bytes` of parameters from the host
+/// into tile 0 over the parameter path, landing as `consumer` (tile 0's
+/// ringConsumer fields) describes. `f438` is the infeed's 16-channel group
+/// count - 1.
+pub fn param_caching(
+    a: &mut Asm,
+    bytes: usize,
+    f438: i64,
+    consumer: &[(&str, i64)],
+) -> Result<(), IsaError> {
+    use Description as D;
+    use Position as P;
+    let units = (bytes / 64) as i64; // the parameter stream moves 64 B units
+    a.emit(
+        OP_SYNC,
+        &[
+            ("tiles", ALL_TILES),
+            ("b43", 1),
+            ("counters", 0x7ffff),
+            ("units", 0x3ff),
+            ("signal", 1),
+        ],
+    )?;
+    a.emit(
+        OP_SCSYNC,
+        &[
+            ("tiles", ALL_TILES),
+            ("smask", 0x1ff),
+            ("tokwait", 1),
+            ("tmask", ALL_TILES),
+            ("sunits", 0x1f),
+        ],
+    )?;
+    a.mov_addr(1, D::BASE_ADDRESS_PARAMETER, P::LOWER_32BIT, "")?;
+    a.mov_addr(0, D::BASE_ADDRESS_PARAMETER, P::UPPER_32BIT, "")?;
+    // descriptor {s3 = s1, s2 = s0, bytes, TAG_PARAMS} via s4..s7
+    mov_reg(a, 3, 1)?;
+    mov_reg(a, 2, 0)?;
+    param_descriptor(a, bytes as i64, TAG_PARAMS)?;
+    let mut pop = vec![
+        ("d0_stride", 1),
+        ("d0_limit", 0x3ff),
+        ("d1_stride", 0xfc01),
+        ("d2_stride", 0xfc01),
+        ("k121", 1),
+        ("k124", 1),
+        ("par136", 1),
+        ("count_m1", units - 1),
+        ("k157", 1),
+        ("count_neg", 0x400 - units),
+        ("k174", 1),
+        ("par177", 1),
+        ("k178", 1),
+        ("rows_neg", 0x8000 - units / 2),
+        ("k199", 1),
+        ("k215", 1),
+    ];
+    if units % 2 == 0 {
+        pop.push(("b183", 1));
+    }
+    a.emit(OP_POP, &pop)?;
+    a.emit(OP_RING_CONSUMER, consumer)?;
+    a.emit(
+        OP_INFEED,
+        &[
+            ("d0_stride", 1),
+            ("d0_limit", 0x3ff),
+            ("d1_stride", 0x1ffc01),
+            ("d2_stride", 0x1ffc01),
+            ("k157", 1),
+            ("k160", 1),
+            ("par172", 1),
+            ("count_m1", units - 1),
+            ("k203", 1),
+            ("count_neg", 0x400 - units),
+            ("k311", 1),
+            ("par314", 1),
+            ("pop_wait", 1),
+            ("k336", 1),
+            ("k352", 1),
+            ("k392", 1),
+            ("tiles", 1),
+            ("k434", 0xf),
+            ("f438", f438),
+        ],
+    )?;
+    a.emit(
+        OP_SYNC,
+        &[
+            ("tiles", ALL_TILES),
+            ("b43", 1),
+            ("units", 0x3ff),
+            ("signal", 1),
+            ("f109", 3),
+        ],
+    )?;
+    wait_tiles(a)?;
+    a.mov(2, 0)?;
+    a.mov(3, 0)?;
+    param_descriptor(a, 0, TAG_DONE)
+}
+
+/// Descriptor `{s3, s2, len, tag}` built in s4..s7 (the caching program's
+/// register choice; [`descriptor_send`] uses s6..s9).
+fn param_descriptor(a: &mut Asm, len: i64, tag: i64) -> Result<(), IsaError> {
+    mov_reg(a, 4, 3)?;
+    mov_reg(a, 5, 2)?;
+    a.emit(OP_SCALAR, &[("v_op", 0xa), ("vs_reg", 4)])?;
+    a.emit(
+        OP_SCALAR,
+        &[
+            ("v_op", 0xa),
+            ("v_offset", 1),
+            ("vs_reg", 5),
+            ("s_op", S_MOVI),
+            ("s_x", 6),
+            ("imm_scalar", len),
+        ],
+    )?;
+    a.emit(
+        OP_SCALAR,
+        &[
+            ("v_op", 0xa),
+            ("v_offset", 2),
+            ("vs_reg", 6),
+            ("s_op", S_MOVI),
+            ("s_x", 7),
+            ("imm_scalar", tag),
+        ],
+    )?;
+    a.emit(OP_SCALAR, &[("v_op", 0xa), ("v_offset", 3), ("vs_reg", 7)])?;
+    a.emit(OP_SCALAR, &[("v_op", 0xc)])?;
+    Ok(())
+}
+
 /// Sends the completion event (tag 4, no address).
 pub fn done(a: &mut Asm) -> Result<(), IsaError> {
     a.mov(4, 0)?;
     a.mov(5, 0)?;
     descriptor_send(a, 0, TAG_DONE)
+}
+
+/// One tile's 4x4 pixel patch of a `cin`-channel uint8 tensor, stored
+/// pixel-major (`[y][x][cin]`) with a halo of `top` / `left` pixels before
+/// and `bottom` / `right` after it (a convolution's padding).
+#[derive(Debug, Clone, Copy)]
+pub struct Patch {
+    pub cin: i64,
+    pub top: i64,
+    pub bottom: i64,
+    pub left: i64,
+    pub right: i64,
+}
+
+impl Patch {
+    pub fn plain(cin: usize) -> Patch {
+        Patch {
+            cin: cin as i64,
+            top: 0,
+            bottom: 0,
+            left: 0,
+            right: 0,
+        }
+    }
+    /// 4-byte words per pixel.
+    pub fn cq(&self) -> i64 {
+        self.cin / 4
+    }
+    /// Padded width / height in pixels.
+    pub fn pw(&self) -> i64 {
+        4 + self.left + self.right
+    }
+    pub fn ph(&self) -> i64 {
+        4 + self.top + self.bottom
+    }
+    /// Unpadded bytes (what the host sends per tile).
+    pub fn tb(&self) -> i64 {
+        16 * self.cin
+    }
+    /// Padded bytes.
+    pub fn tp(&self) -> i64 {
+        self.pw() * self.ph() * self.cin
+    }
+    /// Byte offset of interior pixel (y, x).
+    pub fn at(&self, y: i64, x: i64) -> i64 {
+        ((y + self.top) * self.pw() + x + self.left) * self.cin
+    }
+}
+
+/// The copy/reformat TensorOp (`dp_mode` 4) that moves a tile's input from
+/// where the infeed lands it (narrow `tp`) into the padded compute layout
+/// (narrow 0): the first copy writes rows 0-2, the second row 3.
+/// `par_base` is the low byte of the constants' wide address. Formulas fit
+/// element-wise (32 ch, no halo, constants at 0x207c) and conv k = 1..7
+/// (16 ch).
+pub fn copy_op(a: &mut Asm, p: &Patch, par_base: i64, first: bool) -> Result<(), IsaError> {
+    let (tb, tp, cq, pw) = (p.tb(), p.tp(), p.cq(), p.pw());
+    let w = tb / 64; // 64 B units per tile
+    let (in_base, out_base, out_inc3, out_inc4, sync0) = if first {
+        (
+            tp,
+            p.at(0, 0),
+            tp / 4 - 2 * pw * cq - (4 * cq - 1),
+            -(12 * cq - 1) - 2 * cq * (pw - 4),
+            tb / 16,
+        )
+    } else {
+        (
+            tp + tb,
+            p.at(3, 0),
+            tp / 4 - (4 * cq - 1),
+            -(4 * cq - 1),
+            13 * tb / 64,
+        )
+    };
+    let mut f: Vec<(&str, i64)> = vec![
+        ("tile_mask", ALL_TILES),
+        ("loop1", w - 1),
+        ("loop2", 3),
+        ("in_base", in_base),
+        ("in_inc0", 1),
+        ("in_cnt0", w - 1),
+        ("in_inc1", 1),
+        ("in_cnt1", 3),
+        ("in_mode7", 3),
+        ("in_tflags", 0x80),
+        ("in_twait", w),
+        ("out_base", out_base),
+        ("out_inc0", 1),
+        ("out_cnt0", w - 1),
+        ("out_inc1", 1),
+        ("out_cnt1", 3),
+        ("out_inc2", pw * cq - (4 * cq - 1)),
+        ("out_inc3", out_inc3),
+        ("out_mode7", 3),
+        ("out_tflags", 3),
+        ("par_base", par_base),
+        ("par_sel", 1),
+        ("par_cnt0", w - 1),
+        ("psum_cnt0", w - 1),
+        ("psum_tflags", 0x800),
+        ("cfg0", 5),
+        ("cfg1", 0x6b),
+        ("sync0", sync0),
+        ("sync1", 0x4000 + tb / 16),
+        ("cfg2", 6),
+        ("dp_mode", 4),
+        ("out_ch_last", 3),
+        ("out_ch", 3),
+        ("mult_bits", 1.0f32.to_bits() as i64),
+        ("clamp_max_bits", f32::INFINITY.to_bits() as i64),
+        ("clamp_min_bits", f32::NEG_INFINITY.to_bits() as i64),
+    ];
+    for n in [
+        "in_inc2", "in_inc3", "in_inc4", "in_inc5", "in_inc6", "in_inc7",
+    ] {
+        f.push((n, -(tb / 16 - 1)));
+    }
+    for n in ["out_inc4", "out_inc5", "out_inc6", "out_inc7"] {
+        f.push((n, out_inc4));
+    }
+    if first {
+        f.extend([
+            ("loop3", 2),
+            ("in_cnt2", 2),
+            ("out_cnt2", 2),
+            ("par_cnt2", 3),
+            ("par_cnt3", 2),
+            ("psum_cnt2", 3),
+            ("psum_cnt3", 2),
+        ]);
+    } else {
+        f.extend([("par_cnt2", 3), ("psum_cnt2", 3)]);
+    }
+    a.emit(OP_TENSOR, &f)?;
+    Ok(())
 }
 
 /// Quantization of a uint8 tensor: `real = (q - zero_point) * scale`.

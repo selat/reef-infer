@@ -64,82 +64,6 @@ impl Requant {
     }
 }
 
-/// The copy/reformat TensorOp (`dp_mode` 4) that moves data between the
-/// infeed layout and the compute layout. Field values are the compiler's.
-fn copy_op(a: &mut Asm, first: bool) -> Result<(), IsaError> {
-    let (in_base, out_base, out_inc3, out_inc4, sync0) = if first {
-        (0x200, 0, 0x21, -95, 0x20)
-    } else {
-        (0x400, 0x180, 0x61, -31, 0x68)
-    };
-    let mut f: Vec<(&str, i64)> = vec![
-        ("tile_mask", ALL_TILES),
-        ("loop1", 7),
-        ("loop2", 3),
-        ("in_base", in_base),
-        ("in_inc0", 1),
-        ("in_cnt0", 7),
-        ("in_inc1", 1),
-        ("in_cnt1", 3),
-        ("in_mode7", 3),
-        ("in_tflags", 0x80),
-        ("in_twait", 8),
-        ("out_base", out_base),
-        ("out_inc0", 1),
-        ("out_cnt0", 7),
-        ("out_inc1", 1),
-        ("out_cnt1", 3),
-        ("out_inc2", 1),
-        ("out_inc3", out_inc3),
-        ("out_mode7", 3),
-        ("out_tflags", 3),
-        ("par_base", 0x7c),
-        ("par_sel", 1),
-        ("par_cnt0", 7),
-        ("psum_cnt0", 7),
-        ("psum_tflags", 0x800),
-        ("cfg0", 5),
-        ("cfg1", 0x6b),
-        ("sync0", sync0),
-        ("sync1", 0x4020),
-        ("cfg2", 6),
-        ("dp_mode", 4),
-        ("out_ch_last", 3),
-        ("out_ch", 3),
-        ("mult_bits", 1.0f32.to_bits() as i64),
-        ("clamp_max_bits", f32::INFINITY.to_bits() as i64),
-        ("clamp_min_bits", f32::NEG_INFINITY.to_bits() as i64),
-    ];
-    for k in 2..8 {
-        f.push((
-            [
-                "in_inc2", "in_inc3", "in_inc4", "in_inc5", "in_inc6", "in_inc7",
-            ][k - 2],
-            -31,
-        ));
-    }
-    for k in 4..8 {
-        f.push((
-            ["out_inc4", "out_inc5", "out_inc6", "out_inc7"][k - 4],
-            out_inc4,
-        ));
-    }
-    if first {
-        f.extend([
-            ("loop3", 2),
-            ("in_cnt2", 2),
-            ("out_cnt2", 2),
-            ("par_cnt2", 3),
-            ("par_cnt3", 2),
-        ]);
-        f.extend([("psum_cnt2", 3), ("psum_cnt3", 2)]);
-    } else {
-        f.extend([("par_cnt2", 3), ("psum_cnt2", 3)]);
-    }
-    a.emit(OP_TENSOR, &f)?;
-    Ok(())
-}
-
 const IN_WALK: [&str; 11] = [
     "in_inc0", "in_inc1", "in_cnt1", "in_inc2", "in_cnt2", "in_inc3", "in_inc4", "in_inc5",
     "in_inc6", "in_inc7", "in_mode7",
@@ -431,7 +355,7 @@ fn build_inner(
         ],
     )?;
     a.emit(OP_SYNC, &[("tiles", ALL_TILES), ("units", 0x20)])?;
-    copy_op(&mut a, true)?;
+    copy_op(&mut a, &Patch::plain(32), 0x7c, true)?;
 
     // ── Input: ask the host for SIZE bytes, pop them into the staging
     // buffer, and infeed 2 KiB to each row of 4 tiles over the ring.
@@ -567,7 +491,7 @@ fn build_inner(
     sync(&mut a, 0, 0x3ff, false)?;
 
     // ── Compute.
-    copy_op(&mut a, false)?;
+    copy_op(&mut a, &Patch::plain(32), 0x7c, false)?;
     sync(&mut a, 0x1ffff, 0x3ff, false)?;
     sync(&mut a, 0x1ffff, 0x3ff, false)?;
     requant_op(&mut a, rq)?;
@@ -656,15 +580,13 @@ fn build_inner(
         )?;
     }
 
-    epilogue(
-        &mut a,
-        16,
-        if parts & part::EPILOGUE != 0 {
-            BCAST_WORDS
-        } else {
-            0
-        },
-    )?;
+    // loopback rows count towards counter 5 and are awaited on counter 6
+    let loop_rows = if parts & part::EPILOGUE != 0 {
+        BCAST_WORDS
+    } else {
+        0
+    };
+    epilogue(&mut a, 16 + loop_rows, loop_rows)?;
 
     Ok(Program {
         chunk: a.finish()?,
