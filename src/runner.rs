@@ -98,6 +98,23 @@ impl fmt::Display for DeviceError {
 
 impl std::error::Error for DeviceError {}
 
+/// How long one USB transfer may take before the TPU is considered hung.
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Runs a USB transfer with [`TRANSFER_TIMEOUT`]. A hung TPU can announce a
+/// transfer (e.g. an output event) and then never complete it.
+async fn deadline<T>(
+    f: impl std::future::Future<Output = Result<T, TransferError>>,
+) -> Result<T, DeviceError> {
+    match tokio::time::timeout(TRANSFER_TIMEOUT, f).await {
+        Ok(r) => Ok(r?),
+        Err(_) => {
+            warn!("USB transfer timeout");
+            Err(DeviceError::Timeout)
+        }
+    }
+}
+
 impl From<TransferError> for DeviceError {
     fn from(e: TransferError) -> Self {
         DeviceError::Usb(e)
@@ -283,7 +300,12 @@ impl Device {
                 pc_instrs.len()
             );
             for instr in pc_instrs.iter() {
-                single_ep_send(&self.iface, DescriptorTag::Instructions, instr).await?;
+                deadline(single_ep_send(
+                    &self.iface,
+                    DescriptorTag::Instructions,
+                    instr,
+                ))
+                .await?;
             }
 
             let mut params_sent = false;
@@ -297,7 +319,7 @@ impl Device {
                         debug!("load_params event[{round}]: tag={}", ev.tag);
                         match ev.tag {
                             2 => {
-                                single_ep_send(&self.iface, DescriptorTag::Parameters, &params_buf).await?;
+                                deadline(single_ep_send(&self.iface, DescriptorTag::Parameters, &params_buf)).await?;
                                 params_sent = true;
                             }
                             4..=7 if params_sent => {
@@ -385,7 +407,12 @@ impl Device {
 
         debug!("sending EXEC instructions ({} chunk(s))", exec_instrs.len());
         for instr in &exec_instrs {
-            single_ep_send(&self.iface, DescriptorTag::Instructions, instr).await?;
+            deadline(single_ep_send(
+                &self.iface,
+                DescriptorTag::Instructions,
+                instr,
+            ))
+            .await?;
         }
 
         // Collect one tag-3 chunk per output layer before declaring completion.
@@ -402,14 +429,14 @@ impl Device {
                     debug!("run_inference event[{round}]: tag={} len={}", ev.tag, ev.length);
                     match ev.tag {
                         1 => {
-                            single_ep_send(&self.iface, DescriptorTag::InputActivations, &input_data).await?;
+                            deadline(single_ep_send(&self.iface, DescriptorTag::InputActivations, &input_data)).await?;
                         }
                         2 => {
                             let offset = ev.device_address.wrapping_sub(exec_params_addr) as usize;
                             let len = ev.length as usize;
                             match exec_params.get(offset..offset + len) {
                                 Some(slice) => {
-                                    single_ep_send(&self.iface, DescriptorTag::Parameters, slice).await?;
+                                    deadline(single_ep_send(&self.iface, DescriptorTag::Parameters, slice)).await?;
                                 }
                                 None => {
                                     warn!(
@@ -422,7 +449,7 @@ impl Device {
                             }
                         }
                         3 => {
-                            let out = bulk_recv(&self.iface, EP_OUTPUT_ACTIVATIONS, ev.length as usize).await?;
+                            let out = deadline(bulk_recv(&self.iface, EP_OUTPUT_ACTIVATIONS, ev.length as usize)).await?;
                             output_chunks.push(out);
                             if output_chunks.len() == num_outputs {
                                 break 'exec;
