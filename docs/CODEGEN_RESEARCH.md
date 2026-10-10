@@ -512,7 +512,33 @@ combinations the corpus lacks). Three rules:
   16)` outermost), and that level does not count in `in_mode` (2 x levels +
   1).
 
-**Still open:** Cout >= 64 (1 KiB per tile, a different narrow
-arrangement), Cin < 16 (another loop scheme), stride 2, k = 2 and 4-7,
-sizes other than 16x16, valid padding.
+**Cin 1, 3, 4 (same day):** byte-identical on the three corpus models
+(parameters included) and bit-exact on the TPU (Cin 1 / 3 / 4 with Cout 8 /
+16 / 32).
+
+- **Single pass.** With one 4-byte word per pixel the TensorOp takes all 9
+  taps in one pass, as k = 1 does (`loop0 = k^2 Cin/4 - 1`, `dp_mode` 2,
+  `reduce_mask` 1, no partial sums); the input walk is a row of k pixels
+  contiguous, then k rows, then the 4 x 4 output pixels.
+- **Walk rule refined:** a loop of count 1 takes the next loop's increment
+  (1 when innermost); the earlier schemes are special cases.
+- **Sub-word input.** For tb < 256 B a row of 4 tiles is one wide word, in
+  a one-slot circular buffer (`w_inc0`, `wide_circ`, `cbuf`, mode 3); the
+  narrow landing area is still a full word (`lb = max(tb, 256)`: copy 2
+  reads `tp + lb`, constants at `tp + 2 lb`, `size64 = lb / 64`,
+  `in_twait = lb / 64`, `s_val = -lb / 4`), the copy ops set `par_hmode` /
+  `psum_hmode`, and there is no `sync counters 0x800` after the pop.
+- **Cin 1 / 3 widening.** The host sends Cin bytes per pixel; the copy ops
+  read them byte-wise (`in_hmode`, per-level `in_mode` 1, `par_mode` 2,
+  `cfg1 = 0x6b + 0x100 Cin` in the second) into 4-byte pixels; the
+  constants get a 64-word zero block and take two wide words at 0x2078,
+  so the input buffer moves to 0x2070. The rest is the Cin 4 program with
+  zero weights in the extra channels. Transcribed: with two samples, the
+  input DMAs' `head_words_m1` is a per-Cin table and the parameter walk
+  increment is -1 for Cin 3, 0 for Cin 1.
+- Column-move sync value is 5 for 1-word pixels.
+
+**Still open:** Cin 8 (18 weight rows, no slot count, other row fields),
+Cout >= 64 (1 KiB per tile, a different narrow arrangement), stride 2,
+k = 2 and 4-7, sizes other than 16x16, valid padding.
 

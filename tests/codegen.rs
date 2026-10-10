@@ -255,6 +255,27 @@ fn conv_matches_compiler() {
             3,
             false,
         ),
+        (
+            "k3_padsame_stride1",
+            "Cin1_Cout32",
+            "actnone_in_range4p0",
+            3,
+            false,
+        ),
+        (
+            "k3_padsame_stride1",
+            "Cin3_Cout32",
+            "actnone_in_range4p0",
+            3,
+            false,
+        ),
+        (
+            "k3_padsame_stride1",
+            "Cin4_Cout32",
+            "actnone_in_range4p0",
+            3,
+            false,
+        ),
     ];
     let mut checked = 0;
     for (kind, ch, act, k, relu) in models {

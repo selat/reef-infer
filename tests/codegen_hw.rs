@@ -106,6 +106,10 @@ async fn generated_programs_on_tpu() {
         (3, 64, 16, true, 60, 0),
         (3, 128, 8, false, 140, 200),
         (3, 128, 32, false, 128, 128),
+        (3, 3, 32, false, 127, 128),
+        (3, 3, 16, true, 0, 0),
+        (3, 1, 8, false, 200, 50),
+        (3, 4, 32, false, 90, 140),
     ] {
         let w = bytes(&mut seed, cout * k * k * cin);
         let conv = Conv {

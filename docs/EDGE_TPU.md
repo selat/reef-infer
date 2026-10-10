@@ -356,8 +356,8 @@ perturbation on the device.
 | Corpus tooling (`tools/isa_corpus/`, `examples/isa_check.rs`) | Done |
 | Generators in Rust (`src/codegen/`): element-wise requant (1x16x16x32), FC (K <= 64, N <= 64) | Done; byte-identical to 16.0 (FC parameters included), bit-exact on device |
 | On-chip loopback broadcast (`elementwise::build_broadcast`) | Done; bit-exact on device; landing layout is the compiler's depthwise one |
-| CONV_2D (`codegen::conv`): same padding, stride 1, 16x16; k 1 (Cin 16, Cout 32) and k 3 (Cin 16-128, Cout 8 / 16 / 32) | Done; byte-identical to 16.0 on 11 corpus models (parameters included), bit-exact on device |
-| Conv: Cout 64+ (other narrow layout), Cin < 16, stride 2, other k, other sizes | Next |
+| CONV_2D (`codegen::conv`): same padding, stride 1, 16x16; k 1 (Cin 16, Cout 32) and k 3 (Cin 1, 3, 4, 16-128; Cout 8 / 16 / 32) | Done; byte-identical to 16.0 on 14 corpus models (parameters included), bit-exact on device |
+| Conv: Cout 64+ (other narrow layout), Cin 8, stride 2, other k, other sizes | Next |
 | FC beyond one pass / one tile | Next |
 | Scheduler/allocator for multi-layer graphs | Weeks to months |
 | PyTorch front end (`torch.export`, int8) | After the above |

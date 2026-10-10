@@ -23,13 +23,19 @@
 //! accumulating in partial-sum memory, and the weight rows are streamed in
 //! that order (`[Cin / 4][ky][kx]`).
 //!
-//! Supported (byte-identical to the compiler on 11 corpus models,
+//! Supported (byte-identical to the compiler on 14 corpus models,
 //! `examples/conv_check.rs`; bit-exact on the TPU): same padding, stride 1,
 //! 16x16, and k = 1 with Cin 16, Cout 32, or k = 3 with Cin in
-//! {16, 32, 64, 128} and Cout in {8, 16, 32}. One tile's input (16 Cin
-//! bytes) lands in a single wide slot for Cin 16 and in a circular buffer of
-//! Cin / 16 slots above that. At Cout = 64 a tile's output is 1 KiB and the
-//! compiler arranges narrow memory differently.
+//! {1, 3, 4, 16, 32, 64, 128} and Cout in {8, 16, 32}.
+//!
+//! One tile's input (16 Cin bytes) lands through a wide-memory buffer: for
+//! Cin <= 4 a row of 4 tiles shares one 256 B word, for Cin 16 a tile is
+//! one word, above that a circular buffer of Cin / 16 slots. Cin 1 and 3
+//! are widened on chip to one 4-byte word per pixel (zero weights in the
+//! extra channels); from there the program is Cin 4's. Cin 4 and k = 1 take
+//! all taps in one TensorOp pass, Cin >= 16 one pass per 4 input channels.
+//! Not yet: Cin 8 (another scheme), Cout >= 64 (a tile's output is 1 KiB
+//! and the compiler arranges narrow memory differently).
 
 use super::fc::Fc;
 use super::*;
@@ -58,12 +64,12 @@ impl Conv {
     pub fn check(&self) -> Result<(), String> {
         let ok = match self.k {
             1 => (self.cin, self.cout) == (16, 32),
-            3 => [16, 32, 64, 128].contains(&self.cin) && [8, 16, 32].contains(&self.cout),
+            3 => [1, 3, 4, 16, 32, 64, 128].contains(&self.cin) && [8, 16, 32].contains(&self.cout),
             _ => false,
         };
         if !ok {
             return Err(format!(
-                "Cin={} Cout={} k={}: supported are k 1 (Cin 16, Cout 32) and k 3 (Cin 16..=128, Cout 8, 16 or 32)",
+                "Cin={} Cout={} k={}: supported are k 1 (Cin 16, Cout 32) and k 3 (Cin 1, 3, 4, 16, 32, 64, 128; Cout 8, 16 or 32)",
                 self.cin, self.cout, self.k
             ));
         }
@@ -80,11 +86,27 @@ impl Conv {
     fn patch(&self) -> Patch {
         let p = (self.k / 2) as i64;
         Patch {
-            cin: self.cin as i64,
+            cin: self.cin_pad() as i64,
             top: p,
             bottom: p,
             left: p,
             right: p,
+        }
+    }
+
+    /// Whether the TensorOp takes all taps and words in one pass (k = 1, or
+    /// one word per pixel) instead of one pass per 4 input channels.
+    fn single_pass(&self) -> bool {
+        self.k == 1 || self.cin_pad() == 4
+    }
+
+    /// The two input copy ops ([`copy_op`]); for Cin 1 / 3 they also widen
+    /// each pixel to one 4-byte word.
+    fn copy(&self, a: &mut Asm, pt: &Patch, par_base: i64, first: bool) -> Result<(), IsaError> {
+        if self.cin < 4 {
+            copy_op_small(a, self.cin as i64, pt, par_base, first)
+        } else {
+            copy_op(a, pt, par_base, first)
         }
     }
 
@@ -96,14 +118,19 @@ impl Conv {
     /// The per-channel arithmetic as an FC over one pixel's window, with K
     /// ordered as the weight rows are streamed: `[Cin / 4][ky][kx][4]`.
     fn fc(&self) -> Fc {
-        let (k, cin) = (self.k, self.cin);
-        let kk = k * k * cin;
+        let (k, cin, cp) = (self.k, self.cin, self.cin_pad());
+        let kk = k * k * cp;
         let mut weights = Vec::with_capacity(self.cout * kk);
         for o in 0..self.cout {
-            for g in 0..cin / 4 {
+            for g in 0..cp / 4 {
                 for t in 0..k * k {
                     for j in 0..4 {
-                        weights.push(self.weights[(o * k * k + t) * cin + 4 * g + j]);
+                        let c = 4 * g + j;
+                        weights.push(if c < cin {
+                            self.weights[(o * k * k + t) * cin + c]
+                        } else {
+                            0
+                        });
                     }
                 }
             }
@@ -118,6 +145,12 @@ impl Conv {
             output: self.output,
             relu: self.relu,
         }
+    }
+
+    /// Input channels as computed: at least 4 (Cin 1 and 3 are widened to
+    /// one 4-byte word per pixel on chip, see [`Conv::input_small`]).
+    fn cin_pad(&self) -> usize {
+        self.cin.max(4)
     }
 
     /// Output channels as stored: at least 16 (the compiler pads with
@@ -147,13 +180,15 @@ impl Conv {
             for xx in 0..w {
                 // window in FC order: [Cin / 4][ky][kx][4]
                 let mut win = Vec::with_capacity(fc.k);
-                for g in 0..cin / 4 {
+                for g in 0..self.cin_pad() / 4 {
                     for ky in 0..k {
                         for kx in 0..k {
                             let (sy, sx) = (y + ky - p, xx + kx - p);
                             for j in 0..4 {
-                                win.push(if (0..h).contains(&sy) && (0..w).contains(&sx) {
-                                    x[((sy * w + sx) as usize) * cin + 4 * g + j]
+                                let c = 4 * g + j;
+                                let inside = (0..h).contains(&sy) && (0..w).contains(&sx);
+                                win.push(if inside && c < cin {
+                                    x[((sy * w + sx) as usize) * cin + c]
                                 } else {
                                     pad
                                 });
@@ -197,7 +232,7 @@ impl Conv {
 
     /// Parameter rows of `Cout x 4` bytes: 3 header rows + `K / 4` weight rows.
     fn param_words(&self) -> i64 {
-        3 + (self.k * self.k * self.cin / 4) as i64
+        3 + (self.k * self.k * self.cin_pad() / 4) as i64
     }
 
     fn caching_program(&self, bytes: usize) -> Result<ChunkInfo, IsaError> {
@@ -225,21 +260,26 @@ impl Conv {
         const IN_NAME: &str = "input";
         const OUT_NAME: &str = "output";
         let pt = self.patch();
-        let (tb, tp, cq) = (pt.tb(), pt.tp(), pt.cq());
+        let (tp, cq) = (pt.tp(), pt.cq());
         let ob = PX * self.cout as i64; // output bytes per tile
         // Input buffer in wide memory: one tile's input is `sw` 256 B words.
         // One word (Cin 16) lands in a single slot at 0x2078, overwritten
         // for each of the row's 4 x 1 words; more use a circular buffer of
         // `sw` slots below 0x2078, refilled once per tile of the row.
-        let sw = tb / 256;
-        let buf = 0x2078 - 8 * (sw - 1);
+        let lb = pt.lb();
+        let sw = lb / 256;
+        // Cin 1 / 3: the host sends Cin bytes per pixel (`tbi` per tile) and
+        // two constant words take 0x2078..; the buffer moves below them.
+        let small = self.cin < 4;
+        let tbi = PX * self.cin as i64;
+        let buf = if small { 0x2070 } else { 0x2078 - 8 * (sw - 1) };
         let mut a = Asm::new();
         prologue(&mut a)?;
 
         // ── Constant setup (as in elementwise): one-hot words at narrow
         // tp + 2 tb, copied to wide just below the input buffer.
-        let const_narrow = tp + 2 * tb;
-        let const_wide = buf - 4;
+        let const_narrow = tp + 2 * lb;
+        let const_wide = if small { 0x2078 } else { buf - 4 };
         for (i, fill) in [1i64, 0x100, 0x10000, 0x1000000].into_iter().enumerate() {
             let mut f = vec![
                 ("tile_mask", ALL_TILES),
@@ -248,42 +288,78 @@ impl Conv {
                 ("fill_en", 1),
                 ("fill", fill),
             ];
-            if i == 3 {
+            if i == 3 && !small {
                 f.push(("in_mode", 3));
             }
             a.emit(OP_MESH_N, &f)?;
         }
-        a.emit(
-            OP_NARROW_TO_WIDE,
-            &[
-                ("tile_mask", ALL_TILES),
-                ("narrow_addr", const_narrow / 4),
-                ("n_inc0", 1),
-                ("n_lim0", 3),
-                ("n_inc1", -3),
-                ("n_inc2", -3),
-                ("n_inc3", -3),
-                ("n_inc4", -3),
-                ("n_inc5", -3),
-                ("narrow_lvl_mask", 1),
-                ("wide_addr", const_wide),
-                ("w_inc0", 1),
-                ("sync_en0", 1),
-                ("sync_f1", 1),
-                ("sync_id", 5),
-                ("sync_wait_lvl", 1),
-                ("sync_en1", 1),
-                ("sync_en2", 1),
-                ("tail_lvl", 1),
-            ],
-        )?;
+        if small {
+            // a zero word after the one-hot words; both go to wide 0x2078
+            let mut f = vec![("tile_mask", ALL_TILES), ("fill_en", 1)];
+            let w = mesh_walk("i", const_narrow + 16, &[(64, 1)]).0;
+            let w: Vec<(&str, i64)> = w.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+            f.extend(w);
+            a.emit(OP_MESH_N, &f)?;
+            sync(&mut a, 0, 0x3ff, false)?;
+            a.emit(
+                OP_NARROW_TO_WIDE,
+                &[
+                    ("tile_mask", ALL_TILES),
+                    ("narrow_addr", const_narrow / 4),
+                    ("n_inc0", 1),
+                    ("n_lim0", 0x43),
+                    ("n_inc1", -0x43),
+                    ("n_inc2", -0x43),
+                    ("n_inc3", -0x43),
+                    ("n_inc4", -0x43),
+                    ("n_inc5", -0x43),
+                    ("narrow_lvl_mask", 1),
+                    ("wide_addr", const_wide),
+                    ("w_inc0", 1),
+                    ("w_lim0", 1),
+                    ("w_inc1", -1),
+                    ("w_inc2", -1),
+                    ("w_inc3", -1),
+                    ("wide_lvl_mask", 1),
+                    ("tail_lvl", 1),
+                    ("sync_en0", 0),
+                    ("sync_en1", 0),
+                    ("sync_en2", 0),
+                ],
+            )?;
+        } else {
+            a.emit(
+                OP_NARROW_TO_WIDE,
+                &[
+                    ("tile_mask", ALL_TILES),
+                    ("narrow_addr", const_narrow / 4),
+                    ("n_inc0", 1),
+                    ("n_lim0", 3),
+                    ("n_inc1", -3),
+                    ("n_inc2", -3),
+                    ("n_inc3", -3),
+                    ("n_inc4", -3),
+                    ("n_inc5", -3),
+                    ("narrow_lvl_mask", 1),
+                    ("wide_addr", const_wide),
+                    ("w_inc0", 1),
+                    ("sync_en0", 1),
+                    ("sync_f1", 1),
+                    ("sync_id", 5),
+                    ("sync_wait_lvl", 1),
+                    ("sync_en1", 1),
+                    ("sync_en2", 1),
+                    ("tail_lvl", 1),
+                ],
+            )?;
+        }
         a.emit(OP_SYNC, &[("tiles", ALL_TILES), ("units", 0x20)])?;
-        copy_op(&mut a, &pt, const_wide & 0xff, true)?;
+        self.copy(&mut a, &pt, const_wide & 0xff, true)?;
 
         // ── Input: 4 tb bytes per row of 4 tiles through the input buffer,
         // landing at narrow tp; column c skips Cin * c words.
         load_input_addr(&mut a, IN_NAME)?;
-        let size = 16 * tb;
+        let size = 16 * tbi;
         let units8 = size / 8;
         a.emit(
             OP_POP,
@@ -307,11 +383,22 @@ impl Conv {
         )?;
         descriptor_addr(&mut a)?;
         descriptor_send(&mut a, size, TAG_INPUT)?;
-        a.emit(OP_SYNC, &[("tiles", ALL_TILES), ("counters", 0x800)])?;
-        let (nw, land) = (tb / 4, tp / 4); // narrow words per tile, landing word
+        if tbi >= 256 {
+            a.emit(OP_SYNC, &[("tiles", ALL_TILES), ("counters", 0x800)])?;
+        }
+        let (nw, land) = (tbi / 4, tp / 4); // narrow words per tile, landing word
         // the buffer's wide-side walk: one slot, 4 words in turn, or `sw`
         // circular slots, 4 rounds
-        let wide: Vec<(&str, i64)> = if sw == 1 {
+        let wide: Vec<(&str, i64)> = if tbi < 256 {
+            // a row of 4 tiles is one word: one circular slot
+            vec![
+                ("wide_addr", buf),
+                ("w_inc0", 1),
+                ("wide_circ", 1),
+                ("wide_rows", 1),
+                ("sync_wait_lvl", 1),
+            ]
+        } else if sw == 1 {
             vec![("wide_addr", buf), ("w_lim0", 3), ("wide_rows", 1)]
         } else {
             vec![
@@ -335,20 +422,38 @@ impl Conv {
                 ("narrow_addr", land),
                 ("n_inc0", 1),
                 ("n_lim0", nw - 1),
-                ("n_lim1", 3),
+                ("n_lim1", if small { 4 } else { 3 }),
                 ("narrow_lvl_mask", 1),
                 ("mode", 1),
-                ("size64", tb / 64),
+                ("size64", lb / 64),
             ]);
             for n in ["n_inc1", "n_inc2", "n_inc3", "n_inc4", "n_inc5"] {
                 f.push((n, -(nw - 1)));
             }
-            if col > 0 {
-                let skip = self.cin as i64 * col;
+            let skip = self.cin as i64 * col;
+            // head of the first narrow row; for Cin 1 / 3 the compiler's
+            // values (not derived; tail_words follows from them)
+            let head = match self.cin {
+                1 => [43, 46, 45, 44][col as usize],
+                3 => [15, 12, 9, 6][col as usize],
+                _ => nw - 1 - skip,
+            };
+            if small {
                 f.extend([
-                    ("head_words_m1", nw - 1 - skip),
+                    ("head_words_m1", head),
                     ("head_en", 1),
-                    ("tail_words", skip),
+                    ("tail_words", nw - (head + 1)),
+                ]);
+            }
+            if col > 0 {
+                if !small {
+                    f.extend([
+                        ("head_words_m1", head),
+                        ("head_en", 1),
+                        ("tail_words", skip),
+                    ]);
+                }
+                f.extend([
                     ("skip_en0", 1),
                     ("skip_base", land),
                     ("skip_m1", skip - 1),
@@ -370,8 +475,17 @@ impl Conv {
             ]);
             a.emit(OP_WIDE_TO_NARROW, &f)?;
         }
-        let per_row = 4 * tb / 8; // infeed units of 8 B
-        let consumer: Vec<(&str, i64)> = if sw == 1 {
+        let per_row = 4 * tbi / 8; // infeed units of 8 B
+        let consumer: Vec<(&str, i64)> = if tbi < 256 {
+            vec![
+                ("addr", buf),
+                ("inc0", 1),
+                ("cbuf", 1),
+                ("slots", 1),
+                ("mode", 3),
+                ("s_id", 0x2b),
+            ]
+        } else if sw == 1 {
             vec![
                 ("addr", buf),
                 ("cnt0", 3),
@@ -399,7 +513,7 @@ impl Conv {
             let mut f = consumer.clone();
             f.extend([
                 ("tile_mask", 0xf << (4 * row)),
-                ("s_val", -(tb / 4)),
+                ("s_val", -(lb / 4)),
                 ("s_cnt", sw),
                 ("s_en_b", 1),
                 ("s_y", 1),
@@ -432,7 +546,7 @@ impl Conv {
             )?;
         }
         sync(&mut a, 0, 0x3ff, false)?;
-        copy_op(&mut a, &pt, const_wide & 0xff, false)?;
+        self.copy(&mut a, &pt, const_wide & 0xff, false)?;
         sync(&mut a, 0x1ffff, 0x3ff, false)?;
         if self.k > 1 {
             halo(&mut a, &pt, self.input.zero_point)?;
@@ -446,7 +560,10 @@ impl Conv {
         // per tap, refilled for each of the Cin / 4 passes (k = 3).
         let taps = self.taps();
         let oq = (self.cout / 4) as i64;
-        let (slots, passes) = if self.k == 1 { (cq, 1) } else { (taps, cq) };
+        // Single pass over all taps and words (k = 1, or Cin = 4: one word
+        // per pixel), or one pass per 4 input channels over the taps.
+        let single = self.single_pass();
+        let (slots, passes) = if single { (taps * cq, 1) } else { (taps, cq) };
         let slots_addr = 0x1fe8 - 8 * slots;
         let mut f: Vec<(&str, i64)> = vec![
             ("tile_mask", ALL_TILES),
@@ -518,12 +635,18 @@ impl Conv {
         let (lo, hi) = self.fc().clamp();
         let mut f: Vec<(String, i64)> = Vec::new();
         let rs = pt.pw() * cq; // padded row stride in words
+        let k = self.k as i64;
         let (in_dims, loops): (Vec<(i64, i64)>, [i64; 3]) = if self.k == 1 {
             // per pixel: Cin / 4 words against the slots
             (vec![(cq, 1), (1, 0), (PX, cq)], [cq - 1, PX - 1, 0])
+        } else if single {
+            // per pixel: the k x k window, a row of k pixels contiguous
+            (
+                vec![(k * cq, 1), (k, rs), (1, 0), (4, cq), (4, rs)],
+                [taps * cq - 1, PX - 1, 0],
+            )
         } else {
             // per pass (4 channels): taps (x, y), then pixels (x, y)
-            let k = self.k as i64;
             (
                 vec![(1, 0), (k, cq), (k, rs), (4, cq), (4, rs), (cq, 1)],
                 [taps - 1, PX - 1, cq - 1],
@@ -538,7 +661,16 @@ impl Conv {
         let fixed: Vec<(&str, i64)> = vec![
             ("tile_mask", ALL_TILES),
             ("in_mode7", 3),
-            ("in_tflags", if self.k == 1 { 1 } else { 0xf }),
+            (
+                "in_tflags",
+                if self.k == 1 {
+                    1
+                } else if single {
+                    7
+                } else {
+                    0xf
+                },
+            ),
             ("out_base", tp),
             ("out_inc0", 1),
             ("out_cnt0", oq - 1),
@@ -559,17 +691,17 @@ impl Conv {
             ("cfg1", 0x14f),
             ("sync0", 0x4000),
             ("sync1", 0x4000),
-            ("sync2", if self.k == 1 { 0xa6 } else { 0xb6 }),
+            ("sync2", if single { 0xa6 } else { 0xb6 }),
             ("sync3", 0x80),
             ("sync4", 0x80),
-            ("cfg2", if self.k == 1 { 7 } else { 3 }),
+            ("cfg2", if single { 7 } else { 3 }),
             ("cfg3", 8),
             ("in_zp", self.input.zero_point as i64),
             ("row_a", 0x7ff),
             ("row_m", 3),
             ("row_c", 0x7fc),
-            ("dp_mode", if self.k == 1 { 2 } else { 3 }),
-            ("reduce_mask", if self.k == 1 { 1 } else { 5 }),
+            ("dp_mode", if single { 2 } else { 3 }),
+            ("reduce_mask", if single { 1 } else { 5 }),
             ("out_ch_last", self.cout as i64 - 1),
             ("out_ch", self.cout as i64 - 1),
             ("mult_bits", 1.0f32.to_bits() as i64),
@@ -586,9 +718,9 @@ impl Conv {
         for j in 2..8 {
             f.push((format!("par_inc{j}"), -(slots - 1)));
         }
-        if self.k == 1 {
+        if single {
             f.extend([
-                ("psum_cnt0".into(), cq - 1),
+                ("psum_cnt0".into(), slots - 1),
                 ("psum_cnt1".into(), PX - 1),
                 ("psum_tflags".into(), 0x840),
             ]);
@@ -708,20 +840,34 @@ impl Conv {
 /// Address-generator fields `{p}_inc{j}` / `{p}_cnt{j}` for a loop nest
 /// `dims` (innermost first) of `(count, stride)` in words. An increment is
 /// applied from the last element of the inner loops, so it is the stride
-/// minus their span; a loop of count 1 gets increment 1. The levels after
-/// the last loop (up to `levels`) rewind to the start.
+/// minus their span. A loop of count 1 takes the next loop's increment (1
+/// when innermost). The levels after the last loop (up to `levels`) rewind
+/// to the start.
 fn walk(p: &str, dims: &[(i64, i64)], levels: usize) -> Vec<(String, i64)> {
-    let mut f = Vec::new();
+    let mut inc = vec![0; levels];
+    let mut cnt = vec![0; dims.len()];
     let mut span = 0;
     for (j, &(n, stride)) in dims.iter().enumerate() {
-        f.push((format!("{p}_inc{j}"), if n > 1 { stride - span } else { 1 }));
         if n > 1 {
-            f.push((format!("{p}_cnt{j}"), n - 1));
+            inc[j] = stride - span;
+            cnt[j] = n - 1;
             span += (n - 1) * stride;
         }
     }
-    for j in dims.len()..levels {
-        f.push((format!("{p}_inc{j}"), -span));
+    for v in inc.iter_mut().skip(dims.len()) {
+        *v = -span;
+    }
+    for j in (0..dims.len()).rev() {
+        if dims[j].0 <= 1 {
+            inc[j] = if j == 0 { 1 } else { inc[j + 1] };
+        }
+    }
+    let mut f = Vec::new();
+    for j in 0..levels {
+        f.push((format!("{p}_inc{j}"), inc[j]));
+        if j < dims.len() && cnt[j] > 0 {
+            f.push((format!("{p}_cnt{j}"), cnt[j]));
+        }
     }
     f
 }
@@ -736,11 +882,112 @@ fn mesh_walk(p: &str, addr: i64, dims: &[(i64, i64)]) -> (Vec<(String, i64)>, i6
     (f, dims.len() as i64)
 }
 
+/// [`copy_op`] for Cin 1 / 3 with k = 3 (a 6x6 patch of 4-byte pixels):
+/// the input walk takes Cin bytes per pixel (`in_hmode`, per-level
+/// `in_mode` 1) and the parameter walk the one-hot constants per byte.
+/// Transcribed from the compiler (Cin 1 and 3); the per-level modes and
+/// `hmode` fields are not decoded.
+fn copy_op_small(
+    a: &mut Asm,
+    cin: i64,
+    pt: &Patch,
+    par_base: i64,
+    first: bool,
+) -> Result<(), IsaError> {
+    let mut f: Vec<(String, i64)> = Vec::new();
+    let mut push = |n: &str, v: i64| f.push((n.to_string(), v));
+    for (n, v) in [
+        ("tile_mask", ALL_TILES),
+        ("loop0", cin - 1),
+        ("loop1", 3),
+        ("in_base", if first { pt.tp() } else { pt.tp() + pt.lb() }),
+        ("in_hmode", 1),
+        ("in_cnt0", cin - 1),
+        ("in_cnt1", 3),
+        ("in_inc2", 3 * cin),
+        ("in_mode7", 3),
+        ("in_tflags", 0xc1),
+        ("in_twait", pt.lb() / 64),
+        ("out_base", pt.at(if first { 0 } else { 3 }, 0)),
+        ("out_inc0", 1),
+        ("out_inc1", 1),
+        ("out_cnt1", 3),
+        ("out_inc2", 3),
+        ("out_mode7", 3),
+        ("out_tflags", if first { 7 } else { 3 }),
+        ("par_base", par_base),
+        ("par_sel", 1),
+        ("par_hmode", 1),
+        ("par_cnt0", cin - 1),
+        ("par_cnt1", 3),
+        ("par_mode7", 1),
+        ("psum_cnt0", cin - 1),
+        ("psum_cnt1", 3),
+        ("psum_tflags", 0x840),
+        ("cfg0", 7),
+        ("cfg1", if first { 0x6b } else { 0x6b + 0x100 * cin }),
+        ("sync0", if first { cin } else { 3 * cin }),
+        ("sync1", 0x4000 + cin),
+        ("cfg2", 6),
+        ("cfg3", 7),
+        ("dp_mode", 3),
+        ("reduce_mask", 1),
+        ("out_ch_last", 3),
+        ("out_ch", 3),
+        ("mult_bits", 1.0f32.to_bits() as i64),
+        ("clamp_max_bits", f32::INFINITY.to_bits() as i64),
+        ("clamp_min_bits", f32::NEG_INFINITY.to_bits() as i64),
+    ] {
+        push(n, v);
+    }
+    if cin == 1 {
+        push("psum_hmode", 1);
+    }
+    for j in 0..7 {
+        push(&format!("in_mode{j}"), 1);
+        if cin > 1 {
+            push(&format!("par_mode{j}"), 2);
+        }
+    }
+    for j in 3..8 {
+        push(&format!("in_inc{j}"), -cin);
+    }
+    for j in 1..8 {
+        // -1 for Cin 3, 0 for Cin 1 (two samples)
+        push(&format!("par_inc{j}"), -((cin > 1) as i64));
+    }
+    if first {
+        // rows 0-2: a third loop
+        for (n, v) in [
+            ("loop3", 2),
+            ("in_cnt3", 2),
+            ("out_inc3", 3),
+            ("out_cnt3", 2),
+            ("out_inc4", 0x15),
+            ("par_cnt2", 2),
+            ("psum_cnt2", 2),
+        ] {
+            push(n, v);
+        }
+        for j in 5..8 {
+            push(&format!("out_inc{j}"), -0xf);
+        }
+    } else {
+        push("out_inc3", 0x21);
+        for j in 4..8 {
+            push(&format!("out_inc{j}"), -3);
+        }
+    }
+    let f: Vec<(&str, i64)> = f.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+    a.emit(OP_TENSOR, &f)?;
+    Ok(())
+}
+
 /// One halo move: interior part sent (`o_addr`) into the neighbour's halo
 /// (`i_addr`), over `dims`. `groups` are the tile masks that only receive,
 /// that send and receive, and that send and fill their own halo with the
 /// zero point (no neighbour on that side). Column moves wait on sync
-/// flags 6 / 0xa (value 6 for one-pixel halos, Cin >= 8), after the rows.
+/// flags 6 / 0xa after the rows.
 struct Move {
     op: u8,
     o_addr: i64,
@@ -757,6 +1004,9 @@ fn halo(a: &mut Asm, pt: &Patch, zp: i32) -> Result<(), IsaError> {
     let (cq, pw) = (pt.cq(), pt.pw());
     let rs = pw * cq;
     let fill = (zp as u8 as i64) * 0x0101_0101;
+    // value the column moves wait for (not decoded): 5 for 1-word pixels,
+    // 6 from 2 words up, with 1-pixel halos (corpus; 7 for deeper halos)
+    let sync_val = if cq == 1 { 5 } else { 6 };
     // a pixel's words move in beats of at most 16; the beats of a wider
     // pixel are the outermost loop
     let (beat, beats) = (cq.min(16), (cq / 16).max(1));
@@ -828,7 +1078,7 @@ fn halo(a: &mut Asm, pt: &Patch, zp: i32) -> Result<(), IsaError> {
                 for s in ["s0", "s1"] {
                     f.extend([
                         (format!("{s}_id"), if s == "s0" { 6 } else { 0xa }),
-                        (format!("{s}_val"), 6),
+                        (format!("{s}_val"), sync_val),
                         (format!("{s}_en_a"), 1),
                         (format!("{s}_en_b"), 1),
                     ]);

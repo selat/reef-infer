@@ -510,6 +510,10 @@ impl Patch {
     pub fn tb(&self) -> i64 {
         16 * self.cin
     }
+    /// Narrow bytes the infeed lands per tile: at least one 256 B wide word.
+    pub fn lb(&self) -> i64 {
+        self.tb().max(256)
+    }
     /// Padded bytes.
     pub fn tp(&self) -> i64 {
         self.pw() * self.ph() * self.cin
@@ -539,7 +543,7 @@ pub fn copy_op(a: &mut Asm, p: &Patch, par_base: i64, first: bool) -> Result<(),
         )
     } else {
         (
-            tp + tb,
+            tp + p.lb(),
             p.at(3, 0),
             tp / 4 - (4 * cq - 1),
             -(4 * cq - 1),
@@ -557,7 +561,7 @@ pub fn copy_op(a: &mut Asm, p: &Patch, par_base: i64, first: bool) -> Result<(),
         ("in_cnt1", 3),
         ("in_mode7", 3),
         ("in_tflags", 0x80),
-        ("in_twait", w),
+        ("in_twait", p.lb() / 64),
         ("out_base", out_base),
         ("out_inc0", 1),
         ("out_cnt0", w - 1),
@@ -604,6 +608,10 @@ pub fn copy_op(a: &mut Asm, p: &Patch, par_base: i64, first: bool) -> Result<(),
         ]);
     } else {
         f.extend([("par_cnt2", 3), ("psum_cnt2", 3)]);
+    }
+    if tb < 256 {
+        // under one wide word per tile
+        f.extend([("par_hmode", 1), ("psum_hmode", 1)]);
     }
     a.emit(OP_TENSOR, &f)?;
     Ok(())
