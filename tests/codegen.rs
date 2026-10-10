@@ -276,6 +276,20 @@ fn conv_matches_compiler() {
             3,
             false,
         ),
+        (
+            "k1_padsame_stride2",
+            "Cin16_Cout32",
+            "actnone_in_range4p0",
+            1,
+            false,
+        ),
+        (
+            "k3_padsame_stride2",
+            "Cin16_Cout32",
+            "actnone_in_range4p0",
+            3,
+            false,
+        ),
     ];
     let mut checked = 0;
     for (kind, ch, act, k, relu) in models {
@@ -307,6 +321,7 @@ fn conv_matches_compiler() {
             cin,
             cout,
             k,
+            stride: if kind.ends_with("stride2") { 2 } else { 1 },
             weights: nums("weights").map_or(vec![1; cout * k * k * cin], |v| {
                 v.iter().map(|&x| x as i8).collect()
             }),

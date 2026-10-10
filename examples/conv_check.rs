@@ -126,6 +126,7 @@ fn main() {
             cin,
             cout,
             k,
+            stride: get("stride"),
             weights: nums("weights").map_or(vec![1; cout * k * k * cin], |v| {
                 v.iter().map(|&x| x as i8).collect()
             }),
@@ -136,10 +137,7 @@ fn main() {
             output: quant(&e.output_layers[0]),
             relu: p["act"] == "relu",
         };
-        if conv.check().is_err()
-            || (get("H"), get("W"), get("stride")) != (16, 16, 1)
-            || p["pad"] != "same"
-        {
+        if conv.check().is_err() || (get("H"), get("W")) != (16, 16) || p["pad"] != "same" {
             continue;
         }
         total += 1;

@@ -538,7 +538,30 @@ combinations the corpus lacks). Three rules:
   increment is -1 for Cin 3, 0 for Cin 1.
 - Column-move sync value is 5 for 1-word pixels.
 
+**Stride 2 (same day):** byte-identical on the k = 1 and k = 3 stride-2
+corpus models and bit-exact on the TPU (k 1 Cin 16; k 3 with Cin 3 / 16 /
+64, Cout 8 / 16 / 32, including Cin 3 with ReLU, which the corpus lacks).
+
+- **Padding** is TensorFlow's same padding, `total = max((out - 1) s + k -
+  in, 0)` with the extra pixel after: k = 3 stride 2 pads 1 pixel bottom /
+  right, none top / left. The patch is then 5x5 and only the north and west
+  mesh moves remain (10 mesh ops). Checked on the TPU: a reference padded
+  on the other side gets ~98% of the outputs wrong.
+- **Sync flags:** the west move then waits on 0xa alone, so 0xa is the
+  north move's flag and 6 the south one's.
+- **Walks:** the output pixels step by `s` pixels (`s cq`, `s rs`), 2x2
+  per tile; partial sums are 4 words per output pixel (`psum_base` =
+  slots - 4 npx); the output narrowToWide walks words x pixels x rows
+  (`n_lim0` = Cout/4 - 1, `n_lim1` = `n_lim2` = 4/s - 1).
+- **Walk rule, final:** every level's increment is its stride minus the
+  inner span, including loops of count 1 (with their nominal stride: a
+  word or a pixel step). The "count 1 copies the next increment" rule was a
+  coincidence of the samples.
+- The Cin 1 / 3 copy ops' output walk is the regular copy op's (rows one
+  level up in the first copy), so it follows the patch size; Cin 3 stride
+  2 (5x5 patch, not in the corpus) is bit-exact with it.
+
 **Still open:** Cin 8 (18 weight rows, no slot count, other row fields),
-Cout >= 64 (1 KiB per tile, a different narrow arrangement), stride 2,
-k = 2 and 4-7, sizes other than 16x16, valid padding.
+Cout >= 64 (1 KiB per tile, a different narrow arrangement), k = 2 and
+4-7, sizes other than 16x16, valid padding.
 
