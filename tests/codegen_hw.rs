@@ -96,21 +96,26 @@ async fn generated_programs_on_tpu() {
 
     // Convolutions with random weights: 1x1, and 3x3 (halo exchange, zero
     // point padding at the image border).
-    for (k, cout, relu, in_zp, out_zp) in [
-        (1, 32, false, 127, 131),
-        (1, 32, true, 100, 0),
-        (3, 32, false, 127, 130),
-        (3, 16, true, 3, 0),
-        (3, 8, false, 250, 20),
+    for (k, cin, cout, relu, in_zp, out_zp) in [
+        (1, 16, 32, false, 127, 131),
+        (1, 16, 32, true, 100, 0),
+        (3, 16, 32, false, 127, 130),
+        (3, 16, 16, true, 3, 0),
+        (3, 16, 8, false, 250, 20),
+        (3, 32, 32, false, 128, 120),
+        (3, 64, 16, true, 60, 0),
+        (3, 128, 8, false, 140, 200),
+        (3, 128, 32, false, 128, 128),
     ] {
-        let cin = 16;
         let w = bytes(&mut seed, cout * k * k * cin);
         let conv = Conv {
             cin,
             cout,
             k,
             weights: w.iter().map(|&b| b as i8).collect(),
-            w_scale: (0..cout).map(|i| 0.0007 + 0.0001 * i as f32).collect(),
+            w_scale: (0..cout)
+                .map(|i| (0.0007 + 0.0001 * i as f32) * 16.0 / cin as f32)
+                .collect(),
             bias: (0..cout).map(|i| 300 * i as i32 - 4000).collect(),
             input: Quant {
                 scale: 0.03,
@@ -133,7 +138,7 @@ async fn generated_programs_on_tpu() {
             let bad = got.iter().zip(&want).filter(|(a, b)| a != b).count();
             assert!(
                 bad == 0,
-                "conv k={k} Cout={cout} relu={relu} zp {in_zp}/{out_zp}: {bad}/{} wrong",
+                "conv k={k} Cin={cin} Cout={cout} relu={relu} zp {in_zp}/{out_zp}: {bad}/{} wrong",
                 want.len()
             );
         }

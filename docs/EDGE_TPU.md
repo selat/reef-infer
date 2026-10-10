@@ -319,7 +319,8 @@ rules came out of it:
 
 ### 6.6 Still unknown
 
-`op` 1946-1948 (activation ops, 5 values), `wideToNarrow` 643-645 and 490-493,
+`op` 1946-1948 (activation ops, 5 values), `wideToNarrow` 490-493 (643-645 are
+the top bits of `sync_val`, 2026-10-10),
 single-instance bits in MobileNet programs, TTU mode bits per level, exact
 sync counter semantics, `sync.b43`, `halt.code`. Most need targeted sweeps
 (stride-2 depthwise, multi-input elementwise, streamed weights) or
@@ -355,8 +356,8 @@ perturbation on the device.
 | Corpus tooling (`tools/isa_corpus/`, `examples/isa_check.rs`) | Done |
 | Generators in Rust (`src/codegen/`): element-wise requant (1x16x16x32), FC (K <= 64, N <= 64) | Done; byte-identical to 16.0 (FC parameters included), bit-exact on device |
 | On-chip loopback broadcast (`elementwise::build_broadcast`) | Done; bit-exact on device; landing layout is the compiler's depthwise one |
-| CONV_2D (`codegen::conv`): same padding, stride 1, 16x16, Cin 16; k 1 (Cout 32) and k 3 (Cout 8 / 16 / 32) | Done; byte-identical to 16.0 on 8 corpus models (parameters included), bit-exact on device |
-| Conv: Cin 32-128 (circular input buffer), Cout 64+ (other narrow layout), stride 2, other k, other sizes | Next |
+| CONV_2D (`codegen::conv`): same padding, stride 1, 16x16; k 1 (Cin 16, Cout 32) and k 3 (Cin 16-128, Cout 8 / 16 / 32) | Done; byte-identical to 16.0 on 11 corpus models (parameters included), bit-exact on device |
+| Conv: Cout 64+ (other narrow layout), Cin < 16, stride 2, other k, other sizes | Next |
 | FC beyond one pass / one tile | Next |
 | Scheduler/allocator for multi-layer graphs | Weeks to months |
 | PyTorch front end (`torch.export`, int8) | After the above |

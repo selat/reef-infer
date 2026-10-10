@@ -174,7 +174,10 @@ fn dma_sync(f: F, lo: u32, w2n: bool) -> F {
         .u("sync_id", lo + 4, 5)
         .u("sync_wait_lvl", lo + 9, 2)
         .u("sync_en1", lo + 12, 1)
-        .u("sync_val", lo + 13, 19)
+        // 22 bits: the wideToNarrow loading conv headers counts 0x8000 per
+        // input-channel pass, up to 0x100000 for Cin 128 (bits 643-645
+        // were "unexplained" before; 2026-10-10)
+        .u("sync_val", lo + 13, 22)
         .u("sync_en2", lo + 44, 1)
         .u("sync_f45", lo + 45, 1);
     if w2n {

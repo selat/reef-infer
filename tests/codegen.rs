@@ -234,6 +234,27 @@ fn conv_matches_compiler() {
             3,
             false,
         ),
+        (
+            "k3_padsame_stride1",
+            "Cin32_Cout32",
+            "actnone_in_range4p0",
+            3,
+            false,
+        ),
+        (
+            "k3_padsame_stride1",
+            "Cin64_Cout32",
+            "actnone_in_range4p0",
+            3,
+            false,
+        ),
+        (
+            "k3_padsame_stride1",
+            "Cin128_Cout32",
+            "actnone_in_range4p0",
+            3,
+            false,
+        ),
     ];
     let mut checked = 0;
     for (kind, ch, act, k, relu) in models {
@@ -242,7 +263,10 @@ fn conv_matches_compiler() {
         };
         let compiled = load_tflite_model(&path).unwrap();
         let e = &compiled.executables[0];
-        let (cin, cout) = (16, e.output_layers[0].z_dim as usize);
+        let (cin, cout) = (
+            e.input_layers[0].z_dim as usize,
+            e.output_layers[0].z_dim as usize,
+        );
         // weights from tools/isa_corpus/conv_ref.py, if exported
         let r: Option<serde_json::Value> =
             std::fs::read_to_string(PathBuf::from(&path).with_file_name("conv_ref.json"))

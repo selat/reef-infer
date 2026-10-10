@@ -492,7 +492,27 @@ with same padding and H, W multiples of 4: 3 TensorOps, one multicast):
 pixels); with the zero point all match. Interior tile edges, which depend
 on the neighbour moves, are exact.
 
-**Still open:** Cin 32-128 (input lands in a circular buffer with Cin/16
-slots), Cout >= 64 (1 KiB per tile, a different narrow arrangement), stride
-2, k = 2 and 4-7, sizes other than 16x16, valid padding.
+**Cin 32-128 (same day):** byte-identical on the Cin 32, 64, 128 corpus
+models and bit-exact on the TPU (Cin 32/64/128 with Cout 8/16/32, including
+combinations the corpus lacks). Three rules:
+
+- **Input buffer.** One tile's input is `S = Cin / 16` wide words. S = 1
+  lands in one slot at 0x2078 (the row's 4 words overwrite it in turn);
+  S > 1 uses a circular buffer of S slots at `0x2078 - 8 (S - 1)` (0x2070,
+  0x2060, 0x2040), refilled once per tile of the row (`w_lim1` / `cnt1` =
+  3, `slots` = `s_cnt` = S, `s_id` 0x2b, mode 3). `s_val = -tb / 4` in both
+  forms. Constants sit 4 below the buffer. Element-wise's input stage is
+  the S = 2 circular form.
+- **Header `sync_val` = 0x8000 x passes** (Cin / 4 for k = 3: 0x20000,
+  0x40000, 0x80000, 0x100000). Our `sync_val` field was 19 bits; the
+  "unexplained" `wideToNarrow` bits 643-645 are its top bits (now 22 bits,
+  all corpus bitstreams still round-trip).
+- **Mesh beats.** A pixel moves in beats of at most 16 words; Cin 128 (32
+  words) adds the beats as the outermost loop (`(16, 1)` innermost, `(2,
+  16)` outermost), and that level does not count in `in_mode` (2 x levels +
+  1).
+
+**Still open:** Cout >= 64 (1 KiB per tile, a different narrow
+arrangement), Cin < 16 (another loop scheme), stride 2, k = 2 and 4-7,
+sizes other than 16x16, valid padding.
 
