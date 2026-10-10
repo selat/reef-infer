@@ -386,3 +386,51 @@ range works, so the row is not an address the infeed reads.
 pointer comparison?); what `loop_k168` selects; a loopback in a generated
 program (experiment 3).
 
+## Generated loopback on hardware (2026-10-10)
+
+`elementwise::build_broadcast(rq, in, out, src)`: the identity/requant
+program plus, before the output stage, a barrier, tile `src`'s ringProducer
+-> loopback outfeed -> loopback infeed -> a ringConsumer on all 16 tiles,
+and a second barrier. Checked by `examples/broadcast_hw.rs` and
+`tests/codegen_hw.rs`: other tiles hold zeros, the host producers are
+pointed at each received unit's wide address, and two input passes recover
+which source byte landed where. **Bit-exact on all 16 tiles for sources 0,
+3, 5, 6 and 15.**
+
+Getting there, in order (each step was a hang until fixed):
+
+1. **Epilogue.** The compiler waits on counter 6 for loopback rows and adds
+   them to counter 5 (`thr5` = 16 + rows, `thr6` = rows, `smask = wait =
+   0x60`, `sync counters 0x60000`; C8 dwconv 18 / 2, C32 22 / 6).
+   `codegen::epilogue` takes the row count.
+2. **Host producer `r0_val`.** Compiled dwconv uses `t + 6` after its 6-row
+   loopback; ours now use `rows + t`. Fixing it alone did not stop the
+   hang; whether it is needed was not tested.
+3. **Consumer form.** A plain consumer (no `cbuf` / aux / `rsv286`) never
+   completes. Bisected on the compiled program: clearing `aux_en0` or
+   `rsv286` hangs, `aux_en1` / `rsv319` corrupt data, the consumer's `s_*`
+   and the producer's `r0` / `r1` sync fields change nothing. No
+   "no aux" combination ran, also with infeed `loop_k308` / `loop_k315`
+   cleared or set to 1 or 2. Copying the C8 3x3 consumer verbatim (plus its
+   infeed `count_m1 0x1f` / `count_neg 0x20`) ran.
+
+Bisection pieces (`elementwise::part`, `PARTS=` in the example): barriers
+alone run; consumer without producer hangs, as expected.
+
+**Landing layout** (C8 consumer, `elementwise::bcast_unit_addr`): 24 units of
+16 B arrive (source bytes 0-383; 384-511 never do). Units 0-2 -> 0x1fe8,
+0x1fec, 0x1ff0; 3-11 -> 0x1fa0..0x1fc0; 12-14 -> 0x1ff4..0x1ffc; 15-23 ->
+0x1fc4..0x1fe4. That is 3 aux + 9 slot units per 192 B, the depthwise
+`k^2 + 3` split. A host producer at wide address A returns 16 B from A and
+16 B from A + 4 (rest zero), so one wide address step of 4 is 16 B of
+received data. Raw broadcast without this re-layout needs a consumer form we
+have not found.
+
+**Runner fix.** A hung program can announce an output (tag 3) and never
+send it; `bulk_recv` then blocked forever (one probe sat for 8 minutes).
+All in-loop USB transfers in `runner.rs` now time out after 2 s
+(`DeviceError::Timeout`), so hangs are recoverable by reopening.
+
+**Still open:** a consumer that lands the stream linearly; why only 384 of
+512 B arrive (row size vs consumer slots); what `loop_k168` selects.
+

@@ -200,6 +200,190 @@ fn requant_op(a: &mut Asm, rq: &Requant) -> Result<(), IsaError> {
 /// Builds the program. `rsv543` sets the unexplained `wideToNarrow` bit 543
 /// the compiler sets alongside `skip_en0`.
 pub fn build(rq: &Requant, input: Quant, output: Quant, rsv543: bool) -> Result<Program, IsaError> {
+    build_inner(rq, input, output, rsv543, None)
+}
+
+/// [`build`] plus an on-chip loopback before the output stage: tile `src`
+/// sends its result at wide 0x2078 over the ring to scalar memory, and the
+/// scalar core multicasts it to all 16 tiles (verified bit-exact on
+/// hardware, `examples/broadcast_hw.rs`). The output is still each tile's
+/// own result. The loopback fields are the compiler's for a 2-row C8 3x3
+/// depthwise program, so the receiving ringConsumer splits each 192 B row
+/// into 3 aux units (0x1fe8 + 4 per 16 B) and 9 slot units (0x1fa0 + ...):
+/// only the first 384 B of the 512 B arrive, at [`bcast_unit_addr`].
+pub fn build_broadcast(
+    rq: &Requant,
+    input: Quant,
+    output: Quant,
+    src: usize,
+) -> Result<Program, IsaError> {
+    build_broadcast_parts(rq, input, output, src, ALL_PARTS)
+}
+
+/// Pieces of [`build_broadcast`], for bisecting on hardware.
+pub mod part {
+    pub const CONSUMER: u8 = 1;
+    pub const INFEED: u8 = 2;
+    pub const OUTFEED: u8 = 4;
+    pub const PRODUCER: u8 = 8;
+    pub const BARRIER_PRE: u8 = 16;
+    pub const BARRIER_POST: u8 = 32;
+    /// Epilogue waits for the loopback rows (counters 5 and 6).
+    pub const EPILOGUE: u8 = 64;
+}
+const ALL_PARTS: u8 = 0x7f;
+
+/// [`build_broadcast`] with only the pieces in `parts` (see [`part`]).
+#[doc(hidden)]
+pub fn build_broadcast_parts(
+    rq: &Requant,
+    input: Quant,
+    output: Quant,
+    src: usize,
+    parts: u8,
+) -> Result<Program, IsaError> {
+    assert!(src < 16);
+    build_inner(rq, input, output, true, Some((src as i64, parts)))
+}
+
+/// Rows moved by the loopback (192 B each with this consumer).
+const BCAST_WORDS: i64 = 2;
+
+/// Wide address at which a tile receives 16 B unit `u` (< 24) of a
+/// [`build_broadcast`] loopback: per 192 B row, 3 aux units then 9 slots.
+pub fn bcast_unit_addr(u: usize) -> i64 {
+    assert!(u < 24);
+    let (row, k) = (u / 12, u % 12);
+    if k < 3 {
+        0x1fe8 + 4 * (3 * row + k) as i64
+    } else {
+        0x1fa0 + 4 * (9 * row + k - 3) as i64
+    }
+}
+/// Wide address the result sits at and the broadcast lands at.
+const OUT_WIDE: i64 = 0x2078;
+
+/// Tile `src` (wide [`OUT_WIDE`]) -> scalar memory -> all tiles. Each
+/// tile's ringConsumer is queued first; the scalar core then arms the
+/// loopback infeed, the loopback outfeed, and tile `src`'s ringProducer.
+fn broadcast(a: &mut Asm, src: i64, parts: u8) -> Result<(), IsaError> {
+    let rows_m1 = BCAST_WORDS - 1;
+    if parts & part::CONSUMER != 0 {
+        // The compiler's 2-row (C8 3x3 dwconv) loopback consumer, verbatim:
+        // a 9-slot circular buffer at 0x1fa0 plus aux rows at 0x1fe9 /
+        // 0x1ffc. `aux_en0` and `rsv286` are required (clearing either
+        // hangs the compiled program).
+        a.emit(
+            OP_RING_CONSUMER,
+            &[
+                ("tile_mask", ALL_TILES),
+                ("addr", 0x1fa0),
+                ("inc0", 1),
+                ("cnt0", 8),
+                ("inc1", -8),
+                ("inc2", -8),
+                ("cnt2", 1),
+                ("inc3", -8),
+                ("sdims", 1),
+                ("cbuf", 1),
+                ("slots", 9),
+                ("aux_en0", 1),
+                ("aux_addr0", 0x1fe9),
+                ("aux_addr1", 0x1ffc),
+                ("aux_en1", 1),
+                ("mode", 3),
+                ("s_id", 0x21),
+                ("s_val", -1),
+                ("s_en_a", 1),
+                ("s_en_b", 1),
+                ("s_y", 1),
+                ("rsv286", 2),
+                ("rsv319", 1),
+            ],
+        )?;
+    }
+    if parts & part::INFEED != 0 {
+        a.emit(
+            OP_INFEED,
+            &[
+                ("loop_en", 1),
+                ("d0_stride", 1),
+                ("d0_limit", 0x3f),
+                ("d1_stride", 0x1fffc1),
+                ("d1_limit", rows_m1),
+                ("d2_stride", 0x1fffc1),
+                ("k157", 1),
+                ("k160", 1),
+                ("loop_k168", 1),
+                ("count_m1", 0x1f),
+                ("k203", 1),
+                ("count_neg", 0x20),
+                ("loop_k308", 3),
+                ("k311", 1),
+                ("par314", 1),
+                ("loop_k315", 3),
+                ("pop_wait", 1),
+                ("k336", 1),
+                ("k352", 1),
+                ("k392", 1),
+                ("tiles", ALL_TILES),
+                ("k434", 3),
+            ],
+        )?;
+    }
+    if parts & part::OUTFEED != 0 {
+        a.emit(
+            OP_OUTFEED,
+            &[
+                ("d0_stride", 1),
+                ("d0_limit", 0x3f),
+                ("d1_stride", 0xffc1),
+                ("d1_limit", rows_m1),
+                ("d2_stride", 0xffc1),
+                ("d3_stride", 0x809),
+                ("k173", 1),
+                ("loop_cfg", 0x11),
+                ("loop_row", 0x7fe),
+                ("loop_en", 1),
+                ("f222", 0x3f),
+            ],
+        )?;
+    }
+    if parts & part::PRODUCER != 0 {
+        a.emit(
+            OP_RING_PRODUCER,
+            &[
+                ("tile_mask", 1 << src),
+                ("addr", OUT_WIDE),
+                ("inc0", 1),
+                ("inc1", 1),
+                ("cnt1", rows_m1),
+                ("inc2", -rows_m1),
+                ("inc3", -rows_m1),
+                ("sdims", 3),
+                ("pcfg", 0xc),
+                ("r0_id", 0x31),
+                ("r0_val", -1),
+                ("r0_en_a", 1),
+                ("r0_en_b", 1),
+                ("r1_id", 0x32),
+                ("r1_en_a", 1),
+                ("r1_en_b", 1),
+                ("to_c1", 1),
+                ("dest", 0x10000),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn build_inner(
+    rq: &Requant,
+    input: Quant,
+    output: Quant,
+    rsv543: bool,
+    bcast: Option<(i64, u8)>,
+) -> Result<Program, IsaError> {
     const IN_NAME: &str = "input";
     const OUT_NAME: &str = "output";
     let mut a = Asm::new();
@@ -410,7 +594,7 @@ pub fn build(rq: &Requant, input: Quant, output: Quant, rsv543: bool) -> Result<
             ("n_inc4", -127),
             ("n_inc5", -127),
             ("narrow_lvl_mask", 7),
-            ("wide_addr", 0x2078),
+            ("wide_addr", OUT_WIDE),
             ("w_lim0", 1),
             ("wide_rows", 1),
             ("sync_en0", 1),
@@ -422,7 +606,26 @@ pub fn build(rq: &Requant, input: Quant, output: Quant, rsv543: bool) -> Result<
             ("tail_lvl", 3),
         ],
     )?;
+    let parts = bcast.map_or(0, |b| b.1);
+    if let Some((src, parts)) = bcast {
+        if parts & part::BARRIER_PRE != 0 {
+            sync(&mut a, 0, 0x3ff, true)?;
+            wait_tiles(&mut a)?;
+        }
+        broadcast(&mut a, src, parts)?;
+        if parts & part::BARRIER_POST != 0 {
+            sync(&mut a, 0, 0x3ff, true)?;
+            wait_tiles(&mut a)?;
+        }
+    }
     descriptor_send(&mut a, SIZE as i64, TAG_OUTPUT)?;
+    // r0 (id 0x51) indexes the rows sent to the scalar core; loopback rows
+    // come first (compiled dwconv: 6 rows, then 6..=21).
+    let row0 = if parts & part::PRODUCER != 0 {
+        BCAST_WORDS
+    } else {
+        0
+    };
     for t in 0..16i64 {
         a.emit(
             OP_OUTFEED,
@@ -432,7 +635,7 @@ pub fn build(rq: &Requant, input: Quant, output: Quant, rsv543: bool) -> Result<
             OP_RING_PRODUCER,
             &[
                 ("tile_mask", 1 << t),
-                ("addr", 0x2078),
+                ("addr", OUT_WIDE),
                 ("inc0", 1),
                 ("cnt1", 1),
                 ("sdims", 1),
@@ -441,7 +644,7 @@ pub fn build(rq: &Requant, input: Quant, output: Quant, rsv543: bool) -> Result<
                 ("mode", 3),
                 ("pcfg", 0x14),
                 ("r0_id", 0x51),
-                ("r0_val", t),
+                ("r0_val", row0 + t),
                 ("r0_en_a", 1),
                 ("r0_en_b", 1),
                 ("r1_id", 0x2d),
@@ -453,7 +656,15 @@ pub fn build(rq: &Requant, input: Quant, output: Quant, rsv543: bool) -> Result<
         )?;
     }
 
-    epilogue(&mut a, 16)?;
+    epilogue(
+        &mut a,
+        16,
+        if parts & part::EPILOGUE != 0 {
+            BCAST_WORDS
+        } else {
+            0
+        },
+    )?;
 
     Ok(Program {
         chunk: a.finish()?,

@@ -63,6 +63,11 @@ fn to_c1(d: &isa::Decoded<'_>) -> bool {
     d.get("to_c1").unwrap() == 1
 }
 
+/// The ringConsumer that receives the loopback (all tiles, `s_id` 0x21).
+fn lb_cons(d: &isa::Decoded<'_>) -> bool {
+    d.get("tile_mask").unwrap() == 0xffff && d.get("s_id").unwrap() == 0x21
+}
+
 fn exec(m: &mut TfliteModel) -> &mut ChunkInfo {
     &mut m.executables[0].instruction_chunks[0]
 }
@@ -306,6 +311,154 @@ async fn main() {
             "producer tile_mask = 0x2 (tile 1 as source)",
             Box::new(|m| {
                 patch(exec(m), "ringProducer", to_c1, "tile_mask", 2);
+            }),
+        ),
+        (
+            "consumer cbuf = slots = 0",
+            Box::new(|m| {
+                patch(exec(m), "ringConsumer", lb_cons, "cbuf", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "slots", 0);
+            }),
+        ),
+        (
+            "consumer aux_en0 = aux_en1 = 0",
+            Box::new(|m| {
+                patch(exec(m), "ringConsumer", lb_cons, "aux_en0", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "aux_en1", 0);
+            }),
+        ),
+        (
+            "consumer rsv286 = rsv319 = 0",
+            Box::new(|m| {
+                patch(exec(m), "ringConsumer", lb_cons, "rsv286", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "rsv319", 0);
+            }),
+        ),
+        (
+            "consumer aux + rsv cleared",
+            Box::new(|m| {
+                patch(exec(m), "ringConsumer", lb_cons, "aux_en0", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "aux_en1", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "aux_addr0", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "aux_addr1", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "rsv286", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "rsv319", 0);
+            }),
+        ),
+        (
+            "consumer simple (ours: no cbuf/aux/rsv)",
+            Box::new(|m| {
+                patch(exec(m), "ringConsumer", lb_cons, "cbuf", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "slots", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "aux_en0", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "aux_en1", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "aux_addr0", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "aux_addr1", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "rsv286", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "rsv319", 0);
+            }),
+        ),
+        (
+            "consumer s_* enables = 0",
+            Box::new(|m| {
+                patch(exec(m), "ringConsumer", lb_cons, "s_en_a", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "s_en_b", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "s_y", 0);
+            }),
+        ),
+        (
+            "producer r0_val = 0",
+            Box::new(|m| {
+                patch(exec(m), "ringProducer", to_c1, "r0_val", 0);
+            }),
+        ),
+        (
+            "producer r0/r1 enables = 0",
+            Box::new(|m| {
+                patch(exec(m), "ringProducer", to_c1, "r0_en_a", 0);
+                patch(exec(m), "ringProducer", to_c1, "r0_en_b", 0);
+                patch(exec(m), "ringProducer", to_c1, "r1_en_a", 0);
+                patch(exec(m), "ringProducer", to_c1, "r1_en_b", 0);
+            }),
+        ),
+        (
+            "pair: consumer no aux/rsv + infeed k308=k315=0",
+            Box::new(|m| {
+                patch(exec(m), "ringConsumer", lb_cons, "aux_en0", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "aux_en1", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "aux_addr0", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "aux_addr1", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "rsv286", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "rsv319", 0);
+                patch(exec(m), "infeed", looped, "loop_k308", 0);
+                patch(exec(m), "infeed", looped, "loop_k315", 0);
+            }),
+        ),
+        (
+            "pair: consumer no aux/rsv + infeed k308=k315=k168=0",
+            Box::new(|m| {
+                patch(exec(m), "ringConsumer", lb_cons, "aux_en0", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "aux_en1", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "aux_addr0", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "aux_addr1", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "rsv286", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "rsv319", 0);
+                patch(exec(m), "infeed", looped, "loop_k308", 0);
+                patch(exec(m), "infeed", looped, "loop_k315", 0);
+                patch(exec(m), "infeed", looped, "loop_k168", 0);
+            }),
+        ),
+        (
+            "pair: consumer simple + infeed k308=k315=0",
+            Box::new(|m| {
+                patch(exec(m), "ringConsumer", lb_cons, "cbuf", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "slots", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "aux_en0", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "aux_en1", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "aux_addr0", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "aux_addr1", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "rsv286", 0);
+                patch(exec(m), "ringConsumer", lb_cons, "rsv319", 0);
+                patch(exec(m), "infeed", looped, "loop_k308", 0);
+                patch(exec(m), "infeed", looped, "loop_k315", 0);
+            }),
+        ),
+        (
+            "consumer rsv286 = 0 only",
+            Box::new(|m| {
+                patch(exec(m), "ringConsumer", lb_cons, "rsv286", 0);
+            }),
+        ),
+        (
+            "consumer rsv319 = 0 only",
+            Box::new(|m| {
+                patch(exec(m), "ringConsumer", lb_cons, "rsv319", 0);
+            }),
+        ),
+        (
+            "consumer aux_en0 = 0 only",
+            Box::new(|m| {
+                patch(exec(m), "ringConsumer", lb_cons, "aux_en0", 0);
+            }),
+        ),
+        (
+            "consumer aux_en1 = 0 only",
+            Box::new(|m| {
+                patch(exec(m), "ringConsumer", lb_cons, "aux_en1", 0);
+            }),
+        ),
+        (
+            "infeed k308 = k315 = 1",
+            Box::new(|m| {
+                patch(exec(m), "infeed", looped, "loop_k308", 1);
+                patch(exec(m), "infeed", looped, "loop_k315", 1);
+            }),
+        ),
+        (
+            "infeed k308 = k315 = 2",
+            Box::new(|m| {
+                patch(exec(m), "infeed", looped, "loop_k308", 2);
+                patch(exec(m), "infeed", looped, "loop_k315", 2);
             }),
         ),
         (

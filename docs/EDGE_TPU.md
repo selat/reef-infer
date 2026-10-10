@@ -271,6 +271,28 @@ parameter blob, so stale data would show):
   the exact result) but must lie in [512 + rows, 1023] or [1536, 2047];
   everything else hangs. Measured on 3, 6, 24 and 26 rows. The compiler's
   2046 is inside; the gap below 512 + rows and in 1024-1535 is unexplained.
+- The receiving ringConsumer needs the compiler's aux form: clearing
+  `aux_en0` or `rsv286` hangs (`aux_en1` / `rsv319` only corrupt data),
+  and no "plain" consumer combination ran, even with matching infeed
+  constants. Its geometry tracks the kernel (`slots = k^2`, `cnt0 = k^2 - 1`,
+  `cnt2 = C/4 - 1`, `rsv286 = 2`).
+
+**Generated loopback** (`codegen::elementwise::build_broadcast`, checked by
+`tests/codegen_hw.rs` and `examples/broadcast_hw.rs`): our own program sends
+any tile's data through scalar memory to all 16 tiles, bit-exact on every
+tile for sources 0, 3, 5, 6, 15. With the C8 3x3 consumer copied verbatim, the first
+384 B of the source's 512 B arrive as 24 units of 16 B. Per 192 B, 3 units
+go to the aux rows (0x1fe8 + 4 per unit) and 9 to the slots (0x1fa0 + 4 per
+unit), so each wide address step of 4 holds 16 B here. Two program-level
+rules came out of it:
+
+- The epilogue waits on counter 6 for the loopback rows, and they count
+  towards counter 5: `smask = wait = 0x60`, `thr5` = outfeeds + rows,
+  `thr6` = rows, then `sync counters = 0x60000` (compiled C8: 18 / 2, C32:
+  22 / 6). Without it the program hangs.
+- The host producers' `r0_val` (id 0x51) indexes the rows sent to the scalar
+  core, with the loopback rows first: `rows + t`, not `t` (compiled dwconv:
+  6..=21).
 
 ### 6.4 Compiler 14.1 vs 16.0
 
@@ -332,6 +354,7 @@ perturbation on the device.
 | Decoder / encoder in Rust (`src/isa/`) | Done; all bitstreams round-trip |
 | Corpus tooling (`tools/isa_corpus/`, `examples/isa_check.rs`) | Done |
 | Generators in Rust (`src/codegen/`): element-wise requant (1x16x16x32), FC (K <= 64, N <= 64) | Done; byte-identical to 16.0 (FC parameters included), bit-exact on device |
+| On-chip loopback broadcast (`elementwise::build_broadcast`) | Done; bit-exact on device; landing layout is the compiler's depthwise one |
 | FC beyond one pass / one tile, conv | Next |
 | Conv, then scheduler/allocator for multi-layer graphs | Weeks to months |
 | PyTorch front end (`torch.export`, int8) | After the above |
@@ -345,7 +368,8 @@ as in-memory executables.
 1. ~~Perturb `row_a` / `row_m` / `row_c`~~: done on FC (2026-10-10); conv not yet.
 2. ~~Clear the loopback bits on a compiled depthwise model~~: done
    (2026-10-10, section 6.3): hangs, no stale data.
-3. Minimal loopback: tile 0 -> scalar memory -> all tiles -> host.
+3. ~~Minimal loopback: tile 0 -> scalar memory -> all tiles -> host~~: done
+   (2026-10-10, section 6.3), bit-exact on all 16 tiles.
 4. Load custom spline coefficients and compare with a host model.
 
 The fastest end-to-end path for PyTorch today is PyTorch -> ONNX -> onnx2tf
@@ -373,6 +397,9 @@ cargo run --features usb --example isa_probe [-- 'fc row']
 
 # Loopback perturbations on a compiled dwconv (ROWS=a,b,... sweeps loop_row)
 cargo run --release --features usb --example loopback_probe -- [model] [filter]
+
+# Generated loopback broadcast, every tile checked (PARTS=hex bisects pieces)
+cargo run --release --features usb --example broadcast_hw -- [src...]
 
 # Field diff of two compiled models
 cargo run --example isa_diff -- a_edgetpu.tflite b_edgetpu.tflite

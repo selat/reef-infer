@@ -92,4 +92,77 @@ async fn generated_programs_on_tpu() {
             assert_eq!(got, fc.reference(&x), "fc K={k} N={n} relu={relu}");
         }
     }
+
+    loopback(&mut dev).await;
+}
+
+/// Generated loopback: tile `SRC` -> scalar memory -> all 16 tiles. The
+/// other tiles hold zeros; each tile returns the 512 B at a received unit's
+/// wide address, and two passes recover which source byte landed where.
+async fn loopback(dev: &mut Device) {
+    use reef_infer::codegen::elementwise::{SHAPE, bcast_unit_addr};
+    use reef_infer::isa;
+
+    const SRC: usize = 6;
+    let id = Requant {
+        in_zp: 0,
+        mult: 1.0,
+        clamp_min: 0.0,
+        clamp_max: 255.0,
+        out_zp: 0,
+    };
+    let q = Quant {
+        scale: 1.0,
+        zero_point: 0,
+    };
+    let (_, nx, nz) = SHAPE;
+    // y-x-z index -> offset in tile `t`'s 512 B (rows of 4 pixels x 32 B)
+    let local = |i: usize, t: usize| -> Option<usize> {
+        let (y, x) = (i / nz / nx, i / nz % nx);
+        let (ty, tx) = (4 * (t / 4), 4 * (t % 4));
+        (y / 4 * 4 == ty && x / 4 * 4 == tx).then(|| ((y - ty) * 4 + x - tx) * nz + i % nz)
+    };
+    for u in [0, 2, 3, 11, 12, 15, 23] {
+        let mut got = [vec![0u8; SIZE], vec![0u8; SIZE]];
+        for (pass, out) in got.iter_mut().enumerate() {
+            let x: Vec<u8> = (0..SIZE)
+                .map(|i| match local(i, SRC) {
+                    Some(l) if pass == 0 => (l % 255 + 1) as u8,
+                    Some(l) => (l / 255 + 1) as u8,
+                    None => 0,
+                })
+                .collect();
+            let mut m = elementwise::build_broadcast(&id, q, q, SRC)
+                .unwrap()
+                .into_model();
+            // point the 16 host producers at unit u
+            let c = &mut m.executables[0].instruction_chunks[0];
+            let mut word = 0;
+            for ins in isa::split(&c.bitstream.clone()).unwrap() {
+                let mut d = ins.decode().unwrap();
+                if d.layout.name == "ringProducer" && d.get("r0_id") == Some(0x51) {
+                    d.set("addr", bcast_unit_addr(u)).unwrap();
+                    for (j, w) in d.encode().unwrap().iter().enumerate() {
+                        c.bitstream[(word + j) * 16..(word + j + 1) * 16]
+                            .copy_from_slice(&w.to_le_bytes());
+                    }
+                }
+                word += ins.words.len();
+            }
+            let loaded = dev.load_params(Arc::new(m)).await.unwrap();
+            *out = dev.run_inference(&loaded, x).await.unwrap();
+        }
+        for t in 0..16 {
+            // first 16 B of tile t's output = unit u of tile SRC
+            let src: Vec<usize> = (0..SIZE)
+                .filter(|&i| local(i, t).is_some_and(|l| l < 16))
+                .map(|i| (got[1][i] as usize - 1) * 255 + got[0][i] as usize - 1)
+                .collect();
+            assert_eq!(
+                src,
+                (16 * u..16 * u + 16).collect::<Vec<_>>(),
+                "tile {t} unit {u}"
+            );
+        }
+    }
 }

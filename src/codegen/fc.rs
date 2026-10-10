@@ -518,7 +518,7 @@ impl Fc {
             ],
         )?;
         ring_producer(&mut a, 0x2078, 1, 0x10000)?;
-        epilogue(&mut a, 2)?;
+        epilogue(&mut a, 2, 0)?;
         a.finish()
     }
 }

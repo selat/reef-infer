@@ -286,20 +286,28 @@ pub fn descriptor_send(a: &mut Asm, len: i64, tag: i64) -> Result<(), IsaError> 
 
 /// Drains the tiles and the outfeed, then sends the completion event.
 /// `outfeed_thr` is the compiler's `scsync.thr5` (16 after 16 outfeeds, 2
-/// after one; not decoded).
-pub fn epilogue(a: &mut Asm, outfeed_thr: i64) -> Result<(), IsaError> {
+/// after one; not decoded). A program with a loopback of `loop_rows` rows
+/// also waits on counter 6 for them, and they count towards counter 5
+/// (compiled dwconv: 16 outfeeds + 6 rows -> `thr5` 22, `thr6` 6).
+pub fn epilogue(a: &mut Asm, outfeed_thr: i64, loop_rows: i64) -> Result<(), IsaError> {
     sync(a, 0x1ffff, 0x3ff, false)?;
-    a.emit(
-        OP_SCSYNC,
-        &[
-            ("tiles", ALL_TILES),
-            ("smask", 0x20),
-            ("thr5", outfeed_thr),
-            ("wait", 0x20),
-            ("sunits", 0xc),
-        ],
-    )?;
-    sync(a, 0x20000, 0x3ff, true)?;
+    let (mask, counters) = if loop_rows > 0 {
+        (0x60, 0x60000)
+    } else {
+        (0x20, 0x20000)
+    };
+    let mut f = vec![
+        ("tiles", ALL_TILES),
+        ("smask", mask),
+        ("thr5", outfeed_thr + loop_rows),
+        ("wait", mask),
+        ("sunits", 0xc),
+    ];
+    if loop_rows > 0 {
+        f.push(("thr6", loop_rows));
+    }
+    a.emit(OP_SCSYNC, &f)?;
+    sync(a, counters, 0x3ff, true)?;
     wait_tiles(a)?;
     a.emit(
         OP_SYNC,
