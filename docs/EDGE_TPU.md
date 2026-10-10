@@ -247,8 +247,30 @@ B; MobileNet's 960-channel layer -> 11,520 B).
 
 tinycoral documents the outfeed half as undecoded and reports that a
 scalar-memory infeed to all 16 tiles "delivers no data", cause unknown. Its
-layout leaves `loop_en` and the three loopback constants at zero. Those
-missing bits are our leading explanation. **Untested on hardware.**
+layout leaves `loop_en` and the three loopback constants at zero.
+
+**On hardware** (2026-10-10, `examples/loopback_probe.rs`, compiled dwconv
+C32 k3; the unmodified program is the reference and runs after a different
+parameter blob, so stale data would show):
+
+- The broadcast data is tile 0's: shifting the ringProducer's `addr` or
+  sourcing tile 1 gives wrong output on every channel.
+- Clearing infeed `loop_en`, `loop_k308` or `loop_k315`, or tinycoral's
+  form (all four cleared), **hangs**. No variant returned stale data, so
+  tinycoral's failure is not reproduced as such; the missing bits are
+  required, but the failure mode differs.
+- Infeed `loop_k168 = 0` runs but corrupts channels 4-11 and 16-31
+  (0-3 and 12-15 stay exact).
+- Infeed `tiles` other than `0xffff` (0x0001, 0x00ff) hangs.
+- Outfeed `loop_en`, `loop_cfg` and bit 120 (`d3_stride` lsb) **change
+  nothing**: the result is exact with each cleared. `k173` (1 here, 3 on
+  host outfeeds) and `f222` (0x3f, host 0x7f) hang for any other value, as
+  do ringProducer `to_c1 = 0` and `dest = 0`. So the loopback outfeed is
+  identified by `k173` / `f222` / the producer, not by `loop_en`.
+- `loop_row` does not select what the infeed reads (any working value gives
+  the exact result) but must lie in [512 + rows, 1023] or [1536, 2047];
+  everything else hangs. Measured on 3, 6, 24 and 26 rows. The compiler's
+  2046 is inside; the gap below 512 + rows and in 1024-1535 is unexplained.
 
 ### 6.4 Compiler 14.1 vs 16.0
 
@@ -321,8 +343,8 @@ as in-memory executables.
 **Hardware experiments:**
 
 1. ~~Perturb `row_a` / `row_m` / `row_c`~~: done on FC (2026-10-10); conv not yet.
-2. Run a compiled depthwise model, then clear the loopback bits and rerun
-   (does it reproduce tinycoral's stale-data failure?).
+2. ~~Clear the loopback bits on a compiled depthwise model~~: done
+   (2026-10-10, section 6.3): hangs, no stale data.
 3. Minimal loopback: tile 0 -> scalar memory -> all tiles -> host.
 4. Load custom spline coefficients and compare with a host model.
 
@@ -348,6 +370,9 @@ cargo test --test codegen; cargo test --features usb --test codegen_hw
 
 # Perturbation experiments on hardware (filter by name substring)
 cargo run --features usb --example isa_probe [-- 'fc row']
+
+# Loopback perturbations on a compiled dwconv (ROWS=a,b,... sweeps loop_row)
+cargo run --release --features usb --example loopback_probe -- [model] [filter]
 
 # Field diff of two compiled models
 cargo run --example isa_diff -- a_edgetpu.tflite b_edgetpu.tflite

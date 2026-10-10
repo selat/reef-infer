@@ -349,3 +349,40 @@ two forms differ in parameter layout too, not only in op bits.
 outfeeds, 2 after one); the constant setup in the RELU program (mesh fills of
 one-hot words and a copy op); the caching `ringConsumer` aux fields beyond
 the rules above; K, N > 64 (multi-pass, multiple tiles).
+
+## Loopback on hardware (2026-10-10)
+
+`examples/loopback_probe.rs` on compiled dwconv models (C32 k3 unless noted;
+C16 k3, C128 k3, C32 k7 for the row sweep). Each depthwise program caches
+the weights in tile 0 (PARAMETER_CACHING infeed, `tiles = 0x1`) and every
+inference broadcasts `C x (k^2 + 3)` bytes: ringProducer (tile 0, `to_c1`,
+`dest 0x10000`) -> outfeed (`loop_en`, `loop_row 2046`) -> infeed
+(`loop_en`, `tiles 0xffff`). Reference: the unmodified program. Each case
+first runs the unmodified program with parameter blob A, then the perturbed
+one with blob B (8012/8192 output bytes differ between A and B), so a
+loopback that delivers nothing would return A's output.
+
+| Change | Result |
+|---|---|
+| infeed `loop_en = 0`; `loop_k308 = 0`; `loop_k315 = 0`; all four (tinycoral) | hang |
+| infeed `loop_k168 = 0` | wrong: channels 4-11, 16-31 (0-3, 12-15 exact) |
+| infeed `tiles` 0x0001 / 0x00ff | hang |
+| outfeed `loop_en = 0`; `loop_cfg = 0`; bit 120 = 0 | exact |
+| outfeed `k173` 0 / 2 / 3; `f222` 0 / 0x7f | hang |
+| producer `to_c1 = 0`; `dest = 0` | hang |
+| producer `addr + 0x40`; `tile_mask = 0x2` | wrong on all channels |
+| outfeed `loop_row` in [512 + rows, 1023] or [1536, 2047] | exact |
+| `loop_row` elsewhere (0-511, 512 to 512 + rows - 1, 1024-1535) | hang |
+
+Never stale: every non-hanging variant either matched B or was garbage
+unrelated to A. Every hang recovered by reopening the device (34 in the widest sweep), no replug.
+
+**Takeaways for codegen:** copy the infeed loopback constants exactly; the
+outfeed's `loop_en` / `loop_cfg` decode is not what makes it a loopback
+(`k173 = 1`, `f222 = 0x3f` are the candidates); any `loop_row` in the safe
+range works, so the row is not an address the infeed reads.
+
+**Still open:** why `loop_row` 0-(512 + rows) and 1024-1535 hang (a ring
+pointer comparison?); what `loop_k168` selects; a loopback in a generated
+program (experiment 3).
+
