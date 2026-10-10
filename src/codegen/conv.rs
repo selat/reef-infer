@@ -23,6 +23,15 @@
 //! accumulating in partial-sum memory, and the weight rows are streamed in
 //! that order (`[Cin / 4][ky][kx]`).
 //!
+//! **Wider images** (width 32 / 64, height 16) are derived without the
+//! compiler (bit-exact on the TPU, not compared with its output): a row of
+//! `width` pixels is loaded as 16 superpixels of `m = width / 16` pixels,
+//! i.e. the 16x16 loader, copy ops and halo exchange with `m Cin` channels.
+//! The halo is then whole superpixels (a superset of the 1-pixel halo), and
+//! the conv op walks real pixels inside that layout from `in_base`, the
+//! first window's origin. Each tile computes `4 x 4m` output pixels (or
+//! `2 x 2m` at stride 2).
+//!
 //! Supported (byte-identical to the compiler on 16 corpus models,
 //! `examples/conv_check.rs`; bit-exact on the TPU): same padding, 16x16,
 //! stride 1 or 2, and k = 1 with Cin 16, Cout 32, or k = 3 with Cin in
@@ -57,6 +66,8 @@ pub struct Conv {
     pub k: usize,
     /// 1 or 2 (same padding: TensorFlow pads the far side more).
     pub stride: usize,
+    /// Image width: 16, 32 or 64 (height is 16).
+    pub width: usize,
     pub weights: Vec<i8>,
     pub w_scale: Vec<f32>,
     pub bias: Vec<i32>,
@@ -67,7 +78,17 @@ pub struct Conv {
 
 impl Conv {
     pub fn check(&self) -> Result<(), String> {
+        let m = self.width / 16;
+        let wide_ok = match self.width {
+            16 => true,
+            // superpixels of m pixels must be a loader-verified channel count
+            32 | 64 => self.cin >= 16 && [32, 64, 128].contains(&(self.cin * m)),
+            _ => false,
+        };
+        let ob = (4 / self.stride) * (4 * m / self.stride) * self.cout;
         let ok = [1, 2].contains(&self.stride)
+            && wide_ok
+            && ob <= 2048
             && match self.k {
                 1 => (self.cin, self.cout) == (16, 32),
                 3 => {
@@ -78,8 +99,8 @@ impl Conv {
             };
         if !ok {
             return Err(format!(
-                "Cin={} Cout={} k={}: supported are k 1 (Cin 16, Cout 32) and k 3 (Cin 1, 3, 4, 16, 32, 64, 128; Cout 8, 16 or 32)",
-                self.cin, self.cout, self.k
+                "Cin={} Cout={} k={} width={}: supported are k 1 (Cin 16, Cout 32) and k 3 (Cin 1, 3, 4, 16, 32, 64, 128; Cout 8, 16 or 32), width 16, or 32 / 64 with Cin x width / 16 in 32..=128 and at most 2 KiB of output per tile",
+                self.cin, self.cout, self.k, self.width
             ));
         }
         if self.weights.len() != self.cout * self.k * self.k * self.cin
@@ -101,20 +122,31 @@ impl Conv {
         (total / 2, total - total / 2)
     }
 
-    /// Output pixels per tile along each axis (4 / stride).
-    fn opx(&self) -> i64 {
-        4 / self.stride as i64
+    /// Pixels per superpixel: a row of `width` pixels is loaded as 16
+    /// superpixels of `width / 16` pixels (the 16x16 loader with
+    /// `Cin x width / 16` channels).
+    fn spx(&self) -> i64 {
+        (self.width / 16) as i64
     }
 
-    /// The tile patch: the 4x4 input pixels with the padding as a halo.
+    /// Output pixels per tile along y and x.
+    fn opx(&self) -> (i64, i64) {
+        let s = self.stride as i64;
+        (4 / s, 4 * self.spx() / s)
+    }
+
+    /// The tile patch in superpixels: 4x4 of them, the padding as a halo
+    /// (rounded up to whole superpixels along x; the conv op addresses real
+    /// pixels inside).
     fn patch(&self) -> Patch {
         let (before, after) = self.pad();
+        let m = self.spx();
         Patch {
-            cin: self.cin_pad() as i64,
+            cin: self.cin_pad() as i64 * m,
             top: before,
             bottom: after,
-            left: before,
-            right: after,
+            left: (before + m - 1) / m,
+            right: (after + m - 1) / m,
         }
     }
 
@@ -194,7 +226,7 @@ impl Conv {
     /// Host reference over a y-x-z input: each output pixel is the FC of its
     /// `k x k` window, zero-point padded.
     pub fn reference(&self, x: &[u8]) -> Vec<u8> {
-        let (h, w) = (HW.0 as i64, HW.1 as i64);
+        let (h, w) = (HW.0 as i64, self.width as i64);
         let (k, cin) = (self.k as i64, self.cin);
         let p = self.pad().0;
         let fc = self.fc();
@@ -228,6 +260,13 @@ impl Conv {
 
     pub fn build(&self) -> Result<TfliteModel, Box<dyn std::error::Error>> {
         self.check()?;
+        self.build_unchecked()
+    }
+
+    /// [`Conv::build`] without [`Conv::check`], for hardware experiments on
+    /// shapes outside the verified set.
+    #[doc(hidden)]
+    pub fn build_unchecked(&self) -> Result<TfliteModel, Box<dyn std::error::Error>> {
         let params = self.parameters();
         let caching = ExecInfo {
             exec_type: ExecutableType::PARAMETER_CACHING,
@@ -237,7 +276,7 @@ impl Conv {
             output_layers: vec![],
             scratch_size_bytes: 0,
         };
-        let (h, w) = HW;
+        let (h, w) = (HW.0, self.width);
         let (oh, ow) = (h / self.stride, w / self.stride);
         let exec = ExecInfo {
             exec_type: ExecutableType::EXECUTION_ONLY,
@@ -245,7 +284,11 @@ impl Conv {
             instruction_chunks: vec![self.execution_program()?],
             input_layers: vec![layer("input", (h, w, self.cin), self.input)],
             output_layers: vec![LayerInfo {
-                output_layout: Some(output_layout(self.cout, self.opx() as usize)),
+                output_layout: Some(output_layout(
+                    self.cout,
+                    self.opx().0 as usize,
+                    self.opx().1 as usize,
+                )),
                 ..layer("output", (oh, ow, self.cout), self.output)
             }],
             scratch_size_bytes: 0,
@@ -285,9 +328,11 @@ impl Conv {
         const IN_NAME: &str = "input";
         const OUT_NAME: &str = "output";
         let pt = self.patch();
-        let (tp, cq) = (pt.tp(), pt.cq());
-        let (opx, st) = (self.opx(), self.stride as i64);
-        let npx = opx * opx; // output pixels per tile
+        // `cq`: words per real pixel (conv op, weights); the patch, loader
+        // and halo work in superpixels of `pt.cq()` words
+        let (tp, cq) = (pt.tp(), self.cin_pad() as i64 / 4);
+        let ((oy, ox), st) = (self.opx(), self.stride as i64);
+        let npx = oy * ox; // output pixels per tile
         let ob = npx * self.cout as i64; // output bytes per tile
         // Input buffer in wide memory: one tile's input is `sw` 256 B words.
         // One word (Cin 16) lands in a single slot at 0x2078, overwritten
@@ -298,7 +343,8 @@ impl Conv {
         // Cin 1 / 3: the host sends Cin bytes per pixel (`tbi` per tile) and
         // two constant words take 0x2078..; the buffer moves below them.
         let small = self.cin < 4;
-        let tbi = PX * self.cin as i64;
+        // (the host's bytes per tile: superpixel channels for wide images)
+        let tbi = if small { PX * self.cin as i64 } else { pt.tb() };
         let buf = if small { 0x2070 } else { 0x2078 - 8 * (sw - 1) };
         let mut a = Asm::new();
         prologue(&mut a)?;
@@ -457,7 +503,7 @@ impl Conv {
             for n in ["n_inc1", "n_inc2", "n_inc3", "n_inc4", "n_inc5"] {
                 f.push((n, -(nw - 1)));
             }
-            let skip = self.cin as i64 * col;
+            let skip = if small { self.cin as i64 } else { pt.cin } * col;
             // head of the first narrow row; for Cin 1 / 3 the compiler's
             // values (not derived; tail_words follows from them)
             let head = match self.cin {
@@ -661,7 +707,11 @@ impl Conv {
         // ── The conv TensorOp.
         let (lo, hi) = self.fc().clamp();
         let mut f: Vec<(String, i64)> = Vec::new();
-        let rs = pt.pw() * cq; // padded row stride in words
+        let rs = pt.pw() * pt.cq(); // padded row stride in words
+        // first window's origin: padded row 0 is the top halo; along x the
+        // halo is whole superpixels, so start `left m - pad` real pixels in
+        let (pad_y, pad_x) = (pt.top - self.pad().0, pt.left * self.spx() - self.pad().0);
+        let in_base = 4 * (pad_y * rs + pad_x * cq);
         let k = self.k as i64;
         let (in_dims, loops): (Vec<(i64, i64)>, [i64; 3]) = if self.k == 1 {
             // per pixel: Cin / 4 words against the slots
@@ -669,20 +719,14 @@ impl Conv {
                 (vec![(cq, 1), (1, cq), (npx, cq)], [cq - 1, npx - 1, 0])
             } else {
                 (
-                    vec![(cq, 1), (1, cq), (opx, st * cq), (opx, st * rs)],
+                    vec![(cq, 1), (1, cq), (ox, st * cq), (oy, st * rs)],
                     [cq - 1, npx - 1, 0],
                 )
             }
         } else if single {
             // per pixel: the k x k window, a row of k pixels contiguous
             (
-                vec![
-                    (k * cq, 1),
-                    (k, rs),
-                    (1, cq),
-                    (opx, st * cq),
-                    (opx, st * rs),
-                ],
+                vec![(k * cq, 1), (k, rs), (1, cq), (ox, st * cq), (oy, st * rs)],
                 [taps * cq - 1, npx - 1, 0],
             )
         } else {
@@ -692,14 +736,17 @@ impl Conv {
                     (1, 1),
                     (k, cq),
                     (k, rs),
-                    (opx, st * cq),
-                    (opx, st * rs),
+                    (ox, st * cq),
+                    (oy, st * rs),
                     (cq, 1),
                 ],
                 [taps - 1, npx - 1, cq - 1],
             )
         };
         f.extend(walk("in", &in_dims, 8));
+        if in_base != 0 {
+            f.push(("in_base".into(), in_base));
+        }
         for (i, l) in loops.iter().enumerate() {
             if *l > 0 {
                 f.push((format!("loop{i}"), *l));
@@ -820,9 +867,9 @@ impl Conv {
             ("n_inc0", 1),
             ("n_lim0", oq - 1),
             ("n_inc1", 1),
-            ("n_lim1", opx - 1),
+            ("n_lim1", ox - 1),
             ("n_inc2", 1),
-            ("n_lim2", opx - 1),
+            ("n_lim2", oy - 1),
             ("n_inc3", -(ob / 4 - 1)),
             ("n_inc4", -(ob / 4 - 1)),
             ("n_inc5", -(ob / 4 - 1)),
@@ -1142,16 +1189,16 @@ fn halo(a: &mut Asm, pt: &Patch, zp: i32) -> Result<(), IsaError> {
     Ok(())
 }
 
-/// Tile `4 * (y / q) + x / q` holds a `q x q` patch of the output, rows
-/// of `q` pixels x `nz` bytes; tiles are sent in order.
-fn output_layout(nz: usize, q: usize) -> OutputLayoutInfo {
-    let (ny, nx) = (4 * q, 4 * q);
+/// Tile `4 * (y / qy) + x / qx` holds a `qy x qx` patch of the output,
+/// rows of `qx` pixels x `nz` bytes; tiles are sent in order.
+fn output_layout(nz: usize, qy: usize, qx: usize) -> OutputLayoutInfo {
+    let (ny, nx) = (4 * qy, 4 * qx);
     OutputLayoutInfo {
-        y_coordinate_to_linear_tile_id_map: (0..ny).map(|y| (4 * (y / q)) as i32).collect(),
-        x_coordinate_to_linear_tile_id_map: (0..nx).map(|x| (x / q) as i32).collect(),
-        linearized_tile_byte_offset: (0..16).map(|t| (t * q * q * nz) as i32).collect(),
-        x_coordinate_to_local_byte_offset: (0..nx).map(|x| ((x % q) * nz) as i32).collect(),
-        y_coordinate_to_local_y_offset: (0..ny).map(|y| (y % q) as i32).collect(),
-        x_coordinate_to_local_y_row_size: vec![(q * nz) as i32; nx],
+        y_coordinate_to_linear_tile_id_map: (0..ny).map(|y| (4 * (y / qy)) as i32).collect(),
+        x_coordinate_to_linear_tile_id_map: (0..nx).map(|x| (x / qx) as i32).collect(),
+        linearized_tile_byte_offset: (0..16).map(|t| (t * qy * qx * nz) as i32).collect(),
+        x_coordinate_to_local_byte_offset: (0..nx).map(|x| ((x % qx) * nz) as i32).collect(),
+        y_coordinate_to_local_y_offset: (0..ny).map(|y| (y % qy) as i32).collect(),
+        x_coordinate_to_local_y_row_size: vec![(qx * nz) as i32; nx],
     }
 }

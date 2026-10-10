@@ -565,3 +565,49 @@ corpus models and bit-exact on the TPU (k 1 Cin 16; k 3 with Cin 3 / 16 /
 Cout >= 64 (1 KiB per tile, a different narrow arrangement), k = 2 and
 4-7, sizes other than 16x16, valid padding.
 
+## Wider images without the compiler (2026-10-10)
+
+Goal: support image sizes other than 16x16 from what we know, without
+reading compiled programs of those sizes. Result: **width 32 and 64
+(height 16) bit-exact on the TPU** for k 1 / 3, stride 1 / 2, Cin 16 / 32,
+Cout 8-32 (`examples/conv_wide_hw.rs`, `tests/codegen_hw.rs`); 16x16
+output stays byte-identical to the compiler.
+
+**Design.** Everything verified so far assumed 16 tiles with a 4x4 pixel
+patch each, and the input wideToNarrow's head / tail / skip fields cannot
+be decoded from 16-wide samples (one tile's words and one image row's
+words are both 4 Cin). So avoid them: a row of `16 m` pixels is
+byte-for-byte a row of 16 *superpixels* of `m Cin` channels. The 16x16
+loader, copy ops and halo exchange, verified for 32 / 64 / 128 channels,
+then deliver each tile its 4 x 4m patch. The halo is whole superpixels (m
+pixels instead of 1, a superset; costs memory, not correctness). Only the
+conv op is new: real-pixel strides (`Cin / 4` words) inside the
+superpixel row stride, `in_base` = the first window's origin (`left m -
+pad` pixels in), `4 x 4m` output pixels per tile, and the output layout
+to match.
+
+**Hardware bisection.** The first run hung on every wide case. Separating
+the new pieces with 16-wide cases (built with `Conv::build_unchecked`):
+
+| Case | Result |
+|---|---|
+| 3x3, 16x16, Cin 32 (the loader / halo of a 16x32 Cin 16 image) | exact |
+| 1x1, 16x16, Cout 64 (1 KiB of output per tile, 4 wide words at 0x2078) | exact; the compiler arranges this differently, ours works |
+| 3x3 16x32 Cin 16 Cout 8; 3x3 stride 2; 1x1 16x32 | hang |
+
+All wide cases hanging, even with 8 output pixels and `in_base` 0, pointed
+at what they share: the input stage sized transfers from the real channel
+count (`16 Cin` bytes per tile, `skip = Cin x column`) instead of the
+superpixel one. Fixed, all wide cases are exact. Checks: 127-213 distinct
+output values; `in_base` one pixel off makes 98% of outputs wrong.
+
+**Recovery.** One hang left the chip unable to initialize (`Usb(Cancelled)`
+on open, also for the matmul test); a USB reset through `nusb` then made
+the device drop off the bus and it needed a replug. Not repeated: after
+later hangs, reopening recovered.
+
+**Still open:** heights other than 16 (the loader's rows per tile: the
+skip / head semantics again, or a loader of our own); Cin < 16 at wider
+sizes (superpixel channels not a loader-verified count); output above
+2 KiB per tile (wide staging above 0x207f is untested).
+

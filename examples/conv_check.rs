@@ -127,6 +127,7 @@ fn main() {
             cout,
             k,
             stride: get("stride"),
+            width: 16,
             weights: nums("weights").map_or(vec![1; cout * k * k * cin], |v| {
                 v.iter().map(|&x| x as i8).collect()
             }),
