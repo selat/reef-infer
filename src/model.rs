@@ -21,7 +21,7 @@
 //! stored as a FlatBuffer-string in `serialized_executables`).
 
 use crate::executable_generated::platforms::darwinn::{
-    Description, Executable, ExecutableType, MultiExecutable, Position, root_as_package,
+    DataType, Description, Executable, ExecutableType, MultiExecutable, Position, root_as_package,
 };
 use crate::schema_v3_generated::tflite::root_as_model;
 
@@ -123,6 +123,10 @@ pub struct LayerInfo {
     pub y_dim: i32,
     pub x_dim: i32,
     pub z_dim: i32,
+    /// Bytes per element (DarwiNN `data_type`: 1 for 8-bit, 2 for 16-bit,
+    /// 4 for 32-bit). Not derivable from `size_bytes`, which can include
+    /// padding (an FC with 4 channels sends 8 bytes).
+    pub elem_bytes: usize,
     /// Where each (y, x) position of an output layer sits in the bytes the
     /// device sends. `None` for input layers and outputs without a layout.
     pub output_layout: Option<OutputLayoutInfo>,
@@ -156,7 +160,7 @@ impl LayerInfo {
         if ny * nx * nz == 0 || l.y_coordinate_to_linear_tile_id_map.len() < ny {
             return raw.to_vec();
         }
-        let elem = (self.size_bytes as usize / (ny * nx * nz)).max(1);
+        let elem = self.elem_bytes;
         let row = nz * elem;
         let mut out = vec![0u8; ny * nx * row];
         for y in 0..ny {
@@ -207,7 +211,19 @@ fn parse_layer_info(
         y_dim: layer.y_dim(),
         x_dim: layer.x_dim(),
         z_dim: layer.z_dim(),
+        elem_bytes: elem_bytes(layer.data_type()),
         output_layout,
+    }
+}
+
+fn elem_bytes(t: DataType) -> usize {
+    match t {
+        DataType::FIXED_POINT16
+        | DataType::SIGNED_FIXED_POINT16
+        | DataType::BFLOAT
+        | DataType::HALF => 2,
+        DataType::SIGNED_FIXED_POINT32 | DataType::SINGLE => 4,
+        _ => 1,
     }
 }
 

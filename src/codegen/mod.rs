@@ -646,6 +646,7 @@ pub fn layer(name: &str, (y, x, z): (usize, usize, usize), q: Quant) -> LayerInf
         y_dim: y as i32,
         x_dim: x as i32,
         z_dim: z as i32,
+        elem_bytes: 1,
         output_layout: None,
     }
 }

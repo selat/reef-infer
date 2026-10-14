@@ -242,6 +242,19 @@ impl LoadedParams {
 }
 
 impl Device {
+    /// Keeps one read pending on the event and interrupt endpoints. Each
+    /// event loop leaves its last read pending; submitting a fresh one per
+    /// call piled them up until usbfs ran out of memory (ENOMEM after ~1900
+    /// calls).
+    fn arm_reads(&mut self) {
+        if self.events.pending() == 0 {
+            self.events.submit(self.events.allocate(512));
+        }
+        if self.interrupts.pending() == 0 {
+            self.interrupts.submit(self.interrupts.allocate(64));
+        }
+    }
+
     /// Sends the PARAMETER_CACHING instructions, waits for the chip to DMA the
     /// weights into its SRAM, and returns a [`LoadedParams`] that can be reused
     /// across many [`run_inference`] calls without re-uploading the weights.
@@ -292,8 +305,7 @@ impl Device {
                 .map(|c| patch_chunk(c, params_addr, 0, &HashMap::new()))
                 .collect();
 
-            self.events.submit(self.events.allocate(512));
-            self.interrupts.submit(self.interrupts.allocate(64));
+            self.arm_reads();
 
             debug!(
                 "sending PARAM_CACHING instructions ({} chunk(s))",
@@ -402,8 +414,7 @@ impl Device {
             .map(|c| patch_chunk(c, exec_params_addr, input_addr, &output_addrs))
             .collect();
 
-        self.events.submit(self.events.allocate(512));
-        self.interrupts.submit(self.interrupts.allocate(64));
+        self.arm_reads();
 
         debug!("sending EXEC instructions ({} chunk(s))", exec_instrs.len());
         for instr in &exec_instrs {
