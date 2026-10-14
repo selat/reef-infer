@@ -38,17 +38,22 @@ fn patch_field(buf: &mut [u8], offset_bit: usize, position: u8, addr: u64) {
     copy_u32_bits(buf, offset_bit, word);
 }
 
+/// Patches the relocations: parameters, inputs (by layer name, `input_addr`
+/// for an unnamed or unknown one) and outputs (by layer name).
 fn patch_chunk(
     chunk: &ChunkInfo,
     params_addr: u64,
     input_addr: u64,
+    input_addrs: &HashMap<String, u64>,
     output_addrs: &HashMap<String, u64>,
 ) -> Vec<u8> {
     let mut instr = chunk.bitstream.clone();
     for fo in &chunk.field_offsets {
         let base_addr = match fo.desc {
             Description::BASE_ADDRESS_PARAMETER => params_addr,
-            Description::BASE_ADDRESS_INPUT_ACTIVATION => input_addr,
+            Description::BASE_ADDRESS_INPUT_ACTIVATION => {
+                input_addrs.get(&fo.name).copied().unwrap_or(input_addr)
+            }
             Description::BASE_ADDRESS_OUTPUT_ACTIVATION => {
                 output_addrs.get(&fo.name).copied().unwrap_or(0)
             }
@@ -302,7 +307,7 @@ impl Device {
             let pc_instrs: Vec<Vec<u8>> = pc
                 .instruction_chunks
                 .iter()
-                .map(|c| patch_chunk(c, params_addr, 0, &HashMap::new()))
+                .map(|c| patch_chunk(c, params_addr, 0, &HashMap::new(), &HashMap::new()))
                 .collect();
 
             self.arm_reads();
@@ -406,12 +411,19 @@ impl Device {
             (exec.parameters.as_slice(), exec.parameters.as_ptr() as u64)
         };
 
+        // `input_data` holds the input layers back to back, in order.
         let input_addr = input_data.as_ptr() as u64;
+        let mut input_addrs = HashMap::new();
+        let mut off = 0u64;
+        for layer in &exec.input_layers {
+            input_addrs.insert(layer.name.clone(), input_addr + off);
+            off += layer.size_bytes as u64;
+        }
 
         let exec_instrs: Vec<Vec<u8>> = exec
             .instruction_chunks
             .iter()
-            .map(|c| patch_chunk(c, exec_params_addr, input_addr, &output_addrs))
+            .map(|c| patch_chunk(c, exec_params_addr, input_addr, &input_addrs, &output_addrs))
             .collect();
 
         self.arm_reads();
@@ -440,7 +452,13 @@ impl Device {
                     debug!("run_inference event[{round}]: tag={} len={}", ev.tag, ev.length);
                     match ev.tag {
                         1 => {
-                            deadline(single_ep_send(&self.iface, DescriptorTag::InputActivations, &input_data)).await?;
+                            // the requested slice (one input layer of several);
+                            // the whole buffer if the request does not fit
+                            let offset = ev.device_address.wrapping_sub(input_addr) as usize;
+                            let slice = input_data
+                                .get(offset..offset + ev.length as usize)
+                                .unwrap_or(&input_data);
+                            deadline(single_ep_send(&self.iface, DescriptorTag::InputActivations, slice)).await?;
                         }
                         2 => {
                             let offset = ev.device_address.wrapping_sub(exec_params_addr) as usize;
