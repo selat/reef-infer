@@ -2,6 +2,7 @@ pub mod chip;
 pub mod codegen;
 #[allow(warnings)]
 pub mod executable_generated;
+pub mod graph;
 pub mod isa;
 pub mod model;
 pub mod parser;

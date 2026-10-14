@@ -428,3 +428,46 @@ fn conv_matches_compiler() {
         eprintln!("ISA corpus not found; skipping");
     }
 }
+
+/// The MNIST MLP from `tools/mnist/train.py` (skipped when absent): the
+/// front end maps it to two FC layers, both build, and the host reference
+/// (the TPU's numerics) picks the same class as TFLite's CPU interpreter.
+#[test]
+fn mnist_graph_matches_tflite() {
+    use reef_infer::graph::{Graph, Layer, u8_to_i8};
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/mnist");
+    let Ok(images) = std::fs::read(dir.join("test_images.bin")) else {
+        eprintln!("target/mnist not found (tools/mnist/train.py); skipping");
+        return;
+    };
+    let g = Graph::from_tflite(dir.join("mlp.tflite").to_str().unwrap()).unwrap();
+    let shapes: Vec<_> = g
+        .layers
+        .iter()
+        .map(|l| match l {
+            Layer::Fc(f) => (f.k, f.n, f.relu),
+        })
+        .collect();
+    assert_eq!(shapes, [(784, 128, true), (128, 10, false)]);
+    assert_eq!(g.build().unwrap().len(), 2);
+    // input scale 1/255, zero point -128: the uint8 input is the pixel
+    assert_eq!((g.input.scale, g.input.zero_point), (1.0 / 255.0, 0));
+    let tflite = std::fs::read(dir.join("tflite_logits.bin")).unwrap();
+    let argmax = |v: &[i8]| {
+        (0..v.len())
+            .max_by_key(|&i| (v[i], usize::MAX - i))
+            .unwrap()
+    };
+    for i in 0..500 {
+        let y = u8_to_i8(&g.reference(&images[784 * i..784 * (i + 1)]));
+        let t: Vec<i8> = tflite[10 * i..10 * (i + 1)]
+            .iter()
+            .map(|&b| b as i8)
+            .collect();
+        assert_eq!(argmax(&y), argmax(&t), "image {i}");
+        assert!(
+            y.iter().zip(&t).all(|(a, b)| (a - b).abs() <= 1),
+            "image {i}"
+        );
+    }
+}

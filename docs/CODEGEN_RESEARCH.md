@@ -648,3 +648,78 @@ row offset left at 0, exactly rows 3, 7, 11, ... come out wrong.
 the sub-word input form untested), output above 2 KiB per tile (wide
 staging above 0x207f untested), sizes not a multiple of 16.
 
+
+## Large FC layers and the MNIST MLP (2026-10-14)
+
+Corpus extended with the MNIST layer shapes (`gen.py`: K 784 x N 128 RELU,
+128 x 10, and steps between). `codegen::fc` now covers K up to 1024
+(multiple of 8) and N 4-64 or a multiple of 64 up to 1024, and is
+byte-identical to 16.0 on all 28 supported corpus FC models, parameter
+blobs included (`examples/fc_check.rs`, weights from `fc_ref.py`), and
+bit-exact on the TPU for 784 x 128 RELU, 128 x 10, 128 x 64, 1000 x 64,
+256 x 256, 64 x 1024 and 64 x 4 with random weights (`tests/codegen_hw.rs`).
+
+**Large K: spread, then gather.** The compiler never loops over K in
+passes. The input is infed 64 B per tile over `T = ceil(K / 64)` tiles,
+then gathered over the ring into every compute tile, and one TensorOp
+walks all K / 4 words.
+
+- Infeed: one infeed per row of 4 tiles (256 B, `buf_off` 0x20 per row,
+  `pop_wait` = `buf_off` + 1), each with its own ringConsumer. One row: a
+  single slot at wide 0x2078, `s_val` -64. Several rows: 4 slots at
+  0x2060 (`sdims`, `s_cnt` 4, `s_val` -256).
+- Each tile keeps its 64 B with a wideToNarrow per column `c`: `skip_m1`
+  = 16c - 1, `skip_end` = base + 16c - 1, `tail_f871` and `rsv543` set,
+  `tail_en870` cleared (column 0: no skip, `tail_en870` set). Full tiles
+  share a copy per column; a partial last tile gets its own.
+- Staging lands at narrow word 0xc0 for one row, 0x180 for more (above
+  the gathered input).
+- Gather, per input tile `t`: wideToNarrow on the compute tiles to narrow
+  `in_base + 64t` (`sync_val` 0x8000 + (t + 1) / 2, `sync_en1` for even
+  t), ringConsumer `s_val` = 16t - 64, ringProducer on tile t with
+  `r0_val` = t, narrowToWide of tile t's staging.
+- Output after the input: `out_base` = K (K < 64: input at 64, output at 0).
+
+**Large N: 64 channels per compute tile.** Tiles 0.. each run the same
+TensorOp on their own parameter blob (the blobs are concatenated in the
+stream: one ringConsumer and one infeed per tile, `buf_off` advancing by
+the tile's 64 B units). Each tile outfeeds its channels; producers count
+on after the gathers (`r0_val` = T + tile) and the epilogue's `thr5` is
+the total of ring rows (T + compute tiles). The OutputLayout puts tile t's
+channels at `t x row`.
+
+**Parameter streams over 1024 units** (64 B): `d1_limit` full rows of
+1024, `count_m1` the last row's units - 1 (K 2048 / 4096, N 1024).
+
+**Small N.** Parameters are padded to 16 channels: up to the next multiple
+of 4 the padded channels are computed (the first channel's multiplier,
+zero bias and weights, weight zero point 128); beyond that everything is 0.
+The op computes `ceil(N / 4)` words; the host gets N rounded up to 8 bytes
+(a one-unit outfeed clears its loop like the one-unit input pop). N < 4
+uses a different op form (`w_zp` set, no row fields): not supported.
+
+**MNIST MLP** (`tools/mnist/train.py`: Flatten -> Dense 128 RELU -> Dense
+10, int8). The new front end `graph::Graph` reads the CPU `.tflite`
+(RESHAPE is free; the int32 SHAPE / STRIDED_SLICE / PACK feeding it are
+skipped), maps int8 activations to uint8 (+128) and builds one program per
+layer. **First model with no compiler involved: all 10000 test images on
+the TPU give 97.35%, byte-identical to the host reference on every image**
+(`examples/mnist.rs --device`), and the same as TFLite's CPU interpreter:
+same top-1 on every image, 3 of 100000 logits differ by 1 (f32 multiplier
+vs TFLite's fixed-point one). 3.8 ms per image, most of it reloading the
+parameters (~100 KB) of both layers.
+
+**Cached parameters do not coexist** (`examples/param_cache_hw.rs`): after
+loading FC A (784 x 128) and then FC B (128 x 10), A runs wrong. Both blobs
+start at wide address 0 of tile 0, so `Graph::run` reloads each layer's
+parameters per inference. Placing layers at different wide rows or tiles
+is the fix (the parameter placement item of the roadmap).
+
+**Runner fixes found on the way.** The output relayout derived bytes per
+element from `size_bytes / elements`, wrong when the output is padded to
+twice its length (an FC with 4 channels sends 8 bytes; the compiler's own
+model has the same layer): `LayerInfo.elem_bytes` now comes from the
+DarwiNN `data_type`. And every `load_params` / `run_inference` submitted
+a new event and interrupt read while the previous call's were still
+pending; they piled up until usbfs failed with ENOMEM (errno 12) after
+~1900 calls. The runner now tops up to one pending read.

@@ -1,6 +1,6 @@
 # Roadmap: from single ops to whole models without `edgetpu_compiler`
 
-Status as of 2026-10-10 and the order to work in. Each milestone is a model
+Status as of 2026-10-14 and the order to work in. Each milestone is a model
 family that becomes runnable end to end; each item lists what it needs,
 what we already know, what is unknown, and how it gets verified.
 `EDGE_TPU.md` section 8 has the per-generator status, `CODEGEN_RESEARCH.md`
@@ -11,7 +11,8 @@ the findings.
 | Generator | Coverage | Verified |
 |---|---|---|
 | Element-wise requant (`elementwise`) | 1x16x16x32 | byte-identical, on device |
-| FC (`fc`) | K <= 64 (multiple of 8), N 16-64 (multiple of 16), one pass on tile 0 | byte-identical, on device |
+| FC (`fc`) | K <= 1024 (multiple of 8, input spread over tiles and gathered), N 4-64 or 64 per tile up to 1024 | byte-identical (28 corpus models), on device |
+| Front end (`graph`) | CPU int8 `.tflite`: FC chains with RESHAPE, layers through the host | MNIST MLP on device: 97.35%, bit-exact with the host reference |
 | CONV_2D (`conv`) | same padding; k 1 / 3; stride 1 / 2; 16x16 with Cin 1-128 (k 3), up to 64x64 with Cin >= 16; Cout 8-32 | byte-identical at 16x16, on device up to 64x64 |
 | Loopback broadcast | tile -> scalar memory -> all tiles | on device |
 
@@ -35,20 +36,20 @@ Sizes: S = a day or less, M = a few days, L = a week or more.
 
 | Item | Need | Known / unknown | Size |
 |---|---|---|---|
-| TFLite front end | read the CPU `.tflite` (schema in `schema_v3_generated.rs`): tensors, weights, per-channel scales, zero points, op list | parsing exists for compiled models; op -> generator mapping is new | M |
-| int8 <-> uint8 | TFLite int8 I/O vs our uint8: +128 on input, weights already stored as `W + 128` | known | S |
-| Host-side ops | flatten / reshape (NHWC, free), argmax, softmax, dequantize | known | S |
-| Layer chaining | run layer programs in sequence, output of one as input of the next (through the host first) | runner can do it; **unknown: whether two models' PARAMETER_CACHING blobs overwrite each other in tile 0's wide memory** (experiment: load A, load B, run A) | S + experiment |
-| Model runner API | `Model::from_tflite(path)` -> list of programs + host glue, one `run(input) -> output` | new | S |
+| TFLite front end | read the CPU `.tflite` (schema in `schema_v3_generated.rs`): tensors, weights, per-channel scales, zero points, op list | **done** for FC + RESHAPE (`graph::Graph`); other ops map as their generators arrive | M |
+| int8 <-> uint8 | TFLite int8 I/O vs our uint8: +128 on input, weights already stored as `W + 128` | **done** (`graph::i8_to_u8`) | S |
+| Host-side ops | flatten / reshape (NHWC, free), argmax, softmax, dequantize | reshape done; the rest when a model needs them | S |
+| Layer chaining | run layer programs in sequence, output of one as input of the next (through the host first) | runner can do it; **unknown: whether two models' PARAMETER_CACHING blobs overwrite each other in tile 0's wide memory** **answered: they overwrite** (`examples/param_cache_hw.rs`); `Graph::run` reloads each layer's parameters per inference until layers get separate placements | S + experiment |
+| Model runner API | `Model::from_tflite(path)` -> list of programs + host glue, one `run(input) -> output` | **done** as `Graph::from_tflite` / `build` / `run` | S |
 
 ## Milestone 1: MNIST MLP (Flatten -> Dense 128 ReLU -> Dense 10)
 
 | Item | Need | Known / unknown | Size |
 |---|---|---|---|
-| **FC, large K** | K = 784, 128 | loop over K in passes with partial sums (the conv multi-pass scheme); corpus has FC K up to 1000 to check against | M |
-| **FC, large N** | N = 128 | two 64-channel passes, or outputs split over tiles (the conv output path already spreads over 16 tiles) | M |
-| FC, small N | N = 10 | pad to 16 with zero multiplier / bias / weights (as conv does) | S |
-| End-to-end test | MNIST test set vs TFLite CPU | `.venv` has TensorFlow | S |
+| **FC, large K** | K = 784, 128 | **done**: no passes; the compiler spreads the input 64 B per tile and gathers it over the ring into the compute tiles (byte-identical, K up to 1024) | M |
+| **FC, large N** | N = 128 | **done**: 64 channels per compute tile, one parameter blob each | M |
+| FC, small N | N = 10 | **done**: padded to 16 as the compiler does (live channels to a multiple of 4) | S |
+| End-to-end test | MNIST test set vs TFLite CPU | `tools/mnist/train.py` + `examples/mnist.rs`: **done**: TPU 97.35% on all 10000, bit-exact with the host reference, same top-1 as TFLite CPU | S |
 
 First model with no compiler involved anywhere.
 
