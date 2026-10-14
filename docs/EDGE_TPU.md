@@ -358,11 +358,13 @@ The model-by-model plan (which ops in which order) is in `ROADMAP.md`.
 | Corpus tooling (`tools/isa_corpus/`, `examples/isa_check.rs`) | Done |
 | Generators in Rust (`src/codegen/`): element-wise requant (1x16x16x32), FC (K <= 64, N <= 64) | Done; byte-identical to 16.0 (FC parameters included), bit-exact on device |
 | FC K up to 1024 (input over 16 tiles, gathered over the ring), N 4-64 or 64 per tile up to 1024 | Done; byte-identical to 16.0 on 28 corpus models (parameters included), bit-exact on device |
-| TFLite front end (`graph::Graph`): FC chains with RESHAPE, int8 I/O; layers run through the host | Done: MNIST MLP on the TPU, 97.35% on 10000 images, bit-exact with the host reference, same top-1 as TFLite CPU |
+| TFLite front end (`graph::Graph`): CONV_2D, MAX_POOL_2D, FC, RESHAPE, int8 I/O; layers run through the host, which pads to the generators' sizes and crops | Done: MNIST MLP (97.35%) and CNN (98.66%) on the TPU over 10000 images, bit-exact with the host reference, same top-1 as TFLite CPU |
+| MAX_POOL_2D 2x2 stride 2 (`codegen::pool`): H, W 16 / 32, C 32 / 64 / 128 | Done; byte-identical to 16.0 on 5 corpus models, bit-exact on device |
+| FC K 2048 / 3073-4096 (128 / 256 B per input tile); conv Cout 64 (Cin >= 32, 16x16) | Done; byte-identical to 16.0 (parameters included), bit-exact on device |
 | On-chip loopback broadcast (`elementwise::build_broadcast`) | Done; bit-exact on device; landing layout is the compiler's depthwise one |
 | CONV_2D (`codegen::conv`): same padding, stride 1 or 2, 16x16; k 1 (Cin 16, Cout 32) and k 3 (Cin 1, 3, 4, 16-128; Cout 8 / 16 / 32) | Done; byte-identical to 16.0 on 16 corpus models (parameters included), bit-exact on device |
 | Conv width and height 16 / 32 / 64, Cin >= 16: superpixel columns, 4-row bands, derived without the compiler | Done; bit-exact on device up to 64x64 (not compared with 16.0) |
-| Conv: Cout 64+ for k 3, Cin < 16 at larger sizes, Cin 8, other k, valid padding, sizes not a multiple of 16 | Next |
+| Conv: Cout 64 for Cin 16, Cout 128+, Cin < 16 at larger sizes (stopgap: zero-weight channels), Cin 8, other k, valid padding, sizes not a multiple of 16 (stopgap: host padding) | Next |
 | Scheduler/allocator for multi-layer graphs | Weeks to months |
 | PyTorch front end (`torch.export`, int8) | After the above |
 
@@ -419,9 +421,12 @@ cargo run --example conv_check -- [filter]
 .venv/bin/python tools/isa_corpus/fc_ref.py   # weights for the parameter comparison
 cargo run --example fc_check -- [filter]
 
-# MNIST MLP end to end (train + export, then host reference / TPU)
-.venv/bin/python tools/mnist/train.py
-cargo run --release --example mnist -- [--limit N] [--device]
+# Generated max pool vs every supported corpus model, field by field
+cargo run --example pool_check -- [filter]
+
+# MNIST end to end (train + export, then host reference / TPU)
+.venv/bin/python tools/mnist/train.py [--model mlp|cnn]
+cargo run --release --example mnist -- [--model mlp|cnn] [--limit N] [--device]
 cargo run --example param_cache_hw   # do two layers' cached parameters coexist?
 
 # Field diff of two compiled models

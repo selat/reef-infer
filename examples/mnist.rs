@@ -1,7 +1,7 @@
 //! MNIST end to end without `edgetpu_compiler`: the int8 `.tflite` from
 //! `tools/mnist/train.py` -> `graph::Graph` -> generated layer programs.
 //!
-//!     cargo run --release --example mnist -- [--dir target/mnist] [--limit N] [--device]
+//!     cargo run --release --example mnist -- [--model mlp|cnn] [--dir target/mnist] [--limit N] [--device]
 //!
 //! Always: the host reference (bit-exact with the TPU) against TFLite's CPU
 //! logits over the test set. With `--device`: every image on the TPU,
@@ -27,13 +27,22 @@ async fn main() {
             .unwrap_or_else(|e| panic!("{dir}/{f}: {e} (run tools/mnist/train.py first)"))
     };
 
-    let graph = Graph::from_tflite(&format!("{dir}/mlp.tflite")).unwrap();
-    for (i, l) in graph.layers.iter().enumerate() {
-        println!("layer {i}: {l:?}", l = summary(l));
+    let name = opt("--model").unwrap_or("mlp".into());
+    let graph = Graph::from_tflite(&format!("{dir}/{name}.tflite")).unwrap();
+    for (i, s) in graph.steps.iter().enumerate() {
+        println!(
+            "layer {i}: {} {:?} -> {:?}",
+            summary(&s.layer),
+            s.input,
+            s.output
+        );
     }
     let images = read("test_images.bin");
     let labels = read("test_labels.bin");
-    let tflite: Vec<i8> = read("tflite_logits.bin").iter().map(|&b| b as i8).collect();
+    let tflite: Vec<i8> = read(&format!("{name}_tflite_logits.bin"))
+        .iter()
+        .map(|&b| b as i8)
+        .collect();
     let n = opt("--limit")
         .map(|s| s.parse().unwrap())
         .unwrap_or(labels.len())
@@ -108,10 +117,13 @@ async fn main() {
 }
 
 fn summary(l: &reef_infer::graph::Layer) -> String {
+    use reef_infer::graph::Layer;
     match l {
-        reef_infer::graph::Layer::Fc(f) => format!(
-            "FC K={} N={} relu={} in {:?} out {:?}",
-            f.k, f.n, f.relu, f.input, f.output
+        Layer::Fc(f) => format!("FC K={} N={} relu={}", f.k, f.n, f.relu),
+        Layer::Conv(c) => format!(
+            "CONV {}x{} {}->{} at {}x{} relu={}",
+            c.k, c.k, c.cin, c.cout, c.height, c.width, c.relu
         ),
+        Layer::MaxPool(p) => format!("MAXPOOL 2x2 at {}x{}x{}", p.height, p.width, p.c),
     }
 }

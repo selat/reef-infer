@@ -469,17 +469,18 @@ fn mnist_graph_matches_tflite() {
     };
     let g = Graph::from_tflite(dir.join("mlp.tflite").to_str().unwrap()).unwrap();
     let shapes: Vec<_> = g
-        .layers
+        .steps
         .iter()
-        .map(|l| match l {
+        .map(|s| match &s.layer {
             Layer::Fc(f) => (f.k, f.n, f.relu),
+            l => panic!("unexpected {l:?}"),
         })
         .collect();
     assert_eq!(shapes, [(784, 128, true), (128, 10, false)]);
     assert_eq!(g.build().unwrap().len(), 2);
     // input scale 1/255, zero point -128: the uint8 input is the pixel
     assert_eq!((g.input.scale, g.input.zero_point), (1.0 / 255.0, 0));
-    let tflite = std::fs::read(dir.join("tflite_logits.bin")).unwrap();
+    let tflite = std::fs::read(dir.join("mlp_tflite_logits.bin")).unwrap();
     let argmax = |v: &[i8]| {
         (0..v.len())
             .max_by_key(|&i| (v[i], usize::MAX - i))
@@ -494,6 +495,56 @@ fn mnist_graph_matches_tflite() {
         assert_eq!(argmax(&y), argmax(&t), "image {i}");
         assert!(
             y.iter().zip(&t).all(|(a, b)| (a - b).abs() <= 1),
+            "image {i}"
+        );
+    }
+}
+
+/// The MNIST CNN from `tools/mnist/train.py --model cnn` (skipped when
+/// absent): conv / pool / conv / pool / FC with the host padding glue, and
+/// the host reference against TFLite's CPU interpreter.
+#[test]
+fn mnist_cnn_graph_matches_tflite() {
+    use reef_infer::graph::{Graph, Layer, u8_to_i8};
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/mnist");
+    let (Ok(images), Ok(tflite)) = (
+        std::fs::read(dir.join("test_images.bin")),
+        std::fs::read(dir.join("cnn_tflite_logits.bin")),
+    ) else {
+        eprintln!("target/mnist CNN not found (tools/mnist/train.py --model cnn); skipping");
+        return;
+    };
+    let g = Graph::from_tflite(dir.join("cnn.tflite").to_str().unwrap()).unwrap();
+    let kinds: Vec<_> = g
+        .steps
+        .iter()
+        .map(|s| match &s.layer {
+            Layer::Conv(c) => format!("conv{}x{}:{}", c.height, c.width, c.cin),
+            Layer::MaxPool(p) => format!("pool{}x{}", p.height, p.width),
+            Layer::Fc(f) => format!("fc{}", f.k),
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "conv32x32:16",
+            "pool32x32",
+            "conv16x16:32",
+            "pool16x16",
+            "fc3136"
+        ]
+    );
+    assert_eq!(g.build().unwrap().len(), 5);
+    for i in 0..100 {
+        let y = u8_to_i8(&g.reference(&images[784 * i..784 * (i + 1)]));
+        let t: Vec<i8> = tflite[10 * i..10 * (i + 1)]
+            .iter()
+            .map(|&b| b as i8)
+            .collect();
+        assert!(
+            y.iter()
+                .zip(&t)
+                .all(|(a, b)| (*a as i32 - *b as i32).abs() <= 1),
             "image {i}"
         );
     }

@@ -11,8 +11,9 @@ the findings.
 | Generator | Coverage | Verified |
 |---|---|---|
 | Element-wise requant (`elementwise`) | 1x16x16x32 | byte-identical, on device |
-| FC (`fc`) | K <= 1024 (multiple of 8, input spread over tiles and gathered), N 4-64 or 64 per tile up to 1024 | byte-identical (28 corpus models), on device |
-| Front end (`graph`) | CPU int8 `.tflite`: FC chains with RESHAPE, layers through the host | MNIST MLP on device: 97.35%, bit-exact with the host reference |
+| FC (`fc`) | K <= 2048 or 3073-4096 (multiple of 8, input spread over tiles and gathered), N 4-64 or 64 per tile up to 1024 | byte-identical (31 corpus models), on device |
+| MAX_POOL_2D (`pool`) | 2x2 stride 2 valid; H, W 16 / 32; C 32 / 64 / 128 | byte-identical (5 corpus models), on device |
+| Front end (`graph`) | CPU int8 `.tflite`: CONV_2D, MAX_POOL_2D, FC, RESHAPE; host pads / crops between layers | MNIST MLP (97.35%) and CNN (98.66%) on device, bit-exact with the host reference |
 | CONV_2D (`conv`) | same padding; k 1 / 3; stride 1 / 2; 16x16 with Cin 1-128 (k 3), up to 64x64 with Cin >= 16; Cout 8-32 | byte-identical at 16x16, on device up to 64x64 |
 | Loopback broadcast | tile -> scalar memory -> all tiles | on device |
 
@@ -57,11 +58,16 @@ First model with no compiler involved anywhere.
 
 | Item | Need | Known / unknown | Size |
 |---|---|---|---|
-| **MaxPool 2x2 stride 2** | after each conv | new op; corpus has 8 pool models (max / avg, size 2 / 3, same / valid); likely a TensorOp mode over the conv-style window walk | M |
-| Cin 1 on larger images | first layer, 28x28x1 | sub-word input form (rows of tiles sharing a wide word) at sizes above 16x16 is untested; superpixels of 1 channel are not a verified loader width | M |
-| Sizes not a multiple of 16 | 28x28, 14x14, 7x7 | stopgap: host pads to 32 / 16 with the input zero point and crops (exact for same padding, stride 1); proper: tiles with unequal patches | S stopgap / L proper |
-| Conv Cout 64 at k 3 | second conv | a tile's output reaches 1 KiB; 1 KiB staging at 0x2078 already worked for k 1 | S-M |
-| FC K = 3136 | after flatten | milestone 1's FC with more passes | S |
+**Done (2026-10-14):** all 10000 test images on the TPU, 98.66%,
+bit-exact with the host reference, same top-1 as TFLite CPU.
+
+| Item | Need | Known / unknown | Size |
+|---|---|---|---|
+| **MaxPool 2x2 stride 2** | after each conv | **done** (`codegen::pool`): the element-wise loader, a regrouping into wide words, and a pool op (opcode 0x02); byte-identical on 5 corpus models | M |
+| Cin 1 on larger images | first layer, 28x28x1 | **stopgap**: fed as Cin 16 with zero weights (the verified Cin 16 path at 32x32); the sub-word input form at larger sizes is still open | M |
+| Sizes not a multiple of 16 | 28x28, 14x14, 7x7 | **stopgap done**: host pads with the zero point and crops (`graph::Step`); proper: tiles with unequal patches | S stopgap / L proper |
+| Conv Cout 64 at k 3 | second conv | **done** for Cin >= 32 at 16x16 (byte-identical); Cin 16 moves the compiler's narrow buffers | S-M |
+| FC K = 3136 | after flatten | **done**: no passes either; 128 / 256 B per input tile above K 1024 (K 2049..3072 not derived) | S |
 
 ## Milestone 3: small CNNs (CIFAR-10 style, ResNet-8 / -20)
 

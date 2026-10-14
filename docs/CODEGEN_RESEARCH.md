@@ -723,3 +723,54 @@ DarwiNN `data_type`. And every `load_params` / `run_inference` submitted
 a new event and interrupt read while the previous call's were still
 pending; they piled up until usbfs failed with ENOMEM (errno 12) after
 ~1900 calls. The runner now tops up to one pending read.
+
+## MaxPool, larger FCs and the MNIST CNN (2026-10-14)
+
+**MAX_POOL_2D 2x2 stride 2** (`codegen::pool`), byte-identical to 16.0 on
+the 5 corpus models (H, W 16 / 32; C 32 / 64 / 128; C 8 has one instruction
+less, not covered) and bit-exact on the TPU, nonzero zero points included.
+The program is the element-wise one up to the compute stage: the same band
+loader (one staging row of `tw C / 64` slots, column skips of `tw C / 4`
+words) and the two copy TensorOps, generalized to a `tw x th` patch (first
+copy rows `0 ..= th - 2`, second the last row; the staging row is re-read
+for every output row, stride 0). Then:
+
+- a narrowToWide regroups the patch into wide words of 4 pixels x up to 64
+  channels (levels: pixel, word, 4-pixel group, row, 64-channel block);
+- the pool op is opcode 0x02, a TensorOp variant with window loops
+  (`loop0` / `loop1` = 1 for 2x2) that reads the windows on its parameter
+  path from those wide words (`par_hmode`, `par_mode*`) and writes outputs
+  pixel by pixel; its datapath is an identity requantization `clamp(max -
+  zp, -zp, 255 - zp) + zp` (`offset` = -zp);
+- the output stage switches to the element-wise form (no circular buffer,
+  producer `cnt1`) at 512 B per tile.
+
+Wide memory, top down: the regrouped patch (`4 x words` units below
+0x2080), one staging row (8 units per slot), 4 constant words. Every loop
+increment follows the walk rule.
+
+**FC above K = 1024**: still no passes. Each input tile takes 128 B (K <=
+2048) or 256 B (K <= 4096), so 16 tiles hold the input; K 2049..3072 is not
+in the corpus. Staging is `ceil(K / 256)` wide words at `0x2080 - 8 x
+slots`; column c reads word `c ch / 256` with a skip of `(c ch mod 256) /
+4` words; full rows' ringConsumers walk all slots with `grp` = words per
+tile - 1 and `gstride` = 3 floor(K / 256) + 1 (fits 2048 / 3136 / 4096, not
+decoded). Narrow staging sits at `round_up(K, 256) + 512` bytes, which also
+gives the 0xc0 / 0x180 of smaller K. The parameter pop's `rows_neg`
+saturates at 1024 rows.
+
+**Conv Cout 64** (k 3, Cin 32 at 16x16, 1 KiB of output per tile):
+byte-identical with no change beyond the check, parameters included. Cin 16
+with Cout 64 is not: the compiler moves the narrow buffers.
+
+**MNIST CNN** (`train.py --model cnn`: Conv 3x3 32 ReLU -> MaxPool -> Conv
+3x3 64 ReLU -> MaxPool -> Dense 10, same padding). The front end maps it to
+5 programs; the host pads 28 -> 32 and 14 -> 16 with the zero point and
+crops after each (exact: same padding with stride 1 sees zero-point rows
+either way, and a 2x2 pool's kept outputs never read the padding), and the
+first conv's single channel goes in as 16 with zero weights. **All 10000
+test images on the TPU: 98.66%, byte-identical to the host reference on
+every image**, the same top-1 as TFLite CPU (4 of 100000 logits differ by
+1); 7.9 ms per image, most of it USB round trips and parameter reloads for
+5 programs. edgetpu_compiler rejects this model (Keras 3's Flatten has a
+dynamic shape), so only its per-layer programs were compared.
