@@ -111,6 +111,9 @@ def configs():
         pool, op=["avg"], size=[3], stride=[1], pad=["same"], C=[8, 128], H=[32]
     ):
         c.append(("pool", p))
+    # MNIST CNN layers, padded to 32x32 / 16x16 (28 -> 14 -> 7)
+    for H, C in [(32, 32), (16, 64)]:
+        c.append(("pool", {**pool, "H": H, "W": H, "C": C}))
     act = dict(shape=[16, 16, 32], op="logistic", in_range=8.0)
     for p in sweep(
         act,

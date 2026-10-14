@@ -9,6 +9,7 @@
 pub mod conv;
 pub mod elementwise;
 pub mod fc;
+pub mod pool;
 
 use crate::executable_generated::platforms::darwinn::{Description, ExecutableType, Position};
 use crate::isa::{self, IsaError};

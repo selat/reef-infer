@@ -8,6 +8,7 @@ use reef_infer::codegen::Quant;
 use reef_infer::codegen::conv::Conv;
 use reef_infer::codegen::elementwise::{self, Requant, SIZE};
 use reef_infer::codegen::fc::Fc;
+use reef_infer::codegen::pool::MaxPool;
 use reef_infer::runner::Device;
 
 fn bytes(seed: &mut u64, n: usize) -> Vec<u8> {
@@ -106,6 +107,35 @@ async fn generated_programs_on_tpu() {
             let x = bytes(&mut seed, k);
             let got = dev.run_inference(&loaded, x.clone()).await.unwrap();
             assert_eq!(got, fc.reference(&x), "fc K={k} N={n} relu={relu}");
+        }
+    }
+
+    // 2x2 max pools, including the MNIST CNN's (32x32x32, 16x16x64).
+    for (height, width, c, zp) in [
+        (16, 16, 32, 128),
+        (32, 32, 32, 0),
+        (16, 16, 64, 0),
+        (32, 16, 32, 37),
+        (16, 16, 128, 250),
+    ] {
+        let pool = MaxPool {
+            height,
+            width,
+            c,
+            quant: Quant {
+                scale: 0.05,
+                zero_point: zp,
+            },
+        };
+        let model = Arc::new(pool.build().unwrap().into_model());
+        let loaded = dev.load_params(model).await.unwrap();
+        for _ in 0..2 {
+            let x = bytes(&mut seed, height * width * c);
+            let got = dev.run_inference(&loaded, x.clone()).await.unwrap();
+            assert!(
+                got == pool.reference(&x),
+                "pool {height}x{width}x{c} zp {zp}"
+            );
         }
     }
 

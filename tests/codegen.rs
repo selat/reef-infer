@@ -10,6 +10,7 @@ use reef_infer::codegen::Quant;
 use reef_infer::codegen::conv::Conv;
 use reef_infer::codegen::elementwise::{self, Requant};
 use reef_infer::codegen::fc::Fc;
+use reef_infer::codegen::pool::MaxPool;
 use reef_infer::isa;
 use reef_infer::model::{ExecInfo, LayerInfo, load_tflite_model};
 
@@ -468,6 +469,46 @@ fn mnist_graph_matches_tflite() {
         assert!(
             y.iter().zip(&t).all(|(a, b)| (a - b).abs() <= 1),
             "image {i}"
+        );
+    }
+}
+
+/// Every corpus 2x2 max pool `codegen::pool` supports, including the MNIST
+/// CNN's (32x32x32, 16x16x64): instructions and output layout.
+#[test]
+fn pool_matches_compiler() {
+    for (h, w, c) in [
+        (16, 16, 32),
+        (16, 16, 64),
+        (16, 16, 128),
+        (32, 16, 32),
+        (32, 32, 32),
+    ] {
+        let name = format!("pool/pool_C{c}_H{h}_W{w}_opmax_padvalid_size2_stride2");
+        let Some(path) = corpus(&name) else {
+            eprintln!("ISA corpus model {name} not found; skipping");
+            continue;
+        };
+        let compiled = load_tflite_model(&path).unwrap();
+        let e = &compiled.executables[0];
+        let ours = MaxPool {
+            height: h,
+            width: w,
+            c,
+            quant: quant(&e.input_layers[0]),
+        }
+        .build()
+        .unwrap()
+        .into_model();
+        let o = &ours.executables[0];
+        assert_eq!(
+            o.instruction_chunks[0].bitstream, e.instruction_chunks[0].bitstream,
+            "{name}"
+        );
+        assert_eq!(
+            format!("{:?}", o.output_layers[0].output_layout),
+            format!("{:?}", e.output_layers[0].output_layout),
+            "{name}"
         );
     }
 }
