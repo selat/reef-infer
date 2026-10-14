@@ -355,7 +355,7 @@ fn build_inner(
         ],
     )?;
     a.emit(OP_SYNC, &[("tiles", ALL_TILES), ("units", 0x20)])?;
-    copy_op(&mut a, &Patch::plain(32), 0x7c, true)?;
+    copy_op(&mut a, &Patch::plain(32), 0x7c, true, 0)?;
 
     // ── Input: ask the host for SIZE bytes, pop them into the staging
     // buffer, and infeed 2 KiB to each row of 4 tiles over the ring.
@@ -491,7 +491,7 @@ fn build_inner(
     sync(&mut a, 0, 0x3ff, false)?;
 
     // ── Compute.
-    copy_op(&mut a, &Patch::plain(32), 0x7c, false)?;
+    copy_op(&mut a, &Patch::plain(32), 0x7c, false, 0)?;
     sync(&mut a, 0x1ffff, 0x3ff, false)?;
     sync(&mut a, 0x1ffff, 0x3ff, false)?;
     requant_op(&mut a, rq)?;

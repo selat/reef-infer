@@ -96,29 +96,33 @@ async fn generated_programs_on_tpu() {
 
     // Convolutions with random weights: 1x1, and 3x3 (halo exchange, zero
     // point padding at the image border).
-    for (k, stride, width, cin, cout, relu, in_zp, out_zp) in [
-        (1, 1, 16, 16, 32, false, 127, 131),
-        (1, 1, 16, 16, 32, true, 100, 0),
-        (3, 1, 16, 16, 32, false, 127, 130),
-        (3, 1, 16, 16, 16, true, 3, 0),
-        (3, 1, 16, 16, 8, false, 250, 20),
-        (3, 1, 16, 32, 32, false, 128, 120),
-        (3, 1, 16, 64, 16, true, 60, 0),
-        (3, 1, 16, 128, 8, false, 140, 200),
-        (3, 1, 16, 128, 32, false, 128, 128),
-        (3, 1, 16, 3, 32, false, 127, 128),
-        (3, 1, 16, 3, 16, true, 0, 0),
-        (3, 1, 16, 1, 8, false, 200, 50),
-        (3, 1, 16, 4, 32, false, 90, 140),
-        (1, 2, 16, 16, 32, false, 127, 120),
-        (3, 2, 16, 16, 32, false, 128, 130),
-        (3, 2, 16, 3, 16, true, 10, 0),
-        (3, 2, 16, 64, 8, false, 128, 60),
+    for (k, stride, height, width, cin, cout, relu, in_zp, out_zp) in [
+        (1, 1, 16, 16, 16, 32, false, 127, 131),
+        (1, 1, 16, 16, 16, 32, true, 100, 0),
+        (3, 1, 16, 16, 16, 32, false, 127, 130),
+        (3, 1, 16, 16, 16, 16, true, 3, 0),
+        (3, 1, 16, 16, 16, 8, false, 250, 20),
+        (3, 1, 16, 16, 32, 32, false, 128, 120),
+        (3, 1, 16, 16, 64, 16, true, 60, 0),
+        (3, 1, 16, 16, 128, 8, false, 140, 200),
+        (3, 1, 16, 16, 128, 32, false, 128, 128),
+        (3, 1, 16, 16, 3, 32, false, 127, 128),
+        (3, 1, 16, 16, 3, 16, true, 0, 0),
+        (3, 1, 16, 16, 1, 8, false, 200, 50),
+        (3, 1, 16, 16, 4, 32, false, 90, 140),
+        (1, 2, 16, 16, 16, 32, false, 127, 120),
+        (3, 2, 16, 16, 16, 32, false, 128, 130),
+        (3, 2, 16, 16, 3, 16, true, 10, 0),
+        (3, 2, 16, 16, 64, 8, false, 128, 60),
         // wider images: superpixels of width / 16 pixels
-        (1, 1, 32, 16, 32, false, 127, 128),
-        (3, 1, 32, 16, 32, false, 120, 128),
-        (3, 1, 64, 16, 16, true, 128, 0),
-        (3, 2, 64, 32, 16, false, 100, 150),
+        (1, 1, 16, 32, 16, 32, false, 127, 128),
+        (3, 1, 16, 32, 16, 32, false, 120, 128),
+        (3, 1, 16, 64, 16, 16, true, 128, 0),
+        (3, 2, 16, 64, 32, 16, false, 100, 150),
+        // taller images: bands of 4 rows per tile
+        (3, 1, 32, 16, 16, 32, false, 128, 128),
+        (3, 2, 64, 32, 16, 32, false, 120, 130),
+        (3, 1, 64, 64, 16, 8, true, 128, 0),
     ] {
         let w = bytes(&mut seed, cout * k * k * cin);
         let conv = Conv {
@@ -127,6 +131,7 @@ async fn generated_programs_on_tpu() {
             k,
             stride,
             width,
+            height,
             weights: w.iter().map(|&b| b as i8).collect(),
             w_scale: (0..cout)
                 .map(|i| (0.0007 + 0.0001 * i as f32) * 16.0 / cin as f32)
@@ -147,13 +152,13 @@ async fn generated_programs_on_tpu() {
             .await
             .unwrap();
         for _ in 0..3 {
-            let x = bytes(&mut seed, 16 * width * cin);
+            let x = bytes(&mut seed, height * width * cin);
             let got = dev.run_inference(&loaded, x.clone()).await.unwrap();
             let want = conv.reference(&x);
             let bad = got.iter().zip(&want).filter(|(a, b)| a != b).count();
             assert!(
                 bad == 0,
-                "conv k={k} s={stride} 16x{width} Cin={cin} Cout={cout} relu={relu} zp {in_zp}/{out_zp}: {bad}/{} wrong",
+                "conv k={k} s={stride} {height}x{width} Cin={cin} Cout={cout} relu={relu} zp {in_zp}/{out_zp}: {bad}/{} wrong",
                 want.len()
             );
         }

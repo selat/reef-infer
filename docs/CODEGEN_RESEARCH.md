@@ -606,8 +606,45 @@ on open, also for the matmul test); a USB reset through `nusb` then made
 the device drop off the bus and it needed a replug. Not repeated: after
 later hangs, reopening recovered.
 
-**Still open:** heights other than 16 (the loader's rows per tile: the
-skip / head semantics again, or a loader of our own); Cin < 16 at wider
-sizes (superpixel channels not a loader-verified count); output above
-2 KiB per tile (wide staging above 0x207f is untested).
+**Heights 32 / 64 (same day), also without the compiler.** Bit-exact on
+the TPU up to 64x64 (14 cases: k 1 / 3, stride 1 / 2, Cin 16 / 32, Cout
+8-32, ReLU).
+
+*First attempt, a loader of our own (dropped).* One strided infeed per
+tile gathering its rows (`d0` a row segment, `d1` the rows at the image
+row stride; the default `d1_stride = -0x3fff` decodes as a count-1 level
+under the delta rule), a linear one-slot consumer and one wideToNarrow
+for all tiles. It hung even at 16x16. Bisection from the working band
+loader:
+
+| Variant (16x16, k 1) | Result |
+|---|---|
+| per-tile infeeds of contiguous chunks (gather sizes, no strides) | hang |
+| band loader, each band sent to 1 tile at a time (each band read 4x) | hang |
+| band loader, bands to pairs of tiles (each band read 2x) | hang |
+| band loader, only row 0 split per tile | hang |
+| `k434` / `f438` of the 1-tile infeeds varied (1, 0) | hang |
+| band loader, rows infed in reverse order (correct `buf_off`) | exact |
+| band loader, each band in 4 quarter infeeds (16 infeeds) | exact |
+
+So staging is random-access (`buf_off` honoured, any order) and the
+number and size of infeeds are not limited, but **each staged byte can be
+infed only once**: every variant that re-reads a range hangs. The
+per-tile gather obeys that, so its hang is in its consumer /
+wideToNarrow forms, which were guesses.
+
+*Design used: stacked bands.* A 4-row band through the verified loader and
+copy ops is a unit that deposits 4 image rows into the compute layout.
+For `height / 4` rows per tile the program runs it once per band: the
+image is popped once, band `h`'s infeeds read rows `(row x bands + h)` of
+the staged image, the landing area is reused, and the copy ops write rows
+`4 h ..` of the padded patch (`copy_op` takes the row offset). The copy
+ops' `tp` term is only the nominal stride of a count-1 loop level, so
+they carry over unchanged. The halo's vertical extents and the conv op's
+output rows follow the patch's row count. Check: with the second copy's
+row offset left at 0, exactly rows 3, 7, 11, ... come out wrong.
+
+**Still open:** Cin < 16 at larger sizes (superpixel channel counts and
+the sub-word input form untested), output above 2 KiB per tile (wide
+staging above 0x207f untested), sizes not a multiple of 16.
 

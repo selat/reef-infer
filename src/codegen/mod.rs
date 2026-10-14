@@ -479,6 +479,9 @@ pub fn done(a: &mut Asm) -> Result<(), IsaError> {
 #[derive(Debug, Clone, Copy)]
 pub struct Patch {
     pub cin: i64,
+    /// Interior rows (4, or more for taller images; the loader moves them
+    /// in bands of 4).
+    pub rows: i64,
     pub top: i64,
     pub bottom: i64,
     pub left: i64,
@@ -489,6 +492,7 @@ impl Patch {
     pub fn plain(cin: usize) -> Patch {
         Patch {
             cin: cin as i64,
+            rows: 4,
             top: 0,
             bottom: 0,
             left: 0,
@@ -504,9 +508,10 @@ impl Patch {
         4 + self.left + self.right
     }
     pub fn ph(&self) -> i64 {
-        4 + self.top + self.bottom
+        self.rows + self.top + self.bottom
     }
-    /// Unpadded bytes (what the host sends per tile).
+    /// Unpadded bytes of one 4-row band (what the host sends per tile and
+    /// band).
     pub fn tb(&self) -> i64 {
         16 * self.cin
     }
@@ -526,17 +531,24 @@ impl Patch {
 
 /// The copy/reformat TensorOp (`dp_mode` 4) that moves a tile's input from
 /// where the infeed lands it (narrow `tp`) into the padded compute layout
-/// (narrow 0): the first copy writes rows 0-2, the second row 3.
+/// (narrow 0): the first copy writes rows `row0..row0 + 3`, the second row
+/// `row0 + 3` (one 4-row band).
 /// `par_base` is the low byte of the constants' wide address. Formulas fit
 /// element-wise (32 ch, no halo, constants at 0x207c) and conv k = 1..7
 /// (16 ch).
-pub fn copy_op(a: &mut Asm, p: &Patch, par_base: i64, first: bool) -> Result<(), IsaError> {
+pub fn copy_op(
+    a: &mut Asm,
+    p: &Patch,
+    par_base: i64,
+    first: bool,
+    row0: i64,
+) -> Result<(), IsaError> {
     let (tb, tp, cq, pw) = (p.tb(), p.tp(), p.cq(), p.pw());
     let w = tb / 64; // 64 B units per tile
     let (in_base, out_base, out_inc3, out_inc4, sync0) = if first {
         (
             tp,
-            p.at(0, 0),
+            p.at(row0, 0),
             tp / 4 - 2 * pw * cq - (4 * cq - 1),
             -(12 * cq - 1) - 2 * cq * (pw - 4),
             tb / 16,
@@ -544,7 +556,7 @@ pub fn copy_op(a: &mut Asm, p: &Patch, par_base: i64, first: bool) -> Result<(),
     } else {
         (
             tp + p.lb(),
-            p.at(3, 0),
+            p.at(row0 + 3, 0),
             tp / 4 - (4 * cq - 1),
             -(4 * cq - 1),
             13 * tb / 64,

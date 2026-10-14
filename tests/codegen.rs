@@ -323,6 +323,7 @@ fn conv_matches_compiler() {
             k,
             stride: if kind.ends_with("stride2") { 2 } else { 1 },
             width: 16,
+            height: 16,
             weights: nums("weights").map_or(vec![1; cout * k * k * cin], |v| {
                 v.iter().map(|&x| x as i8).collect()
             }),

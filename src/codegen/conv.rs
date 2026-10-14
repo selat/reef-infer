@@ -23,7 +23,7 @@
 //! accumulating in partial-sum memory, and the weight rows are streamed in
 //! that order (`[Cin / 4][ky][kx]`).
 //!
-//! **Wider images** (width 32 / 64, height 16) are derived without the
+//! **Larger images** (width / height 32 or 64) are derived without the
 //! compiler (bit-exact on the TPU, not compared with its output): a row of
 //! `width` pixels is loaded as 16 superpixels of `m = width / 16` pixels,
 //! i.e. the 16x16 loader, copy ops and halo exchange with `m Cin` channels.
@@ -31,6 +31,12 @@
 //! the conv op walks real pixels inside that layout from `in_base`, the
 //! first window's origin. Each tile computes `4 x 4m` output pixels (or
 //! `2 x 2m` at stride 2).
+//!
+//! Taller images (height 32 / 64) give each tile `height / 4` rows. The
+//! loader moves them as consecutive 4-row bands: each band goes through the
+//! verified 16-row loader and copy ops unchanged (its infeeds read that
+//! band's rows of the staged image, every byte once), and the copy ops place
+//! it 4 rows further down the patch. Verified on the TPU up to 64x64.
 //!
 //! Supported (byte-identical to the compiler on 16 corpus models,
 //! `examples/conv_check.rs`; bit-exact on the TPU): same padding, 16x16,
@@ -66,8 +72,10 @@ pub struct Conv {
     pub k: usize,
     /// 1 or 2 (same padding: TensorFlow pads the far side more).
     pub stride: usize,
-    /// Image width: 16, 32 or 64 (height is 16).
+    /// Image width: 16, 32 or 64.
     pub width: usize,
+    /// Image height: 16, 32 or 64.
+    pub height: usize,
     pub weights: Vec<i8>,
     pub w_scale: Vec<f32>,
     pub bias: Vec<i32>,
@@ -85,9 +93,17 @@ impl Conv {
             32 | 64 => self.cin >= 16 && [32, 64, 128].contains(&(self.cin * m)),
             _ => false,
         };
-        let ob = (4 / self.stride) * (4 * m / self.stride) * self.cout;
+        let tall_ok = match self.height {
+            16 => true,
+            // bands of 4 rows through the verified loader: >= 16 superpixel
+            // channels (the linear and circular input forms)
+            32 | 64 => self.cin_pad() * m >= 16,
+            _ => false,
+        };
+        let ob = (self.height / 4 / self.stride) * (4 * m / self.stride) * self.cout;
         let ok = [1, 2].contains(&self.stride)
             && wide_ok
+            && tall_ok
             && ob <= 2048
             && match self.k {
                 1 => (self.cin, self.cout) == (16, 32),
@@ -132,7 +148,7 @@ impl Conv {
     /// Output pixels per tile along y and x.
     fn opx(&self) -> (i64, i64) {
         let s = self.stride as i64;
-        (4 / s, 4 * self.spx() / s)
+        ((self.height / 4) as i64 / s, 4 * self.spx() / s)
     }
 
     /// The tile patch in superpixels: 4x4 of them, the padding as a halo
@@ -143,6 +159,7 @@ impl Conv {
         let m = self.spx();
         Patch {
             cin: self.cin_pad() as i64 * m,
+            rows: (self.height / 4) as i64,
             top: before,
             bottom: after,
             left: (before + m - 1) / m,
@@ -158,11 +175,18 @@ impl Conv {
 
     /// The two input copy ops ([`copy_op`]); for Cin 1 / 3 they also widen
     /// each pixel to one 4-byte word.
-    fn copy(&self, a: &mut Asm, pt: &Patch, par_base: i64, first: bool) -> Result<(), IsaError> {
+    fn copy(
+        &self,
+        a: &mut Asm,
+        pt: &Patch,
+        par_base: i64,
+        first: bool,
+        row0: i64,
+    ) -> Result<(), IsaError> {
         if self.cin < 4 {
-            copy_op_small(a, self.cin as i64, pt, par_base, first)
+            copy_op_small(a, self.cin as i64, pt, par_base, first, row0)
         } else {
-            copy_op(a, pt, par_base, first)
+            copy_op(a, pt, par_base, first, row0)
         }
     }
 
@@ -226,7 +250,7 @@ impl Conv {
     /// Host reference over a y-x-z input: each output pixel is the FC of its
     /// `k x k` window, zero-point padded.
     pub fn reference(&self, x: &[u8]) -> Vec<u8> {
-        let (h, w) = (HW.0 as i64, self.width as i64);
+        let (h, w) = (self.height as i64, self.width as i64);
         let (k, cin) = (self.k as i64, self.cin);
         let p = self.pad().0;
         let fc = self.fc();
@@ -276,7 +300,7 @@ impl Conv {
             output_layers: vec![],
             scratch_size_bytes: 0,
         };
-        let (h, w) = (HW.0, self.width);
+        let (h, w) = (self.height, self.width);
         let (oh, ow) = (h / self.stride, w / self.stride);
         let exec = ExecInfo {
             exec_type: ExecutableType::EXECUTION_ONLY,
@@ -427,12 +451,14 @@ impl Conv {
             )?;
         }
         a.emit(OP_SYNC, &[("tiles", ALL_TILES), ("units", 0x20)])?;
-        self.copy(&mut a, &pt, const_wide & 0xff, true)?;
+        self.copy(&mut a, &pt, const_wide & 0xff, true, 0)?;
 
         // ── Input: 4 tb bytes per row of 4 tiles through the input buffer,
         // landing at narrow tp; column c skips Cin * c words.
         load_input_addr(&mut a, IN_NAME)?;
-        let size = 16 * tbi;
+        // the whole image is popped once; bands of 4 rows are infed in turn
+        let bands = pt.rows / 4;
+        let size = 16 * tbi * bands;
         let units8 = size / 8;
         a.emit(
             OP_POP,
@@ -460,167 +486,174 @@ impl Conv {
             a.emit(OP_SYNC, &[("tiles", ALL_TILES), ("counters", 0x800)])?;
         }
         let (nw, land) = (tbi / 4, tp / 4); // narrow words per tile, landing word
-        // the buffer's wide-side walk: one slot, 4 words in turn, or `sw`
-        // circular slots, 4 rounds
-        let wide: Vec<(&str, i64)> = if tbi < 256 {
-            // a row of 4 tiles is one word: one circular slot
-            vec![
-                ("wide_addr", buf),
-                ("w_inc0", 1),
-                ("wide_circ", 1),
-                ("wide_rows", 1),
-                ("sync_wait_lvl", 1),
-            ]
-        } else if sw == 1 {
-            vec![("wide_addr", buf), ("w_lim0", 3), ("wide_rows", 1)]
-        } else {
-            vec![
-                ("wide_addr", buf),
-                ("w_inc0", 1),
-                ("w_lim0", sw - 1),
-                ("w_inc1", -(sw - 1)),
-                ("w_lim1", 3),
-                ("w_inc2", -(sw - 1)),
-                ("w_inc3", -(sw - 1)),
-                ("wide_lvl_mask", 1),
-                ("wide_circ", 1),
-                ("wide_rows", sw),
-                ("sync_wait_lvl", 1),
-            ]
-        };
-        for col in 0..4i64 {
-            let mut f: Vec<(&str, i64)> = wide.clone();
-            f.extend([
-                ("tile_mask", 0x1111 << col),
-                ("narrow_addr", land),
-                ("n_inc0", 1),
-                ("n_lim0", nw - 1),
-                ("n_lim1", if small { 4 } else { 3 }),
-                ("narrow_lvl_mask", 1),
-                ("mode", 1),
-                ("size64", lb / 64),
-            ]);
-            for n in ["n_inc1", "n_inc2", "n_inc3", "n_inc4", "n_inc5"] {
-                f.push((n, -(nw - 1)));
+        for h in 0..bands {
+            // band h: the verified 4-row loader and copy ops, landing in the
+            // same place, copied to rows 4 h.. of the patch
+            if h > 0 {
+                self.copy(&mut a, &pt, const_wide & 0xff, true, 4 * h)?;
             }
-            let skip = if small { self.cin as i64 } else { pt.cin } * col;
-            // head of the first narrow row; for Cin 1 / 3 the compiler's
-            // values (not derived; tail_words follows from them)
-            let head = match self.cin {
-                1 => [43, 46, 45, 44][col as usize],
-                3 => [15, 12, 9, 6][col as usize],
-                _ => nw - 1 - skip,
+            // the buffer's wide-side walk: one slot, 4 words in turn, or `sw`
+            // circular slots, 4 rounds
+            let wide: Vec<(&str, i64)> = if tbi < 256 {
+                // a row of 4 tiles is one word: one circular slot
+                vec![
+                    ("wide_addr", buf),
+                    ("w_inc0", 1),
+                    ("wide_circ", 1),
+                    ("wide_rows", 1),
+                    ("sync_wait_lvl", 1),
+                ]
+            } else if sw == 1 {
+                vec![("wide_addr", buf), ("w_lim0", 3), ("wide_rows", 1)]
+            } else {
+                vec![
+                    ("wide_addr", buf),
+                    ("w_inc0", 1),
+                    ("w_lim0", sw - 1),
+                    ("w_inc1", -(sw - 1)),
+                    ("w_lim1", 3),
+                    ("w_inc2", -(sw - 1)),
+                    ("w_inc3", -(sw - 1)),
+                    ("wide_lvl_mask", 1),
+                    ("wide_circ", 1),
+                    ("wide_rows", sw),
+                    ("sync_wait_lvl", 1),
+                ]
             };
-            if small {
+            for col in 0..4i64 {
+                let mut f: Vec<(&str, i64)> = wide.clone();
                 f.extend([
-                    ("head_words_m1", head),
-                    ("head_en", 1),
-                    ("tail_words", nw - (head + 1)),
+                    ("tile_mask", 0x1111 << col),
+                    ("narrow_addr", land),
+                    ("n_inc0", 1),
+                    ("n_lim0", nw - 1),
+                    ("n_lim1", if small { 4 } else { 3 }),
+                    ("narrow_lvl_mask", 1),
+                    ("mode", 1),
+                    ("size64", lb / 64),
                 ]);
-            }
-            if col > 0 {
-                if !small {
+                for n in ["n_inc1", "n_inc2", "n_inc3", "n_inc4", "n_inc5"] {
+                    f.push((n, -(nw - 1)));
+                }
+                let skip = if small { self.cin as i64 } else { pt.cin } * col;
+                // head of the first narrow row; for Cin 1 / 3 the compiler's
+                // values (not derived; tail_words follows from them)
+                let head = match self.cin {
+                    1 => [43, 46, 45, 44][col as usize],
+                    3 => [15, 12, 9, 6][col as usize],
+                    _ => nw - 1 - skip,
+                };
+                if small {
                     f.extend([
                         ("head_words_m1", head),
                         ("head_en", 1),
-                        ("tail_words", skip),
+                        ("tail_words", nw - (head + 1)),
+                    ]);
+                }
+                if col > 0 {
+                    if !small {
+                        f.extend([
+                            ("head_words_m1", head),
+                            ("head_en", 1),
+                            ("tail_words", skip),
+                        ]);
+                    }
+                    f.extend([
+                        ("skip_en0", 1),
+                        ("skip_base", land),
+                        ("skip_m1", skip - 1),
+                        ("skip_end", land + skip - 1),
+                        ("rsv543", 1),
                     ]);
                 }
                 f.extend([
-                    ("skip_en0", 1),
-                    ("skip_base", land),
-                    ("skip_m1", skip - 1),
-                    ("skip_end", land + skip - 1),
-                    ("rsv543", 1),
+                    ("sync_en0", 1),
+                    ("sync_id", 0xe),
+                    ("sync_en1", 1),
+                    ("sync_val", 0x8000),
+                    ("sync_en2", 1),
+                    ("sync_dec_lvl", 1),
+                    ("sync_dec", -1),
+                    ("sync_dec_mode", 3),
+                    ("tail_en870", 0),
+                    ("tail_f871", 1),
                 ]);
+                a.emit(OP_WIDE_TO_NARROW, &f)?;
             }
-            f.extend([
-                ("sync_en0", 1),
-                ("sync_id", 0xe),
-                ("sync_en1", 1),
-                ("sync_val", 0x8000),
-                ("sync_en2", 1),
-                ("sync_dec_lvl", 1),
-                ("sync_dec", -1),
-                ("sync_dec_mode", 3),
-                ("tail_en870", 0),
-                ("tail_f871", 1),
-            ]);
-            a.emit(OP_WIDE_TO_NARROW, &f)?;
+            let per_row = 4 * tbi / 8; // infeed units of 8 B
+            let consumer: Vec<(&str, i64)> = if tbi < 256 {
+                vec![
+                    ("addr", buf),
+                    ("inc0", 1),
+                    ("cbuf", 1),
+                    ("slots", 1),
+                    ("mode", 3),
+                    ("s_id", 0x2b),
+                ]
+            } else if sw == 1 {
+                vec![
+                    ("addr", buf),
+                    ("cnt0", 3),
+                    ("slots", 1),
+                    ("mode", 1),
+                    ("s_id", 0xb),
+                ]
+            } else {
+                vec![
+                    ("addr", buf),
+                    ("inc0", 1),
+                    ("cnt0", sw - 1),
+                    ("inc1", -(sw - 1)),
+                    ("cnt1", 3),
+                    ("inc2", -(sw - 1)),
+                    ("inc3", -(sw - 1)),
+                    ("sdims", 1),
+                    ("cbuf", 1),
+                    ("slots", sw),
+                    ("mode", 3),
+                    ("s_id", 0x2b),
+                ]
+            };
+            for row in 0..4i64 {
+                let mut f = consumer.clone();
+                f.extend([
+                    ("tile_mask", 0xf << (4 * row)),
+                    ("s_val", -(lb / 4)),
+                    ("s_cnt", sw),
+                    ("s_en_b", 1),
+                    ("s_y", 1),
+                ]);
+                a.emit(OP_RING_CONSUMER, &f)?;
+                a.emit(
+                    OP_INFEED,
+                    &[
+                        ("stream", 1),
+                        ("buf_off", per_row * (row * bands + h)),
+                        ("d0_stride", 1),
+                        ("d0_limit", 0x3fff),
+                        ("d1_stride", 0x1fc001),
+                        ("d2_stride", 0x1fc001),
+                        ("k157", 1),
+                        ("k160", 1),
+                        ("av176", 1),
+                        ("count_m1", per_row - 1),
+                        ("k203", 1),
+                        ("count_neg", 0x4000 - per_row),
+                        ("k311", 1),
+                        ("pop_wait", per_row * (row * bands + h) + 1),
+                        ("k336", 1),
+                        ("k352", 1),
+                        ("k392", 1),
+                        ("tiles", 0xf << (4 * row)),
+                        ("k434", 0xf),
+                        ("f438", 3),
+                    ],
+                )?;
+            }
+            sync(&mut a, 0, 0x3ff, false)?;
+            self.copy(&mut a, &pt, const_wide & 0xff, false, 4 * h)?;
+            sync(&mut a, 0x1ffff, 0x3ff, false)?;
         }
-        let per_row = 4 * tbi / 8; // infeed units of 8 B
-        let consumer: Vec<(&str, i64)> = if tbi < 256 {
-            vec![
-                ("addr", buf),
-                ("inc0", 1),
-                ("cbuf", 1),
-                ("slots", 1),
-                ("mode", 3),
-                ("s_id", 0x2b),
-            ]
-        } else if sw == 1 {
-            vec![
-                ("addr", buf),
-                ("cnt0", 3),
-                ("slots", 1),
-                ("mode", 1),
-                ("s_id", 0xb),
-            ]
-        } else {
-            vec![
-                ("addr", buf),
-                ("inc0", 1),
-                ("cnt0", sw - 1),
-                ("inc1", -(sw - 1)),
-                ("cnt1", 3),
-                ("inc2", -(sw - 1)),
-                ("inc3", -(sw - 1)),
-                ("sdims", 1),
-                ("cbuf", 1),
-                ("slots", sw),
-                ("mode", 3),
-                ("s_id", 0x2b),
-            ]
-        };
-        for row in 0..4i64 {
-            let mut f = consumer.clone();
-            f.extend([
-                ("tile_mask", 0xf << (4 * row)),
-                ("s_val", -(lb / 4)),
-                ("s_cnt", sw),
-                ("s_en_b", 1),
-                ("s_y", 1),
-            ]);
-            a.emit(OP_RING_CONSUMER, &f)?;
-            a.emit(
-                OP_INFEED,
-                &[
-                    ("stream", 1),
-                    ("buf_off", per_row * row),
-                    ("d0_stride", 1),
-                    ("d0_limit", 0x3fff),
-                    ("d1_stride", 0x1fc001),
-                    ("d2_stride", 0x1fc001),
-                    ("k157", 1),
-                    ("k160", 1),
-                    ("av176", 1),
-                    ("count_m1", per_row - 1),
-                    ("k203", 1),
-                    ("count_neg", 0x4000 - per_row),
-                    ("k311", 1),
-                    ("pop_wait", per_row * row + 1),
-                    ("k336", 1),
-                    ("k352", 1),
-                    ("k392", 1),
-                    ("tiles", 0xf << (4 * row)),
-                    ("k434", 0xf),
-                    ("f438", 3),
-                ],
-            )?;
-        }
-        sync(&mut a, 0, 0x3ff, false)?;
-        self.copy(&mut a, &pt, const_wide & 0xff, false)?;
-        sync(&mut a, 0x1ffff, 0x3ff, false)?;
         if self.k > 1 {
             halo(&mut a, &pt, self.input.zero_point)?;
         }
@@ -975,6 +1008,7 @@ fn copy_op_small(
     pt: &Patch,
     par_base: i64,
     first: bool,
+    row0: i64,
 ) -> Result<(), IsaError> {
     let (pw, tp) = (pt.pw(), pt.tp());
     let mut f: Vec<(String, i64)> = Vec::new();
@@ -991,7 +1025,7 @@ fn copy_op_small(
         ("in_mode7", 3),
         ("in_tflags", 0xc1),
         ("in_twait", pt.lb() / 64),
-        ("out_base", pt.at(if first { 0 } else { 3 }, 0)),
+        ("out_base", pt.at(row0 + if first { 0 } else { 3 }, 0)),
         ("out_inc0", 1),
         ("out_inc1", 1),
         ("out_cnt1", 3),
@@ -1095,14 +1129,15 @@ fn halo(a: &mut Asm, pt: &Patch, zp: i32) -> Result<(), IsaError> {
     // pixel are the outermost loop
     let (beat, beats) = (cq.min(16), (cq / 16).max(1));
     let rows = |n: i64| vec![(beat, 1), (4, cq), (n, rs), (beats, 16)];
-    let cols = |n: i64| vec![(beat, 1), (n, cq), (pw, rs), (beats, 16)];
+    let ph = pt.ph();
+    let cols = |n: i64| vec![(beat, 1), (n, cq), (ph, rs), (beats, 16)];
     let (t, b, l, r) = (pt.top, pt.bottom, pt.left, pt.right);
     let moves = [
         // north: top interior rows -> the northern tile's bottom halo
         Move {
             op: OP_MESH_N,
             o_addr: pt.at(0, 0),
-            i_addr: pt.at(4, 0),
+            i_addr: pt.at(pt.rows, 0),
             dims: rows(b),
             groups: [0x000f, 0x0ff0, 0xf000],
             synced: false,
@@ -1110,7 +1145,7 @@ fn halo(a: &mut Asm, pt: &Patch, zp: i32) -> Result<(), IsaError> {
         // south: bottom interior rows -> the southern tile's top halo
         Move {
             op: OP_MESH_S,
-            o_addr: pt.at(4 - t, 0),
+            o_addr: pt.at(pt.rows - t, 0),
             i_addr: pt.at(-t, 0),
             dims: rows(t),
             groups: [0xf000, 0x0ff0, 0x000f],

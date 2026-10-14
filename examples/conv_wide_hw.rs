@@ -1,4 +1,4 @@
-//! Wider-than-16 convolutions (`Conv::width` 32 / 64) on the TPU against
+//! Convolutions larger than 16x16 (`Conv::width` / `height` 32, 64) on the TPU against
 //! the host reference; on a mismatch prints which output pixels are wrong.
 //!
 //!     cargo run --release --features usb --example conv_wide_hw
@@ -24,27 +24,27 @@ fn bytes(seed: &mut u64, n: usize) -> Vec<u8> {
 async fn main() {
     let mut dev = Some(Device::open().await.expect("open device"));
     let mut seed = 0x1357_9bdf_2468_ace0u64;
-    let cases: Vec<(usize, usize, usize, usize, usize)> = match std::env::var("CASES") {
-        // CASES=k,s,width,cin,cout;...  (built without Conv::check)
+    let cases: Vec<(usize, usize, usize, usize, usize, usize)> = match std::env::var("CASES") {
+        // CASES=k,s,height,width,cin,cout;...  (built without Conv::check)
         Ok(v) => v
             .split(';')
             .map(|c| {
                 let n: Vec<usize> = c.split(',').map(|x| x.parse().unwrap()).collect();
-                (n[0], n[1], n[2], n[3], n[4])
+                (n[0], n[1], n[2], n[3], n[4], n[5])
             })
             .collect(),
         Err(_) => vec![
-            (1, 1, 32, 16, 32),
-            (3, 1, 32, 16, 32),
-            (3, 1, 32, 32, 16),
-            (3, 1, 64, 16, 16),
-            (3, 2, 32, 16, 32),
-            (3, 2, 64, 32, 16),
-            (1, 2, 64, 16, 32),
+            (1, 1, 16, 32, 16, 32),
+            (3, 1, 16, 32, 16, 32),
+            (3, 1, 16, 32, 32, 16),
+            (3, 1, 16, 64, 16, 16),
+            (3, 2, 16, 32, 16, 32),
+            (3, 2, 16, 64, 32, 16),
+            (1, 2, 16, 64, 16, 32),
         ],
     };
-    for (k, stride, width, cin, cout) in cases {
-        let name = format!("k={k} s={stride} 16x{width} Cin={cin} Cout={cout}");
+    for (k, stride, height, width, cin, cout) in cases {
+        let name = format!("k={k} s={stride} {height}x{width} Cin={cin} Cout={cout}");
         let w = bytes(&mut seed, cout * k * k * cin);
         let conv = Conv {
             cin,
@@ -52,6 +52,7 @@ async fn main() {
             k,
             stride,
             width,
+            height,
             weights: w.iter().map(|&b| b as i8).collect(),
             w_scale: (0..cout)
                 .map(|i| (0.0007 + 0.0001 * i as f32) * 16.0 / cin as f32)
@@ -75,7 +76,7 @@ async fn main() {
             }
         };
         let d = dev.as_mut().unwrap();
-        let x = bytes(&mut seed, 16 * width * cin);
+        let x = bytes(&mut seed, height * width * cin);
         let r = match d.load_params(Arc::new(model)).await {
             Ok(l) => d.run_inference(&l, x.clone()).await,
             Err(e) => Err(e),
@@ -118,7 +119,7 @@ async fn main() {
             want.len()
         );
         // wrong pixels map ('#' = any channel wrong)
-        let (oh, ow) = (16 / stride, width / stride);
+        let (oh, ow) = (height / stride, width / stride);
         for y in 0..oh {
             let row: String = (0..ow)
                 .map(|x| {

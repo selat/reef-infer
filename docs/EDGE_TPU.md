@@ -357,8 +357,8 @@ perturbation on the device.
 | Generators in Rust (`src/codegen/`): element-wise requant (1x16x16x32), FC (K <= 64, N <= 64) | Done; byte-identical to 16.0 (FC parameters included), bit-exact on device |
 | On-chip loopback broadcast (`elementwise::build_broadcast`) | Done; bit-exact on device; landing layout is the compiler's depthwise one |
 | CONV_2D (`codegen::conv`): same padding, stride 1 or 2, 16x16; k 1 (Cin 16, Cout 32) and k 3 (Cin 1, 3, 4, 16-128; Cout 8 / 16 / 32) | Done; byte-identical to 16.0 on 16 corpus models (parameters included), bit-exact on device |
-| Conv width 32 / 64 (height 16), Cin >= 16: superpixel loading, derived without the compiler | Done; bit-exact on device (not compared with 16.0) |
-| Conv: other heights, Cout 64+ for k 3, Cin 8, other k, valid padding | Next |
+| Conv width and height 16 / 32 / 64, Cin >= 16: superpixel columns, 4-row bands, derived without the compiler | Done; bit-exact on device up to 64x64 (not compared with 16.0) |
+| Conv: Cout 64+ for k 3, Cin < 16 at larger sizes, Cin 8, other k, valid padding, sizes not a multiple of 16 | Next |
 | FC beyond one pass / one tile | Next |
 | Scheduler/allocator for multi-layer graphs | Weeks to months |
 | PyTorch front end (`torch.export`, int8) | After the above |
