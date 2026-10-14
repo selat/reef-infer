@@ -409,7 +409,8 @@ pub fn param_caching_tiles(a: &mut Asm, tiles: &[ParamTile], f438: i64) -> Resul
         ("k174", 1),
         ("par177", 1),
         ("k178", 1),
-        ("rows_neg", 0x8000 - units / 2),
+        // saturates at 1024 (FC K 2048 / 4096)
+        ("rows_neg", 0x8000 - (units / 2).min(1024)),
         ("k199", 1),
         ("k215", 1),
     ];

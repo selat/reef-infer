@@ -202,6 +202,24 @@ fn fc_matches_compiler() {
             10,
             false,
         ),
+        (
+            "K2048_N64_actnone_biasTrue_in_range4p0_ioint8",
+            2048,
+            64,
+            false,
+        ),
+        (
+            "K3136_N10_actnone_biasTrue_in_range4p0_ioint8",
+            3136,
+            10,
+            false,
+        ),
+        (
+            "K4096_N64_actnone_biasTrue_in_range4p0_ioint8",
+            4096,
+            64,
+            false,
+        ),
     ] {
         let Some(path) = corpus(&format!("fc/fc_{name}")) else {
             eprintln!("ISA corpus model fc_{name} not found; skipping");
@@ -266,6 +284,14 @@ fn conv_matches_compiler() {
             "actnone_in_range4p0",
             3,
             false,
+        ),
+        // the MNIST CNN's second conv: 1 KiB of output per tile
+        (
+            "k3_padsame_stride1",
+            "Cin32_Cout64",
+            "actrelu_in_range4p0",
+            3,
+            true,
         ),
         (
             "k3_padsame_stride1",

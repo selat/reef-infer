@@ -49,8 +49,11 @@ pub struct Fc {
 
 impl Fc {
     pub fn check(&self) -> Result<(), String> {
-        if !(self.k % 8 == 0 && (8..=1024).contains(&self.k)) {
-            return Err(format!("K={} must be a multiple of 8 in 8..=1024", self.k));
+        if !(self.k % 8 == 0 && (8..=4096).contains(&self.k) && !(2049..=3072).contains(&self.k)) {
+            return Err(format!(
+                "K={} must be a multiple of 8 in 8..=2048 or 3073..=4096",
+                self.k
+            ));
         }
         if !((4..=64).contains(&self.n) || (self.n % 64 == 0 && self.n <= 1024)) {
             return Err(format!(
@@ -251,19 +254,20 @@ impl Fc {
         let nq = self.tile_n().div_ceil(4) as i64;
         let ctiles = self.out_tiles() as i64;
         let cmask = (1i64 << ctiles) - 1; // compute tiles
-        let itiles = self.k.div_ceil(64) as i64; // input tiles, 64 B each
-        let in_bytes = |t: i64| (k - 64 * t).min(64);
+        // Input tiles take `ch` bytes each: 64 up to K = 1024, then 128 / 256
+        // so that 16 tiles hold up to 4096 (K 2049..=3072 not derived).
+        let ch = 64 * self.k.div_ceil(1024).next_power_of_two() as i64;
+        let itiles = (k + ch - 1) / ch;
+        let in_bytes = |t: i64| (k - ch * t).min(ch);
         // narrow memory placement (bytes); the compiler moves the input up
         // when it does not fill the first 64 B
         let (in_base, out_base) = if k < 64 { (64, 0) } else { (0, k) };
-        // Staging: one 4-row slot of wide memory per row of 4 input tiles
-        // above 256 B, landing at narrow 0x180 words (above the input).
+        // Staging: `slots` wide words (256 B) hold the whole input, below
+        // 0x2080; it lands in narrow memory above the input and output.
         let rows = (itiles + 3) / 4;
-        let (stage_w, stage_n, slots) = if rows > 1 {
-            (0x2060, 0x180, 4)
-        } else {
-            (0x2078, 0xc0, 1)
-        };
+        let slots = (k + 255) / 256;
+        let stage_w = 0x2080 - 8 * slots;
+        let stage_n = ((k + 255) / 256 * 256 + 512) / 4;
         let mut a = Asm::new();
         prologue(&mut a)?;
         a.emit(OP_SYNC, &[("tiles", ALL_TILES), ("units", 0x20)])?;
@@ -303,14 +307,15 @@ impl Fc {
         a.emit(OP_POP, &pop)?;
         descriptor_addr(&mut a)?;
         descriptor_send(&mut a, k, TAG_INPUT)?;
-        // Each tile of a row receives the row's bytes and keeps its own 64 B:
-        // column c skips the first 16c words. Full tiles go by column, a
-        // partial last tile on its own.
-        let full = if k % 64 == 0 { itiles } else { itiles - 1 };
+        // Each tile of a row receives the row's bytes and keeps its own `ch`:
+        // column c reads wide word `c ch / 256` of the row, skipping the
+        // words before its bytes. Full tiles go by column, a partial last
+        // tile on its own.
+        let full = if k % ch == 0 { itiles } else { itiles - 1 };
         let mut classes: Vec<(i64, i64, i64)> = (0..4.min(itiles))
             .map(|c| {
                 let mask = (c..full).step_by(4).fold(0, |m, t| m | 1 << t);
-                (mask, c, 64)
+                (mask, c, ch)
             })
             .filter(|&(m, _, _)| m != 0)
             .collect();
@@ -318,9 +323,10 @@ impl Fc {
             classes.push((1 << full, full % 4, in_bytes(full)));
         }
         for (mask, c, bytes) in classes {
+            let skip = (c * ch % 256) / 4;
             let mut f = vec![
                 ("tile_mask", mask),
-                ("wide_addr", stage_w),
+                ("wide_addr", stage_w + 4 * (c * ch / 256)),
                 ("w_inc0", 1),
                 ("narrow_addr", stage_n),
                 ("mode", 1),
@@ -335,12 +341,12 @@ impl Fc {
                 ("sync_dec", -1),
                 ("sync_dec_mode", 3),
             ];
-            if c > 0 {
+            if skip > 0 {
                 f.extend([
                     ("skip_en0", 1),
                     ("skip_base", stage_n),
-                    ("skip_m1", 16 * c - 1),
-                    ("skip_end", stage_n + 16 * c - 1),
+                    ("skip_m1", skip - 1),
+                    ("skip_end", stage_n + skip - 1),
                     ("tail_en870", 0),
                     ("tail_f871", 1),
                     ("rsv543", 1),
@@ -367,18 +373,30 @@ impl Fc {
             if slots > 1 {
                 f.push(("sdims", 1));
             }
+            // above 1024 B a full row of 4 tiles walks all slots, in groups
+            // (`grp` = words per tile - 1; `gstride` fits K 2048 / 3136 / 4096)
+            if ch > 64 && in_bytes(4 * r + 3) == ch {
+                f.extend([
+                    ("cnt0", slots - 1),
+                    ("inc1", -(slots - 1)),
+                    ("inc2", -(slots - 1)),
+                    ("inc3", -(slots - 1)),
+                    ("grp", ch / 64 - 1),
+                    ("gstride", 3 * (k / 256) + 1),
+                ]);
+            }
             a.emit(OP_RING_CONSUMER, &f)?;
-            let units8 = (k - 256 * r).min(256) / 8;
+            let units8 = (k - 4 * ch * r).min(4 * ch) / 8;
             let infeed: Vec<(&str, i64)> = [
                 ("stream", 1),
-                ("buf_off", 0x20 * r),
+                ("buf_off", ch / 2 * r),
                 ("d0_stride", 1),
                 ("k157", 1),
                 ("k160", 1),
                 ("av176", 1),
                 ("count_m1", units8 - 1),
                 ("k311", 1),
-                ("pop_wait", 0x20 * r + 1),
+                ("pop_wait", ch / 2 * r + 1),
                 ("k336", 1),
                 ("k352", 1),
                 ("k392", 1),
@@ -415,7 +433,7 @@ impl Fc {
                 ("w_inc0", 1),
                 ("wide_circ", 1),
                 ("wide_rows", 1),
-                ("narrow_addr", (in_base + 64 * t) / 4),
+                ("narrow_addr", (in_base + ch * t) / 4),
                 ("sync_en0", 1),
                 ("sync_id", 0xe),
                 ("sync_wait_lvl", 1),
@@ -425,7 +443,7 @@ impl Fc {
             ];
             f.extend(walk(in_bytes(t) / 4 - 1));
             a.emit(OP_WIDE_TO_NARROW, &f)?;
-            ring_consumer(&mut a, cmask, -64 + 16 * t)?;
+            ring_consumer(&mut a, cmask, -64 + ch / 4 * t)?;
             ring_producer(&mut a, 1 << t, 0x2068, t, cmask)?;
             let mut f = vec![("tile_mask", 1 << t), ("narrow_addr", stage_n)];
             f.extend(walk(in_bytes(t) / 4 - 1));

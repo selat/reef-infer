@@ -80,6 +80,10 @@ async fn generated_programs_on_tpu() {
         (256, 256, true),
         (64, 1024, false),
         (64, 4, false),
+        // 128 / 256 B per input tile (the MNIST CNN's dense layer: 3136 x 10)
+        (2048, 64, false),
+        (3136, 10, false),
+        (4096, 64, true),
     ] {
         let w = bytes(&mut seed, n * k);
         let fc = Fc {
@@ -159,6 +163,10 @@ async fn generated_programs_on_tpu() {
         (3, 2, 16, 16, 16, 32, false, 128, 130),
         (3, 2, 16, 16, 3, 16, true, 10, 0),
         (3, 2, 16, 16, 64, 8, false, 128, 60),
+        // Cout 64 (1 KiB of output per tile): the MNIST CNN's second conv
+        (3, 1, 16, 16, 32, 64, true, 0, 0),
+        (3, 1, 16, 16, 64, 64, false, 128, 128),
+        (3, 1, 16, 16, 128, 64, false, 128, 100),
         // wider images: superpixels of width / 16 pixels
         (1, 1, 16, 32, 16, 32, false, 127, 128),
         (3, 1, 16, 32, 16, 32, false, 120, 128),
@@ -168,6 +176,8 @@ async fn generated_programs_on_tpu() {
         (3, 1, 32, 16, 16, 32, false, 128, 128),
         (3, 2, 64, 32, 16, 32, false, 120, 130),
         (3, 1, 64, 64, 16, 8, true, 128, 0),
+        // the MNIST CNN's first conv (28x28 padded to 32, Cin 1 as 16)
+        (3, 1, 32, 32, 16, 32, true, 0, 0),
     ] {
         let w = bytes(&mut seed, cout * k * k * cin);
         let conv = Conv {

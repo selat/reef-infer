@@ -109,13 +109,16 @@ impl Conv {
                 1 => (self.cin, self.cout) == (16, 32),
                 3 => {
                     [1, 3, 4, 16, 32, 64, 128].contains(&self.cin)
-                        && [8, 16, 32].contains(&self.cout)
+                        && ([8, 16, 32].contains(&self.cout)
+                            // 1 KiB of output per tile; Cin 16 moves the
+                            // compiler's narrow buffers (not derived)
+                            || (self.cout == 64 && self.cin >= 32 && self.width == 16))
                 }
                 _ => false,
             };
         if !ok {
             return Err(format!(
-                "Cin={} Cout={} k={} width={}: supported are k 1 (Cin 16, Cout 32) and k 3 (Cin 1, 3, 4, 16, 32, 64, 128; Cout 8, 16 or 32), width 16, or 32 / 64 with Cin x width / 16 in 32..=128 and at most 2 KiB of output per tile",
+                "Cin={} Cout={} k={} width={}: supported are k 1 (Cin 16, Cout 32) and k 3 (Cin 1, 3, 4, 16, 32, 64, 128; Cout 8, 16 or 32, or 64 for Cin >= 32 at width 16), width 16, or 32 / 64 with Cin x width / 16 in 32..=128 and at most 2 KiB of output per tile",
                 self.cin, self.cout, self.k, self.width
             ));
         }

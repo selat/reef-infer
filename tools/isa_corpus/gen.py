@@ -54,6 +54,7 @@ def configs():
         (784, 16, "none"),
     ]:
         c.append(("fc", {**fc, "K": K, "N": N, "act": act}))
+    c.append(("fc", {**fc, "K": 3136, "N": 10}))
     conv = dict(
         H=16, W=16, Cin=16, Cout=32, k=3, stride=1, pad="same", act="none", in_range=4.0
     )
@@ -70,6 +71,10 @@ def configs():
         in_range=[0.5, 16.0],
     ):
         c.append(("conv", p))
+    for H, Cin, Cout in [(32, 16, 32), (16, 32, 64)]:
+        c.append(
+            ("conv", {**conv, "H": H, "W": H, "Cin": Cin, "Cout": Cout, "act": "relu"})
+        )
     for k in (1, 3, 5):
         for s in (1, 2):
             for pad in ("same", "valid"):
