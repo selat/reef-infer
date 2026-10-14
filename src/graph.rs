@@ -1,12 +1,16 @@
 //! Whole models without `edgetpu_compiler`: reads a CPU int8 `.tflite`,
-//! maps its ops to `codegen` generators, and runs the layer programs one
-//! after another, through the host.
+//! maps its ops to `codegen` generators, and runs the layer programs in
+//! graph order through the host, keeping every activation by tensor id (so
+//! a residual ADD can read a tensor produced several steps earlier).
 //!
 //! Supported ops:
 //! - FULLY_CONNECTED (fused NONE / RELU);
 //! - CONV_2D with same padding (fused NONE / RELU; dilation is not in the
 //!   bundled schema and assumed 1);
 //! - MAX_POOL_2D 2x2, stride 2;
+//! - ADD of two equal-shape tensors (fused NONE / RELU);
+//! - AVERAGE_POOL_2D over the whole image (global), lowered to an FC that
+//!   sums each channel's pixels and rounds exactly as TFLite does;
 //! - RESHAPE (free in NHWC). Ops computing a reshape's int32 shape (SHAPE,
 //!   STRIDED_SLICE, PACK, ...) are skipped.
 //!
@@ -23,7 +27,10 @@
 
 use std::sync::Arc;
 
+use std::collections::HashMap;
+
 use crate::codegen::Quant;
+use crate::codegen::add::Add;
 use crate::codegen::conv::Conv;
 use crate::codegen::fc::Fc;
 use crate::codegen::pool::MaxPool;
@@ -49,6 +56,7 @@ pub enum Layer {
     Fc(Fc),
     Conv(Conv),
     MaxPool(MaxPool),
+    Add(Add),
 }
 
 impl Layer {
@@ -57,69 +65,96 @@ impl Layer {
             Layer::Fc(f) => f.build(),
             Layer::Conv(c) => c.build(),
             Layer::MaxPool(p) => Ok(p.build()?.into_model()),
+            Layer::Add(a) => Ok(a.build()?.into_model()),
         }
     }
 
     /// Host reference (bit-exact with the TPU), uint8 in and out, at the
     /// program's shapes.
-    pub fn reference(&self, x: &[u8]) -> Vec<u8> {
+    pub fn reference(&self, x: &[Vec<u8>]) -> Vec<u8> {
         match self {
-            Layer::Fc(f) => f.reference(x),
-            Layer::Conv(c) => c.reference(x),
-            Layer::MaxPool(p) => p.reference(x),
+            Layer::Fc(f) => f.reference(&x[0]),
+            Layer::Conv(c) => c.reference(&x[0]),
+            Layer::MaxPool(p) => p.reference(&x[0]),
+            Layer::Add(a) => a.reference(&x[0], &x[1]),
         }
     }
 
-    /// The program's input and output shapes.
-    pub fn shapes(&self) -> (Shape, Shape) {
+    /// The program's input shapes and output shape.
+    pub fn shapes(&self) -> (Vec<Shape>, Shape) {
         match self {
-            Layer::Fc(f) => ((1, 1, f.k), (1, 1, f.n)),
+            Layer::Fc(f) => (vec![(1, 1, f.k)], (1, 1, f.n)),
             Layer::Conv(c) => {
                 let s = c.stride;
                 (
-                    (c.height, c.width, c.cin),
+                    vec![(c.height, c.width, c.cin)],
                     (c.height.div_ceil(s), c.width.div_ceil(s), c.cout),
                 )
             }
-            Layer::MaxPool(p) => ((p.height, p.width, p.c), p.out_shape()),
+            Layer::MaxPool(p) => (vec![(p.height, p.width, p.c)], p.out_shape()),
+            Layer::Add(a) => {
+                let sh = (a.height, a.width, a.c);
+                (vec![sh, sh], sh)
+            }
         }
     }
 }
 
-/// A layer program with the TFLite shapes around it.
+/// An activation a step reads: TFLite tensor id, its shape, and its zero
+/// point (the padding value).
 #[derive(Debug, Clone)]
-pub struct Step {
-    pub layer: Layer,
-    /// The TFLite input / output shapes (the program's may be larger).
-    pub input: Shape,
-    pub output: Shape,
-    /// Zero point of the input (the padding value).
+pub struct Input {
+    pub tensor: i32,
+    pub shape: Shape,
     pub pad: u8,
 }
 
+/// A layer program with the TFLite tensors around it.
+#[derive(Debug, Clone)]
+pub struct Step {
+    pub layer: Layer,
+    pub inputs: Vec<Input>,
+    /// The output tensor id and its TFLite shape (the program's may be
+    /// larger).
+    pub output: i32,
+    pub output_shape: Shape,
+}
+
+/// The TFLite tensor `x` (shape `from`) -> a program input of shape `to`:
+/// zero-point padding at the bottom, right and in the extra channels
+/// (unchanged when only the shape's split differs, as a flatten).
+fn fit(x: &[u8], from: Shape, to: Shape, pad: u8) -> Vec<u8> {
+    let ((py, px, pz), (y, xx, z)) = (to, from);
+    if len(to) == len(from) && (to.0 == 1 && to.1 == 1 || to == from) {
+        return x.to_vec();
+    }
+    let mut out = vec![pad; py * px * pz];
+    for r in 0..y {
+        for c in 0..xx {
+            let (src, dst) = ((r * xx + c) * z, (r * px + c) * pz);
+            out[dst..dst + z].copy_from_slice(&x[src..src + z]);
+        }
+    }
+    out
+}
+
 impl Step {
-    /// The TFLite input -> the program's input: zero-point padding at the
-    /// bottom, right and in the extra channels.
-    pub fn fit(&self, x: &[u8]) -> Vec<u8> {
-        let ((py, px, pz), (y, xx, z)) = (self.layer.shapes().0, self.input);
-        if (py, px, pz) == (y, xx, z) {
-            return x.to_vec();
-        }
-        let mut out = vec![self.pad; py * px * pz];
-        for r in 0..y {
-            for c in 0..xx {
-                let (src, dst) = ((r * xx + c) * z, (r * px + c) * pz);
-                out[dst..dst + z].copy_from_slice(&x[src..src + z]);
-            }
-        }
-        out
+    /// The step's TFLite inputs -> the program's inputs.
+    pub fn fit(&self, x: &[&[u8]]) -> Vec<Vec<u8>> {
+        let (shapes, _) = self.layer.shapes();
+        self.inputs
+            .iter()
+            .zip(x)
+            .zip(shapes)
+            .map(|((i, x), to)| fit(x, i.shape, to, i.pad))
+            .collect()
     }
 
     /// The program's output -> the TFLite output (crop).
     pub fn crop(&self, y: &[u8]) -> Vec<u8> {
-        let ((_, px, pz), (oy, ox, oz)) = (self.layer.shapes().1, self.output);
-        if len(self.layer.shapes().1) == len(self.output) {
-            return y[..len(self.output)].to_vec();
+        let ((_, px, pz), (oy, ox, oz)) = (self.layer.shapes().1, self.output_shape);
+        if len(self.layer.shapes().1) == len(self.output_shape) {
+            return y[..len(self.output_shape)].to_vec();
         }
         let mut out = Vec::with_capacity(oy * ox * oz);
         for r in 0..oy {
@@ -131,12 +166,12 @@ impl Step {
         out
     }
 
-    pub fn reference(&self, x: &[u8]) -> Vec<u8> {
+    pub fn reference(&self, x: &[&[u8]]) -> Vec<u8> {
         self.crop(&self.layer.reference(&self.fit(x)))
     }
 }
 
-/// A model as a chain of layer programs.
+/// A model as layer programs in graph order.
 #[derive(Debug, Clone)]
 pub struct Graph {
     pub steps: Vec<Step>,
@@ -145,6 +180,9 @@ pub struct Graph {
     pub output: Quant,
     /// The TFLite input shape.
     pub input_shape: Shape,
+    /// Graph input / output tensor ids.
+    pub input_tensor: i32,
+    pub output_tensor: i32,
     /// Whether the `.tflite` input / output tensors are int8 (else uint8).
     pub int8_io: bool,
 }
@@ -188,8 +226,11 @@ impl Graph {
         let shape = |i: i32| tensor_shape(&model, i);
         let int8_io = tensors.get(graph_in as usize).type_() == INT8;
 
-        // Follow the activation from the graph input through the ops.
-        let mut act = graph_in;
+        // Activations available so far (graph input, then op outputs);
+        // RESHAPE aliases its output to its input.
+        let mut alias: HashMap<i32, i32> = HashMap::new();
+        let mut have = vec![graph_in];
+        let resolve = |alias: &HashMap<i32, i32>, t: i32| *alias.get(&t).unwrap_or(&t);
         let mut steps = Vec::new();
         for op in sg.operators().ok_or("no operators")? {
             let ins: Vec<i32> = op.inputs().map(|v| v.iter().collect()).unwrap_or_default();
@@ -197,32 +238,44 @@ impl Graph {
             let shape_math = outs
                 .iter()
                 .all(|&o| tensors.get(o as usize).type_() == TensorType::INT32);
-            if !ins.contains(&act) || shape_math {
+            let data: Vec<i32> = ins
+                .iter()
+                .copied()
+                .filter(|&i| i >= 0 && have.contains(&resolve(&alias, i)))
+                .collect();
+            if data.is_empty() || shape_math {
                 continue; // a reshape's shape (SHAPE of the activation, ...)
             }
-            let (input, output) = (shape(ins[0])?, shape(outs[0])?);
-            let pad = tq(ins[0])?.zero_point as u8;
+            let input = |i: i32| -> Result<Input, Error> {
+                Ok(Input {
+                    tensor: resolve(&alias, i),
+                    shape: shape(i)?,
+                    pad: tq(i)?.zero_point as u8,
+                })
+            };
+            let (in0, output) = (shape(ins[0])?, shape(outs[0])?);
             let code = codes.get(op.opcode_index() as usize).builtin_code();
             let layer = match code {
                 BuiltinOperator::RESHAPE => {
                     if tq(ins[0])? != tq(outs[0])? {
                         return Err("RESHAPE changes quantization".into());
                     }
-                    None
+                    alias.insert(outs[0], resolve(&alias, ins[0]));
+                    continue;
                 }
                 BuiltinOperator::FULLY_CONNECTED => {
                     let opts = op
                         .builtin_options_as_fully_connected_options()
                         .ok_or("FULLY_CONNECTED without options")?;
                     let relu = relu(opts.fused_activation_function())?;
-                    Some(Layer::Fc(fc_layer(&model, &ins, outs[0], relu)?))
+                    Layer::Fc(fc_layer(&model, &ins, outs[0], relu)?)
                 }
-                BuiltinOperator::CONV_2D => Some(Layer::Conv(conv_layer(&model, &op, input)?)),
+                BuiltinOperator::CONV_2D => Layer::Conv(conv_layer(&model, &op, in0)?),
                 BuiltinOperator::MAX_POOL_2D => {
                     let o = op
                         .builtin_options_as_pool_2_doptions()
                         .ok_or("MAX_POOL_2D without options")?;
-                    let (y, x, c) = input;
+                    let (y, x, c) = in0;
                     let even = y % 2 == 0 && x % 2 == 0;
                     if (
                         o.filter_width(),
@@ -245,25 +298,62 @@ impl Graph {
                         quant: tq(ins[0])?,
                     };
                     p.check()?;
-                    Some(Layer::MaxPool(p))
+                    Layer::MaxPool(p)
+                }
+                BuiltinOperator::AVERAGE_POOL_2D => {
+                    let o = op
+                        .builtin_options_as_pool_2_doptions()
+                        .ok_or("AVERAGE_POOL_2D without options")?;
+                    let (y, x, c) = in0;
+                    if (o.filter_height() as usize, o.filter_width() as usize) != (y, x)
+                        || relu(o.fused_activation_function())?
+                        || tq(ins[0])? != tq(outs[0])?
+                    {
+                        return Err("AVERAGE_POOL_2D: only global pools, same quantization".into());
+                    }
+                    Layer::Fc(average_fc(y * x, c)?)
+                }
+                BuiltinOperator::ADD => {
+                    let o = op
+                        .builtin_options_as_add_options()
+                        .ok_or("ADD without options")?;
+                    let (y, x, c) = in0;
+                    if shape(ins[1])? != in0 {
+                        return Err("ADD: broadcasting not supported".into());
+                    }
+                    let a = Add {
+                        height: fit_size(y, &[16, 32]).ok_or("add input too tall")?,
+                        width: fit_size(x, &[16, 32]).ok_or("add input too wide")?,
+                        c,
+                        a: tq(ins[0])?,
+                        b: tq(ins[1])?,
+                        output: tq(outs[0])?,
+                        relu: relu(o.fused_activation_function())?,
+                    };
+                    a.check()?;
+                    Layer::Add(a)
                 }
                 c => return Err(format!("op {c:?} not supported").into()),
             };
-            if let Some(layer) = layer {
-                let (pin, _) = layer.shapes();
-                if len(pin) < len(input) {
-                    return Err(format!("{layer:?}: input {input:?} does not fit").into());
+            let inputs: Vec<Input> = match &layer {
+                Layer::Add(_) => vec![input(ins[0])?, input(ins[1])?],
+                _ => vec![input(ins[0])?],
+            };
+            for (i, s) in inputs.iter().zip(layer.shapes().0) {
+                if len(s) < len(i.shape) {
+                    return Err(format!("{layer:?}: input {:?} does not fit", i.shape).into());
                 }
-                steps.push(Step {
-                    layer,
-                    input,
-                    output,
-                    pad,
-                });
             }
-            act = outs[0];
+            steps.push(Step {
+                layer,
+                inputs,
+                output: outs[0],
+                output_shape: output,
+            });
+            have.push(outs[0]);
         }
-        if act != graph_out {
+        let output_tensor = resolve(&alias, graph_out);
+        if !have.contains(&output_tensor) {
             return Err("the data path does not reach the graph output".into());
         }
         if steps.is_empty() {
@@ -274,6 +364,8 @@ impl Graph {
             input: tq(graph_in)?,
             output: tq(graph_out)?,
             input_shape: shape(graph_in)?,
+            input_tensor: graph_in,
+            output_tensor,
             int8_io,
         })
     }
@@ -285,7 +377,13 @@ impl Graph {
 
     /// Host reference over the whole graph, uint8 in and out.
     pub fn reference(&self, x: &[u8]) -> Vec<u8> {
-        self.steps.iter().fold(x.to_vec(), |x, s| s.reference(&x))
+        let mut acts: HashMap<i32, Vec<u8>> = HashMap::from([(self.input_tensor, x.to_vec())]);
+        for s in &self.steps {
+            let ins: Vec<&[u8]> = s.inputs.iter().map(|i| &acts[&i.tensor][..]).collect();
+            let y = s.reference(&ins);
+            acts.insert(s.output, y);
+        }
+        acts.remove(&self.output_tensor).unwrap()
     }
 
     /// Builds every layer's program.
@@ -305,13 +403,68 @@ impl Graph {
         programs: &[Arc<TfliteModel>],
         x: &[u8],
     ) -> Result<Vec<u8>, DeviceError> {
-        let mut x = x.to_vec();
+        let mut acts: HashMap<i32, Vec<u8>> = HashMap::from([(self.input_tensor, x.to_vec())]);
         for (s, p) in self.steps.iter().zip(programs) {
-            let y = dev.run_model(Arc::clone(p), s.fit(&x)).await?;
-            x = s.crop(&y);
+            let ins: Vec<&[u8]> = s.inputs.iter().map(|i| &acts[&i.tensor][..]).collect();
+            let y = dev.run_model(Arc::clone(p), s.fit(&ins).concat()).await?;
+            acts.insert(s.output, s.crop(&y));
         }
-        Ok(x)
+        Ok(acts.remove(&self.output_tensor).unwrap())
     }
+}
+
+/// A global average pool over `n` pixels of `c` channels as an FC on the
+/// flattened input (K = n c, weight 127 from each pixel to its channel),
+/// rounding exactly as TFLite's int8 AVERAGE_POOL_2D: the raw int8 sum /
+/// n, half away from zero. The FC subtracts zero point 128 (summing the
+/// raw int8 values), adds it back, and multiplies by the smallest f32 at
+/// or above 1 / (127 n) for which the TPU's round-half-even of every
+/// possible sum matches (ties sit just past .5 in magnitude).
+fn average_fc(n: usize, c: usize) -> Result<Fc, Error> {
+    let q = Quant {
+        scale: 1.0,
+        zero_point: 128,
+    };
+    let tflite = |sum: i64| {
+        let n = n as i64;
+        if sum > 0 {
+            (sum + n / 2) / n
+        } else {
+            (sum - n / 2) / n
+        }
+    };
+    let mut m = (1.0 / (127.0 * n as f64)) as f32;
+    let fits = |m: f32| {
+        (-128 * n as i64..=127 * n as i64).all(|sum| {
+            let v = ((127 * sum) as f32 * m)
+                .clamp(-128.0, 127.0)
+                .round_ties_even();
+            v as i64 == tflite(sum)
+        })
+    };
+    let mut tries = 0;
+    while !fits(m) {
+        m = f32::from_bits(m.to_bits() + 1);
+        tries += 1;
+        if tries > 1000 {
+            return Err(format!("average pool over {n} pixels: no exact multiplier").into());
+        }
+    }
+    let k = n * c;
+    let fc = Fc {
+        k,
+        n: c,
+        weights: (0..c * k)
+            .map(|i| if (i % k) % c == i / k { 127 } else { 0 })
+            .collect(),
+        w_scale: vec![m; c],
+        bias: vec![0; c],
+        input: q,
+        output: q,
+        relu: false,
+    };
+    fc.check()?;
+    Ok(fc)
 }
 
 fn relu(a: ActivationFunctionType) -> Result<bool, Error> {

@@ -1,5 +1,5 @@
 """Train and int8-quantize an MNIST model, and export the test set with
-TFLite CPU outputs as the reference for `examples/mnist.rs`.
+TFLite CPU outputs as the reference for `examples/eval.rs`.
 
 - `mlp`: Flatten -> Dense 128 ReLU -> Dense 10.
 - `cnn`: Conv 3x3 32 ReLU -> MaxPool 2 -> Conv 3x3 64 ReLU -> MaxPool 2 ->

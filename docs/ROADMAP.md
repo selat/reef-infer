@@ -13,7 +13,8 @@ the findings.
 | Element-wise requant (`elementwise`) | 1x16x16x32 | byte-identical, on device |
 | FC (`fc`) | K <= 2048 or 3073-4096 (multiple of 8, input spread over tiles and gathered), N 4-64 or 64 per tile up to 1024 | byte-identical (31 corpus models), on device |
 | MAX_POOL_2D (`pool`) | 2x2 stride 2 valid; H, W 16 / 32; C 32 / 64 / 128 | byte-identical (5 corpus models), on device |
-| Front end (`graph`) | CPU int8 `.tflite`: CONV_2D, MAX_POOL_2D, FC, RESHAPE; host pads / crops between layers | MNIST MLP (97.35%) and CNN (98.66%) on device, bit-exact with the host reference |
+| ADD (`add`) | two equal-shape inputs, requantized, fused RELU; H, W 16 / 32; image row 512 / 1024 / 2048 B | byte-identical (8 corpus models), on device |
+| Front end (`graph`) | CPU int8 `.tflite` as a DAG: CONV_2D, MAX_POOL_2D, ADD, global AVERAGE_POOL_2D (as an FC), FC, RESHAPE; host pads / crops between layers | MNIST MLP (97.35%), CNN (98.66%) and CIFAR-10 ResNet-8 (75.22%) on device, bit-exact with the host reference |
 | CONV_2D (`conv`) | same padding; k 1 / 3; stride 1 / 2; 16x16 with Cin 1-128 (k 3), up to 64x64 with Cin >= 16; Cout 8-32 | byte-identical at 16x16, on device up to 64x64 |
 | Loopback broadcast | tile -> scalar memory -> all tiles | on device |
 
@@ -71,13 +72,17 @@ bit-exact with the host reference, same top-1 as TFLite CPU.
 
 ## Milestone 3: small CNNs (CIFAR-10 style, ResNet-8 / -20)
 
+**ResNet-8 done (2026-10-14):** the MLPerf Tiny CIFAR-10 model, all 10000
+test images on the TPU, 75.22%, bit-exact with the host reference, same
+top-1 as TFLite CPU. The items it did not need stay open.
+
 | Item | Need | Known / unknown | Size |
 |---|---|---|---|
-| **Element-wise add (two inputs)** | residual connections | second input stream; corpus has add / sub / mul / min / max | M |
-| Conv Cout 64-256 | wider layers | compiler uses `loop3` 64-channel blocks above 64 | M |
-| Conv Cin 8 | odd widths in small nets | the 18-weight-row scheme seen in the corpus | S-M |
-| Valid padding | many Keras models | corpus models use 12-38 TensorOps (edge tiles special-cased); our own: no halo fill, smaller output | M |
-| Global average pool / MEAN | classifier heads | corpus `misc_opmean`, `pool_..._opavg` | M |
+| **Element-wise add (two inputs)** | residual connections | **done** (`codegen::add`): byte-identical on 8 corpus models; the runner serves several input layers; the front end runs a DAG | M |
+| Conv Cout 64-256 | wider layers | Cout 64 done (Cin >= 32, 16x16; 1x1 Cin 32 in two passes); 128-256: compiler uses `loop3` 64-channel blocks | M |
+| Conv Cin 8 | odd widths in small nets | the 18-weight-row scheme seen in the corpus; open | S-M |
+| Valid padding | many Keras models | corpus models use 12-38 TensorOps (edge tiles special-cased); our own: no halo fill, smaller output; open | M |
+| Global average pool / MEAN | classifier heads | **done as an FC lowering** (sum per channel, TFLite's rounding, bit-exact); the compiler's own program (a mesh reduction across tiles, 127 instructions) is not decoded | M |
 | Output > 2 KiB per tile | larger feature maps | wide staging above 0x207f untested; or produce in chunks | S-M |
 | Images > 64x64 (32x32 done) | 96-128 px inputs | patch memory per tile grows; needs a capacity model (experiment: largest patch that runs) | M |
 

@@ -358,7 +358,9 @@ The model-by-model plan (which ops in which order) is in `ROADMAP.md`.
 | Corpus tooling (`tools/isa_corpus/`, `examples/isa_check.rs`) | Done |
 | Generators in Rust (`src/codegen/`): element-wise requant (1x16x16x32), FC (K <= 64, N <= 64) | Done; byte-identical to 16.0 (FC parameters included), bit-exact on device |
 | FC K up to 1024 (input over 16 tiles, gathered over the ring), N 4-64 or 64 per tile up to 1024 | Done; byte-identical to 16.0 on 28 corpus models (parameters included), bit-exact on device |
-| TFLite front end (`graph::Graph`): CONV_2D, MAX_POOL_2D, FC, RESHAPE, int8 I/O; layers run through the host, which pads to the generators' sizes and crops | Done: MNIST MLP (97.35%) and CNN (98.66%) on the TPU over 10000 images, bit-exact with the host reference, same top-1 as TFLite CPU |
+| TFLite front end (`graph::Graph`): a DAG of CONV_2D, MAX_POOL_2D, ADD, global AVERAGE_POOL_2D (lowered to an FC), FC, RESHAPE, int8 I/O; layers run through the host, which pads to the generators' sizes and crops | Done: MNIST MLP (97.35%), CNN (98.66%) and CIFAR-10 ResNet-8 (75.22%) on the TPU over 10000 images each, bit-exact with the host reference, same top-1 as TFLite CPU |
+| Element-wise ADD (`codegen::add`): two input layers, requantized (integer weights from the scale ratio), fused RELU | Done; byte-identical to 16.0 on 8 corpus models, bit-exact on device (arbitrary scale ratios too) |
+| Conv 1x1 Cin 32 -> Cout 64 (two passes of 16 channels), stride-2 Cout 64 | Done; byte-identical to 16.0 (parameters included), bit-exact on device |
 | MAX_POOL_2D 2x2 stride 2 (`codegen::pool`): H, W 16 / 32, C 32 / 64 / 128 | Done; byte-identical to 16.0 on 5 corpus models, bit-exact on device |
 | FC K 2048 / 3073-4096 (128 / 256 B per input tile); conv Cout 64 (Cin >= 32, 16x16) | Done; byte-identical to 16.0 (parameters included), bit-exact on device |
 | On-chip loopback broadcast (`elementwise::build_broadcast`) | Done; bit-exact on device; landing layout is the compiler's depthwise one |
@@ -421,12 +423,19 @@ cargo run --example conv_check -- [filter]
 .venv/bin/python tools/isa_corpus/fc_ref.py   # weights for the parameter comparison
 cargo run --example fc_check -- [filter]
 
+# Generated element-wise add vs every supported corpus model, field by field
+cargo run --example add_check -- [filter]
+
+# CIFAR-10 ResNet-8 end to end (train + export, then host reference / TPU)
+.venv/bin/python tools/cifar10/train.py
+cargo run --release --example eval -- --dir target/cifar10 --model resnet8 [--limit N] [--device]
+
 # Generated max pool vs every supported corpus model, field by field
 cargo run --example pool_check -- [filter]
 
 # MNIST end to end (train + export, then host reference / TPU)
 .venv/bin/python tools/mnist/train.py [--model mlp|cnn]
-cargo run --release --example mnist -- [--model mlp|cnn] [--limit N] [--device]
+cargo run --release --example eval -- [--dir target/mnist] [--model mlp|cnn] [--limit N] [--device]
 cargo run --example param_cache_hw   # do two layers' cached parameters coexist?
 
 # Field diff of two compiled models

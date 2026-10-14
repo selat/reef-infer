@@ -774,3 +774,66 @@ every image**, the same top-1 as TFLite CPU (4 of 100000 logits differ by
 1); 7.9 ms per image, most of it USB round trips and parameter reloads for
 5 programs. edgetpu_compiler rejects this model (Keras 3's Flatten has a
 dynamic shape), so only its per-layer programs were compared.
+
+## Element-wise ADD, wider 1x1 convs and ResNet-8 (2026-10-14)
+
+**Element-wise ADD** (`codegen::add`), byte-identical to 16.0 on all 8
+supported corpus models (16x16x32 / 16x16x64 / 32x32x16 / 32x32x64, scale
+ratios 1/4 .. 4, with and without RELU) and bit-exact on the TPU, including
+ResNet-8's arbitrary scale ratios. The program is two runs of the band
+loader (now shared with the pool in `codegen::band`): A staged at narrow
+`B` into the patch at 0, B staged at `2B` into the patch at `B` (B = bytes
+per tile), then a constant setup and one TensorOp.
+
+The arithmetic is an integer dot product per value: `out = clamp((wa a +
+wb b + offset) mult) + out_zp`, with
+
+- `(wa, wb)`: `s_small / s_big` (exact rational of the f32 scales) as the
+  best fraction with denominator <= 32767 (Python's
+  `Fraction.limit_denominator`), the larger scale getting the denominator.
+  1 : 1 for nearly equal scales, 4 : 1 for exact powers, 32767 : 32766 or
+  3157 : 3156 when the scales differ by 1e-5 / 3e-4 (8/8 corpus models; an
+  f32 ratio gets one of them wrong). The weights are 16-bit halves of mesh
+  fills from all four directions (opcodes 0x15-0x18) at narrow `2B`, moved
+  to wide 0x2070 for the op's parameter path;
+- `offset = -(wa za + wb zb)` and `mult = s_big * (1 / (w_big s_out))` in
+  f32 (12/12 corpus models including the 1-D ones); clamps as FC / conv.
+
+The add op reads word pairs of both patches (`in_hmode` 2, `in_mode*` 2;
+levels: 2 words, the two patches, pixels, rows, channel words) and writes
+over B's patch. Wide placement: with a 2-slot image row the constants sit
+on top (0x207c) and the staging below, otherwise the staging on top.
+
+**Runner: several input layers.** The compiled ADD has two named input
+layers with their own relocations. The runner now gives each input layer
+its own address in one buffer (layers back to back) and serves each input
+request the slice it asks for; before, it sent the whole buffer for every
+request.
+
+**Conv 1x1 above 16 input channels**: the compiler splits Cin 32 into two
+passes of 4 words (a 4-slot weight buffer refilled per pass) with partial
+sums, the 3x3 multi-pass form; byte-identical for 32 -> 64 stride 2,
+parameters included. Stride-2 3x3 with Cout 64 and 64 -> 64 needed no
+change. The 32-wide convs differ from the compiler (it walks real pixels in
+a wider patch where ours uses superpixels): both are correct on the TPU, so
+`conv_check` compares them only with `--all-sizes`.
+
+**Global average pool as an FC.** The compiler's 8x8x64 AVERAGE_POOL_2D is
+a 127-instruction program that reduces across all 16 tiles over the mesh
+(directions, slots and sync ids not decoded; one corpus model). The front
+end instead lowers a global average pool to an FC (K = H W C, weight 127
+from each pixel to its channel) that reproduces TFLite's int8 rounding
+exactly: input and output zero point 128 (summing the raw int8 values) and
+the smallest f32 multiplier at or above 1 / (127 n) for which the TPU's
+round-half-even of every possible sum equals TFLite's `(sum +- n/2) / n`
+(ties land just past .5 in magnitude; checked exhaustively at build time).
+
+**ResNet-8** (`tools/cifar10/train.py`, the MLPerf Tiny model ending at
+the logits, 20 epochs: 75.0% float, 75.2% int8). The front end now runs a
+DAG (every activation kept by tensor id) and maps the model to 14 programs:
+9 convs (the 3-channel input as 16 with zero weights, the 8x8 stage padded
+to 16x16), 3 ADDs with fused RELU (8x8x64 padded to 16x16x64), the average
+pool FC and the dense head. **All 10000 test images on the TPU: 75.22%,
+byte-identical to the host reference on every image**, the same top-1 as
+TFLite CPU on all of them (6 of 100000 logits differ by 1); 25.6 ms per
+image, most of it 14 parameter loads and USB round trips per image.

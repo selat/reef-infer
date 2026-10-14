@@ -1,7 +1,12 @@
-//! MNIST end to end without `edgetpu_compiler`: the int8 `.tflite` from
-//! `tools/mnist/train.py` -> `graph::Graph` -> generated layer programs.
+//! A test set end to end without `edgetpu_compiler`: an int8 `.tflite`
+//! from `tools/mnist/train.py` or `tools/cifar10/train.py` ->
+//! `graph::Graph` -> generated layer programs.
 //!
-//!     cargo run --release --example mnist -- [--model mlp|cnn] [--dir target/mnist] [--limit N] [--device]
+//!     cargo run --release --example eval -- [--dir target/mnist] [--model mlp|cnn] [--limit N] [--device]
+//!     cargo run --release --example eval -- --dir target/cifar10 --model resnet8 [--device]
+//!
+//! The directory holds `<model>.tflite`, `test_images.bin` (uint8 pixels),
+//! `test_labels.bin` and `<model>_tflite_logits.bin` (int8, 10 per image).
 //!
 //! Always: the host reference (bit-exact with the TPU) against TFLite's CPU
 //! logits over the test set. With `--device`: every image on the TPU,
@@ -30,14 +35,16 @@ async fn main() {
     let name = opt("--model").unwrap_or("mlp".into());
     let graph = Graph::from_tflite(&format!("{dir}/{name}.tflite")).unwrap();
     for (i, s) in graph.steps.iter().enumerate() {
+        let ins: Vec<_> = s.inputs.iter().map(|i| i.shape).collect();
         println!(
             "layer {i}: {} {:?} -> {:?}",
             summary(&s.layer),
-            s.input,
-            s.output
+            ins,
+            s.output_shape
         );
     }
     let images = read("test_images.bin");
+    let px = graph.input_len(); // bytes per image
     let labels = read("test_labels.bin");
     let tflite: Vec<i8> = read(&format!("{name}_tflite_logits.bin"))
         .iter()
@@ -63,7 +70,7 @@ async fn main() {
     let (mut ours_ok, mut cpu_ok, mut same_top1, mut bytes_diff, mut max_diff) = (0, 0, 0, 0, 0);
     let mut refs = Vec::with_capacity(n);
     for i in 0..n {
-        let x = quantize(&images[784 * i..784 * (i + 1)]);
+        let x = quantize(&images[px * i..px * (i + 1)]);
         let y = u8_to_i8(&graph.reference(&x));
         let t = &tflite[10 * i..10 * (i + 1)];
         for (a, b) in y.iter().zip(t) {
@@ -125,5 +132,13 @@ fn summary(l: &reef_infer::graph::Layer) -> String {
             c.k, c.k, c.cin, c.cout, c.height, c.width, c.relu
         ),
         Layer::MaxPool(p) => format!("MAXPOOL 2x2 at {}x{}x{}", p.height, p.width, p.c),
+        Layer::Add(a) => format!(
+            "ADD at {}x{}x{} relu={} weights {:?}",
+            a.height,
+            a.width,
+            a.c,
+            a.relu,
+            a.weights()
+        ),
     }
 }
