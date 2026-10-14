@@ -592,6 +592,7 @@ fn build_inner(
         chunk: a.finish()?,
         parameters: Vec::new(),
         input: layer(IN_NAME, SHAPE, input),
+        extra_inputs: Vec::new(),
         output: LayerInfo {
             output_layout: Some(output_layout()),
             ..layer(OUT_NAME, SHAPE, output)

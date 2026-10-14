@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use reef_infer::codegen::Quant;
+use reef_infer::codegen::add::Add;
 use reef_infer::codegen::conv::Conv;
 use reef_infer::codegen::elementwise::{self, Requant, SIZE};
 use reef_infer::codegen::fc::Fc;
@@ -111,6 +112,73 @@ async fn generated_programs_on_tpu() {
             let x = bytes(&mut seed, k);
             let got = dev.run_inference(&loaded, x.clone()).await.unwrap();
             assert_eq!(got, fc.reference(&x), "fc K={k} N={n} relu={relu}");
+        }
+    }
+
+    // Element-wise adds (two input layers), including ResNet-8's shapes and
+    // scale ratios no corpus model has (weights from the fraction search).
+    let q = |scale: f32, zero_point: i32| Quant { scale, zero_point };
+    for (h, w, c, qa, qb, qo, relu) in [
+        (
+            16,
+            16,
+            32,
+            q(0.0313, 128),
+            q(0.0313, 128),
+            q(0.0627, 127),
+            false,
+        ),
+        (32, 32, 16, q(0.0370, 0), q(0.1254, 122), q(0.0656, 0), true),
+        (
+            16,
+            16,
+            32,
+            q(0.0649, 106),
+            q(0.0720, 119),
+            q(0.0380, 0),
+            true,
+        ),
+        (
+            16,
+            16,
+            64,
+            q(0.0857, 54),
+            q(0.1155, 105),
+            q(0.0674, 0),
+            true,
+        ),
+        (
+            32,
+            32,
+            64,
+            q(0.0078, 128),
+            q(0.0314, 127),
+            q(0.0391, 128),
+            false,
+        ),
+    ] {
+        let add = Add {
+            height: h,
+            width: w,
+            c,
+            a: qa,
+            b: qb,
+            output: qo,
+            relu,
+        };
+        let model = Arc::new(add.build().unwrap().into_model());
+        let loaded = dev.load_params(model).await.unwrap();
+        for _ in 0..2 {
+            let (x, y) = (bytes(&mut seed, h * w * c), bytes(&mut seed, h * w * c));
+            let got = dev
+                .run_inference(&loaded, [x.clone(), y.clone()].concat())
+                .await
+                .unwrap();
+            assert!(
+                got == add.reference(&x, &y),
+                "add {h}x{w}x{c} weights {:?}",
+                add.weights()
+            );
         }
     }
 

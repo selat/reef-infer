@@ -611,3 +611,84 @@ fn pool_matches_compiler() {
         );
     }
 }
+
+/// Every corpus element-wise ADD `codegen::add` supports (shapes 16x16x32 /
+/// 16x16x64 / 32x32x16 / 32x32x64, scale ratios 1/4 .. 4, RELU):
+/// instructions (weights, multiplier, clamps included) and output layout.
+#[test]
+fn add_matches_compiler() {
+    use reef_infer::codegen::add::Add;
+    for (shape, act, b_range) in [
+        ("16x16x32", "none", "4p0"),
+        ("16x16x32", "none", "1p0"),
+        ("16x16x32", "none", "2p0"),
+        ("16x16x32", "none", "16p0"),
+        ("32x32x64", "none", "4p0"),
+        ("16x16x32", "relu", "4p0"),
+        ("16x16x64", "relu", "4p0"),
+        ("32x32x16", "relu", "4p0"),
+    ] {
+        let name =
+            format!("eltwise/eltwise_a_range4p0_act{act}_b_range{b_range}_opadd_shape{shape}");
+        let Some(path) = corpus(&name) else {
+            eprintln!("ISA corpus model {name} not found; skipping");
+            continue;
+        };
+        let compiled = load_tflite_model(&path).unwrap();
+        let e = &compiled.executables[0];
+        let dims: Vec<usize> = shape.split('x').map(|d| d.parse().unwrap()).collect();
+        let ours = Add {
+            height: dims[0],
+            width: dims[1],
+            c: dims[2],
+            a: quant(&e.input_layers[0]),
+            b: quant(&e.input_layers[1]),
+            output: quant(&e.output_layers[0]),
+            relu: act == "relu",
+        }
+        .build()
+        .unwrap()
+        .into_model();
+        let o = &ours.executables[0];
+        assert_eq!(
+            o.instruction_chunks[0].bitstream, e.instruction_chunks[0].bitstream,
+            "{name}"
+        );
+        assert_eq!(
+            format!("{:?}", o.output_layers[0].output_layout),
+            format!("{:?}", e.output_layers[0].output_layout),
+            "{name}"
+        );
+    }
+}
+
+/// ADD's integer weights: the best fraction of the scales with denominator
+/// <= 32767, as the compiler picks them (corpus 1D / 3-D models).
+#[test]
+fn add_weights_follow_the_compiler() {
+    use reef_infer::codegen::Quant;
+    use reef_infer::codegen::add::Add;
+    let q = |scale| Quant {
+        scale,
+        zero_point: 128,
+    };
+    for (sa, sb, want) in [
+        (0.03136582, 0.031355884, (3157, 3156)),
+        (0.03136884, 0.031368285, (32767, 32766)),
+        (0.031372506, 0.031372417, (1, 1)),
+        (0.03137238, 0.007843103, (4, 1)),
+        (0.03137244, 0.1254892, (1, 4)),
+        (0.03137235, 0.01568624, (2, 1)),
+    ] {
+        let add = Add {
+            height: 16,
+            width: 16,
+            c: 32,
+            a: q(sa),
+            b: q(sb),
+            output: q(0.06),
+            relu: false,
+        };
+        assert_eq!(add.weights(), want, "{sa} / {sb}");
+    }
+}

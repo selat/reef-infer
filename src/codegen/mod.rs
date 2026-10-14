@@ -6,6 +6,8 @@
 //! result into an [`ExecInfo`] that [`crate::runner::Device`] runs like a
 //! compiled model.
 
+pub mod add;
+pub(crate) mod band;
 pub mod conv;
 pub mod elementwise;
 pub mod fc;
@@ -688,6 +690,8 @@ pub struct Program {
     pub chunk: ChunkInfo,
     pub parameters: Vec<u8>,
     pub input: LayerInfo,
+    /// Further input layers (the host sends all inputs back to back).
+    pub extra_inputs: Vec<LayerInfo>,
     pub output: LayerInfo,
 }
 
@@ -699,7 +703,9 @@ impl Program {
                 exec_type: ExecutableType::STAND_ALONE,
                 parameters: self.parameters,
                 instruction_chunks: vec![self.chunk],
-                input_layers: vec![self.input],
+                input_layers: std::iter::once(self.input)
+                    .chain(self.extra_inputs)
+                    .collect(),
                 output_layers: vec![self.output],
                 scratch_size_bytes: 0,
             }],

@@ -137,11 +137,18 @@ def configs():
         act=["relu"],
     ):
         c.append(("eltwise", p))
+    # ResNet-8 residual adds (8x8x64 also padded to 16x16x64)
+    for shape in [[32, 32, 16], [16, 16, 32], [8, 8, 64], [16, 16, 64]]:
+        c.append(("eltwise", {**ew, "shape": shape, "act": "relu"}))
     pool = dict(H=16, W=16, C=32, op="max", size=2, stride=2, pad="valid")
     for p in sweep(
         pool, op=["avg"], size=[3], stride=[1], pad=["same"], C=[8, 128], H=[32]
     ):
         c.append(("pool", p))
+    # ResNet-8 head: 8x8 average pool over 8x8x64
+    c.append(
+        ("pool", {**pool, "H": 8, "W": 8, "C": 64, "op": "avg", "size": 8, "stride": 8})
+    )
     # MNIST CNN layers, padded to 32x32 / 16x16 (28 -> 14 -> 7)
     for H, C in [(32, 32), (16, 64)]:
         c.append(("pool", {**pool, "H": H, "W": H, "C": C}))
