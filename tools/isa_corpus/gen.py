@@ -71,6 +71,32 @@ def configs():
         in_range=[0.5, 16.0],
     ):
         c.append(("conv", p))
+    # ResNet-8 convs: stride-2 3x3 / 1x1 downsampling, 3x3 at 32x32 and 8x8
+    for H, Cin, Cout, k, s, act in [
+        (32, 16, 32, 3, 2, "relu"),
+        (32, 16, 32, 1, 2, "none"),
+        (16, 32, 64, 3, 2, "relu"),
+        (16, 32, 64, 1, 2, "none"),
+        (32, 16, 16, 3, 1, "relu"),
+        (32, 16, 16, 3, 1, "none"),
+        (8, 64, 64, 3, 1, "none"),
+        (16, 64, 64, 3, 1, "none"),
+    ]:
+        c.append(
+            (
+                "conv",
+                {
+                    **conv,
+                    "H": H,
+                    "W": H,
+                    "Cin": Cin,
+                    "Cout": Cout,
+                    "k": k,
+                    "stride": s,
+                    "act": act,
+                },
+            )
+        )
     for H, Cin, Cout in [(32, 16, 32), (16, 32, 64)]:
         c.append(
             ("conv", {**conv, "H": H, "W": H, "Cin": Cin, "Cout": Cout, "act": "relu"})

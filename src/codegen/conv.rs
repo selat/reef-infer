@@ -106,7 +106,7 @@ impl Conv {
             && tall_ok
             && ob <= 2048
             && match self.k {
-                1 => (self.cin, self.cout) == (16, 32),
+                1 => [(16, 32), (32, 64)].contains(&(self.cin, self.cout)),
                 3 => {
                     [1, 3, 4, 16, 32, 64, 128].contains(&self.cin)
                         && ([8, 16, 32].contains(&self.cout)
@@ -669,10 +669,18 @@ impl Conv {
         // per tap, refilled for each of the Cin / 4 passes (k = 3).
         let taps = self.taps();
         let oq = (self.cout / 4) as i64;
-        // Single pass over all taps and words (k = 1, or Cin = 4: one word
-        // per pixel), or one pass per 4 input channels over the taps.
-        let single = self.single_pass();
-        let (slots, passes) = if single { (taps * cq, 1) } else { (taps, cq) };
+        // Single pass over all taps and words (k = 1 up to 4 words, or
+        // Cin = 4: one word per pixel), one pass per 4 words (k = 1 above 16
+        // channels), or one pass per 4 input channels over the taps.
+        let k1_split = self.k == 1 && cq > 4;
+        let single = self.single_pass() && !k1_split;
+        let (slots, passes) = if k1_split {
+            (4, cq / 4)
+        } else if single {
+            (taps * cq, 1)
+        } else {
+            (taps, cq)
+        };
         let slots_addr = 0x1fe8 - 8 * slots;
         let mut f: Vec<(&str, i64)> = vec![
             ("tile_mask", ALL_TILES),
@@ -749,7 +757,20 @@ impl Conv {
         let (pad_y, pad_x) = (pt.top - self.pad().0, pt.left * self.spx() - self.pad().0);
         let in_base = 4 * (pad_y * rs + pad_x * cq);
         let k = self.k as i64;
-        let (in_dims, loops): (Vec<(i64, i64)>, [i64; 3]) = if self.k == 1 {
+        let (in_dims, loops): (Vec<(i64, i64)>, [i64; 3]) = if k1_split {
+            // per pass (4 words): the words, then pixels (x, y)
+            if st == 1 {
+                (
+                    vec![(4, 1), (npx, cq), (passes, 4)],
+                    [3, npx - 1, passes - 1],
+                )
+            } else {
+                (
+                    vec![(4, 1), (ox, st * cq), (oy, st * rs), (passes, 4)],
+                    [3, npx - 1, passes - 1],
+                )
+            }
+        } else if self.k == 1 {
             // per pixel: Cin / 4 words against the slots
             if st == 1 {
                 (vec![(cq, 1), (1, cq), (npx, cq)], [cq - 1, npx - 1, 0])
@@ -857,12 +878,12 @@ impl Conv {
         } else {
             // partial sums: one per pixel, revisited each pass
             f.extend([
-                ("par_cnt2".into(), cq - 1),
+                ("par_cnt2".into(), passes - 1),
                 ("psum_base".into(), slots_addr - 4 * npx),
-                ("psum_cnt0".into(), taps - 1),
+                ("psum_cnt0".into(), slots - 1),
                 ("psum_inc1".into(), 1),
                 ("psum_cnt1".into(), npx - 1),
-                ("psum_cnt2".into(), cq - 1),
+                ("psum_cnt2".into(), passes - 1),
                 ("psum_mode7".into(), 2),
             ]);
             for j in 2..8 {

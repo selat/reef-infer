@@ -293,6 +293,28 @@ fn conv_matches_compiler() {
             3,
             true,
         ),
+        // ResNet-8: stride-2 downsampling (3x3 and 1x1 shortcut), 64 -> 64
+        (
+            "k3_padsame_stride2",
+            "Cin32_Cout64",
+            "actrelu_in_range4p0",
+            3,
+            true,
+        ),
+        (
+            "k1_padsame_stride2",
+            "Cin32_Cout64",
+            "actnone_in_range4p0",
+            1,
+            false,
+        ),
+        (
+            "k3_padsame_stride1",
+            "Cin64_Cout64",
+            "actnone_in_range4p0",
+            3,
+            false,
+        ),
         (
             "k3_padsame_stride1",
             "Cin16_Cout32",

@@ -1,7 +1,7 @@
 //! Builds `codegen::conv` programs for the corpus CONV_2D models it
 //! supports and diffs them against the compiler's, field by field.
 //!
-//!     cargo run --example conv_check -- [filter] [--all-diffs]
+//!     cargo run --example conv_check -- [filter] [--all-diffs] [--all-sizes]
 //!
 //! Corpus directory: `target/isa_corpus` or `REEF_ISA_CORPUS`. With the
 //! models' weights exported (`tools/isa_corpus/conv_ref.py`) the parameter
@@ -127,8 +127,8 @@ fn main() {
             cout,
             k,
             stride: get("stride"),
-            width: 16,
-            height: 16,
+            width: get("W"),
+            height: get("H"),
             weights: nums("weights").map_or(vec![1; cout * k * k * cin], |v| {
                 v.iter().map(|&x| x as i8).collect()
             }),
@@ -139,7 +139,13 @@ fn main() {
             output: quant(&e.output_layers[0]),
             relu: p["act"] == "relu",
         };
-        if conv.check().is_err() || (get("H"), get("W")) != (16, 16) || p["pad"] != "same" {
+        // 32 / 64 wide or tall images use our superpixel / band layout,
+        // not the compiler's: compared only with --all-sizes
+        let all_sizes = args.iter().any(|a| a == "--all-sizes");
+        if conv.check().is_err()
+            || p["pad"] != "same"
+            || (!all_sizes && (conv.height, conv.width) != (16, 16))
+        {
             continue;
         }
         total += 1;
