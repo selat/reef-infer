@@ -86,3 +86,4 @@ cargo test --features usb
 
 - [`docs/EDGE_TPU.md`](docs/EDGE_TPU.md): everything known about the Edge TPU: hardware, file and USB formats, the instruction set, decoded fields, and open questions.
 - [`docs/CODEGEN_RESEARCH.md`](docs/CODEGEN_RESEARCH.md): the dated research log behind it.
+- [`docs/ROADMAP.md`](docs/ROADMAP.md): which ops to generate next, milestone by milestone (MNIST to MobileNet and detection).

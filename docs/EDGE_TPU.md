@@ -350,6 +350,8 @@ perturbation on the device.
 
 ## 8. Code generation status and plan
 
+The model-by-model plan (which ops in which order) is in `ROADMAP.md`.
+
 | Step | Status |
 |---|---|
 | Decoder / encoder in Rust (`src/isa/`) | Done; all bitstreams round-trip |
