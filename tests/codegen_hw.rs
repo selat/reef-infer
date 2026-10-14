@@ -64,8 +64,22 @@ async fn generated_programs_on_tpu() {
         assert!(got == want, "{rq:?}");
     }
 
-    // Fully connected layers with random weights.
-    for (k, n, relu) in [(64, 64, false), (8, 16, true), (40, 48, false)] {
+    // Fully connected layers with random weights: one tile, K spread over
+    // several input tiles (a partial last one for 784 / 1000), N over
+    // several compute tiles, and N padded to 16 (the MNIST layers: 784 x
+    // 128 ReLU, 128 x 10).
+    for (k, n, relu) in [
+        (64, 64, false),
+        (8, 16, true),
+        (40, 48, false),
+        (128, 64, false),
+        (784, 128, true),
+        (128, 10, false),
+        (1000, 64, false),
+        (256, 256, true),
+        (64, 1024, false),
+        (64, 4, false),
+    ] {
         let w = bytes(&mut seed, n * k);
         let fc = Fc {
             k,
@@ -77,8 +91,9 @@ async fn generated_programs_on_tpu() {
                 scale: 0.03,
                 zero_point: 120,
             },
+            // wider sums for larger K, so the outputs do not all saturate
             output: Quant {
-                scale: 0.3,
+                scale: 0.3 * (k as f32 / 64.0).sqrt(),
                 zero_point: 130,
             },
             relu,

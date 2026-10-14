@@ -341,8 +341,34 @@ pub fn param_caching(
     f438: i64,
     consumer: &[(&str, i64)],
 ) -> Result<(), IsaError> {
+    param_caching_tiles(a, &[(1, bytes, consumer.to_vec())], f438)
+}
+
+/// Loop fields of a parameter transfer of `units` 64 B units: rows of 1024
+/// units (`d1_limit` = full rows), `count_m1` the units of the last row.
+/// From the corpus (FC K = 2048 / 4096, N = 1024); a multiple of 1024 is
+/// not covered.
+fn param_rows(units: i64) -> [(&'static str, i64); 3] {
+    let rows = units / 1024;
+    let last = units - 1024 * rows;
+    [
+        ("d1_limit", rows),
+        ("count_m1", last - 1),
+        ("count_neg", 0x400 - last),
+    ]
+}
+
+/// One tile's share of a parameter stream: tile mask, bytes, and its
+/// ringConsumer's fields.
+pub type ParamTile<'a> = (i64, usize, Vec<(&'a str, i64)>);
+
+/// [`param_caching`] for several tiles: each [`ParamTile`] gets the next
+/// `bytes` of the stream, all ringConsumers first, then one infeed per tile
+/// at increasing staging offsets.
+pub fn param_caching_tiles(a: &mut Asm, tiles: &[ParamTile], f438: i64) -> Result<(), IsaError> {
     use Description as D;
     use Position as P;
+    let bytes: usize = tiles.iter().map(|t| t.1).sum();
     let units = (bytes / 64) as i64; // the parameter stream moves 64 B units
     a.emit(
         OP_SYNC,
@@ -378,9 +404,7 @@ pub fn param_caching(
         ("k121", 1),
         ("k124", 1),
         ("par136", 1),
-        ("count_m1", units - 1),
         ("k157", 1),
-        ("count_neg", 0x400 - units),
         ("k174", 1),
         ("par177", 1),
         ("k178", 1),
@@ -388,14 +412,19 @@ pub fn param_caching(
         ("k199", 1),
         ("k215", 1),
     ];
+    pop.extend(param_rows(units));
     if units % 2 == 0 {
         pop.push(("b183", 1));
     }
     a.emit(OP_POP, &pop)?;
-    a.emit(OP_RING_CONSUMER, consumer)?;
-    a.emit(
-        OP_INFEED,
-        &[
+    for (_, _, consumer) in tiles {
+        a.emit(OP_RING_CONSUMER, consumer)?;
+    }
+    let mut off = 0;
+    for &(mask, b, _) in tiles {
+        let u = (b / 64) as i64;
+        let mut f = vec![
+            ("buf_off", off),
             ("d0_stride", 1),
             ("d0_limit", 0x3ff),
             ("d1_stride", 0x1ffc01),
@@ -403,20 +432,21 @@ pub fn param_caching(
             ("k157", 1),
             ("k160", 1),
             ("par172", 1),
-            ("count_m1", units - 1),
             ("k203", 1),
-            ("count_neg", 0x400 - units),
             ("k311", 1),
             ("par314", 1),
-            ("pop_wait", 1),
+            ("pop_wait", off + 1),
             ("k336", 1),
             ("k352", 1),
             ("k392", 1),
-            ("tiles", 1),
+            ("tiles", mask),
             ("k434", 0xf),
             ("f438", f438),
-        ],
-    )?;
+        ];
+        f.extend(param_rows(u));
+        a.emit(OP_INFEED, &f)?;
+        off += u;
+    }
     a.emit(
         OP_SYNC,
         &[

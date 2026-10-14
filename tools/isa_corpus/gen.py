@@ -44,6 +44,16 @@ def configs():
         in_range=[0.5, 1.0, 16.0, 100.0],
     ):
         c.append(("fc", p))
+    # MNIST MLP layers (784 -> 128 ReLU -> 10) and the steps between
+    for K, N, act in [
+        (784, 128, "relu"),
+        (128, 10, "none"),
+        (784, 64, "none"),
+        (128, 128, "none"),
+        (64, 10, "none"),
+        (784, 16, "none"),
+    ]:
+        c.append(("fc", {**fc, "K": K, "N": N, "act": act}))
     conv = dict(
         H=16, W=16, Cin=16, Cout=32, k=3, stride=1, pad="same", act="none", in_range=4.0
     )

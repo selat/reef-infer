@@ -142,32 +142,92 @@ fn relu_matches_compiler() {
     );
 }
 
+/// Corpus FC models covering each tiling case: one tile, K over 2 / 4 /
+/// 13 / 16 input tiles (a partial last tile for 784 and 1000), N over 2 / 4
+/// / 16 compute tiles, N padded to 16 or rounded to 8 B of output, and the
+/// MNIST MLP's two layers. Instructions and output layout (they depend only
+/// on the shape, the activation quantization and RELU).
 #[test]
 fn fc_matches_compiler() {
-    let Some(path) = corpus("fc/fc_K64_N64_actnone_biasTrue_in_range4p0_iouint8") else {
-        eprintln!("ISA corpus not found; skipping");
-        return;
-    };
-    let compiled = load_tflite_model(&path).unwrap();
-    let e = &compiled.executables[0];
-    // The instructions depend only on the shape and the activation quantization.
-    let ours = fc(
-        64,
-        64,
-        quant(&e.input_layers[0]),
-        quant(&e.output_layers[0]),
-    )
-    .build()
-    .unwrap();
-    for i in 0..2 {
+    for (name, k, n, relu) in [
+        (
+            "K64_N64_actnone_biasTrue_in_range4p0_iouint8",
+            64,
+            64,
+            false,
+        ),
+        ("K8_N64_actnone_biasTrue_in_range4p0_ioint8", 8, 64, false),
+        (
+            "K128_N64_actnone_biasTrue_in_range4p0_ioint8",
+            128,
+            64,
+            false,
+        ),
+        (
+            "K256_N64_actnone_biasTrue_in_range4p0_ioint8",
+            256,
+            64,
+            false,
+        ),
+        (
+            "K1000_N64_actnone_biasTrue_in_range4p0_ioint8",
+            1000,
+            64,
+            false,
+        ),
+        (
+            "K64_N128_actnone_biasTrue_in_range4p0_ioint8",
+            64,
+            128,
+            false,
+        ),
+        (
+            "K64_N1024_actnone_biasTrue_in_range4p0_ioint8",
+            64,
+            1024,
+            false,
+        ),
+        ("K64_N4_actnone_biasTrue_in_range4p0_ioint8", 64, 4, false),
+        ("K64_N10_actnone_biasTrue_in_range4p0_ioint8", 64, 10, false),
+        (
+            "K784_N128_actrelu_biasTrue_in_range4p0_ioint8",
+            784,
+            128,
+            true,
+        ),
+        (
+            "K128_N10_actnone_biasTrue_in_range4p0_ioint8",
+            128,
+            10,
+            false,
+        ),
+    ] {
+        let Some(path) = corpus(&format!("fc/fc_{name}")) else {
+            eprintln!("ISA corpus model fc_{name} not found; skipping");
+            continue;
+        };
+        let compiled = load_tflite_model(&path).unwrap();
+        let e = &compiled.executables[0];
+        let mut f = fc(k, n, quant(&e.input_layers[0]), quant(&e.output_layers[0]));
+        f.relu = relu;
+        let ours = f.build().unwrap();
+        for i in 0..2 {
+            assert_eq!(
+                ours.executables[i].exec_type,
+                compiled.executables[i].exec_type
+            );
+            assert_eq!(
+                ours.executables[i].instruction_chunks[0].bitstream,
+                compiled.executables[i].instruction_chunks[0].bitstream,
+                "{name}: executable {i}"
+            );
+        }
+        let (a, b) = (&ours.executables[0].output_layers[0], &e.output_layers[0]);
+        assert_eq!(a.size_bytes, b.size_bytes, "{name}");
         assert_eq!(
-            ours.executables[i].exec_type,
-            compiled.executables[i].exec_type
-        );
-        assert_eq!(
-            ours.executables[i].instruction_chunks[0].bitstream,
-            compiled.executables[i].instruction_chunks[0].bitstream,
-            "executable {i}"
+            format!("{:?}", a.output_layout),
+            format!("{:?}", b.output_layout),
+            "{name}"
         );
     }
 }

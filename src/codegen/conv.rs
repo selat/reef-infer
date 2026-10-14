@@ -240,7 +240,7 @@ impl Conv {
     }
 
     pub fn parameters(&self) -> Vec<u8> {
-        let p = self.fc().parameters();
+        let p = self.fc().blob(0..self.cout, self.cout);
         let (row, pad) = (4 * self.cout, 4 * self.cout_pad());
         p.chunks(row)
             .flat_map(|r| r.iter().copied().chain(std::iter::repeat_n(0, pad - row)))
