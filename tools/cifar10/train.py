@@ -2,7 +2,9 @@
 classification model), and export the test set with TFLite CPU outputs as
 the reference for `examples/cifar10.rs`.
 
-    .venv/bin/python tools/cifar10/train.py [--out target/cifar10] [--epochs 20]
+    .venv/bin/python tools/cifar10/train.py [--out target/cifar10] [--epochs 20] [--export-only]
+
+`--export-only` reuses `resnet8.keras` and only redoes the int8 export.
 
 Model (MLPerf Tiny `resnet_v1_eembc`, ending at the logits instead of a
 softmax): Conv 3x3 16 -> 3 residual stacks of 16 / 32 / 64 filters (the
@@ -10,7 +12,10 @@ second and third downsample with stride 2 and a 1x1 stride-2 shortcut) ->
 AveragePooling 8x8 -> Dense 10. Batch norm folds into the convs.
 
 Writes to `--out`:
-- `resnet8.tflite`: the int8 model (int8 input / output).
+- `resnet8.keras`: the trained float model.
+- `resnet8.tflite`: the int8 model (int8 input / output), traced with a
+  batch of 1 so every shape is static (`edgetpu_compiler` rejects the
+  dynamic reshape Keras 3's Flatten otherwise exports).
 - `test_images.bin`: 10000 x 32 x 32 x 3 uint8 pixels; `test_labels.bin`.
 - `resnet8_tflite_logits.bin`: 10000 x 10 int8 logits from TFLite.
 """
@@ -24,6 +29,7 @@ import tensorflow as tf
 ap = argparse.ArgumentParser()
 ap.add_argument("--out", default="target/cifar10")
 ap.add_argument("--epochs", type=int, default=20)
+ap.add_argument("--export-only", action="store_true")
 a = ap.parse_args()
 out = Path(a.out)
 out.mkdir(parents=True, exist_ok=True)
@@ -59,25 +65,31 @@ x = block(x, 64, 2)
 x = L.AveragePooling2D(8)(x)
 x = L.Flatten()(x)
 model = keras.Model(inp, L.Dense(10)(x))
-model.compile(
-    optimizer="adam",
-    loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-    metrics=["accuracy"],
-)
-
 x_tr = x_train.astype("float32") / 255.0
 x_te = x_test.astype("float32") / 255.0
-aug = keras.Sequential([L.RandomFlip("horizontal"), L.RandomTranslation(0.1, 0.1)])
-ds = (
-    tf.data.Dataset.from_tensor_slices((x_tr, y_train))
-    .shuffle(50000, seed=0)
-    .batch(64)
-    .map(lambda x, y: (aug(x, training=True), y), num_parallel_calls=tf.data.AUTOTUNE)
-    .prefetch(tf.data.AUTOTUNE)
-)
-model.fit(ds, epochs=a.epochs, verbose=2)
-_, acc = model.evaluate(x_te, y_test, verbose=0)
-print(f"float accuracy: {acc:.4f}")
+if a.export_only:
+    model = keras.models.load_model(out / "resnet8.keras")
+else:
+    model.compile(
+        optimizer="adam",
+        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        metrics=["accuracy"],
+    )
+
+    aug = keras.Sequential([L.RandomFlip("horizontal"), L.RandomTranslation(0.1, 0.1)])
+    ds = (
+        tf.data.Dataset.from_tensor_slices((x_tr, y_train))
+        .shuffle(50000, seed=0)
+        .batch(64)
+        .map(
+            lambda x, y: (aug(x, training=True), y), num_parallel_calls=tf.data.AUTOTUNE
+        )
+        .prefetch(tf.data.AUTOTUNE)
+    )
+    model.fit(ds, epochs=a.epochs, verbose=2)
+    _, acc = model.evaluate(x_te, y_test, verbose=0)
+    print(f"float accuracy: {acc:.4f}")
+    model.save(out / "resnet8.keras")
 
 
 def rep():
@@ -85,7 +97,13 @@ def rep():
         yield [x_tr[i : i + 1]]
 
 
-conv = tf.lite.TFLiteConverter.from_keras_model(model)
+# the same model on a batch of 1: static shapes, the Flatten folds to a
+# constant reshape
+static = keras.models.clone_model(
+    model, input_tensors=keras.Input((32, 32, 3), batch_size=1)
+)
+static.set_weights(model.get_weights())
+conv = tf.lite.TFLiteConverter.from_keras_model(static)
 conv.optimizations = [tf.lite.Optimize.DEFAULT]
 conv.representative_dataset = rep
 conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]

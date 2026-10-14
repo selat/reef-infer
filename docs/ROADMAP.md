@@ -108,6 +108,13 @@ top-1 as TFLite CPU. The items it did not need stay open.
 | SSD post-processing | box decode, NMS | on the host (as libedgetpu does) | S |
 | PyTorch front end | `torch.export` int8 -> our op list | after the TFLite front end proves the mapping | L |
 
+## Speed today (2026-10-14)
+
+ResNet-8 on CIFAR-10, same `.tflite` and TPU (`examples/bench_compare.rs`):
+`edgetpu_compiler` 0.96 ms per image, ours 32.4 ms (14 programs, every
+layer reloading its parameters; 14.5 ms with parameters resident). The gap
+is per-call overhead, so items 1 and 4 below matter most.
+
 ## Cross-cutting, in order of when they start to matter
 
 1. **Parameter cache placement** (milestone 0 experiment): needed as soon

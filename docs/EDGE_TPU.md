@@ -426,9 +426,14 @@ cargo run --example fc_check -- [filter]
 # Generated element-wise add vs every supported corpus model, field by field
 cargo run --example add_check -- [filter]
 
-# CIFAR-10 ResNet-8 end to end (train + export, then host reference / TPU)
-.venv/bin/python tools/cifar10/train.py
+# CIFAR-10 ResNet-8 end to end (train + export, then host reference / TPU);
+# --export-only redoes the int8 export from the saved resnet8.keras
+.venv/bin/python tools/cifar10/train.py [--export-only]
 cargo run --release --example eval -- --dir target/cifar10 --model resnet8 [--limit N] [--device]
+
+# Speed / accuracy against edgetpu_compiler on the same .tflite and TPU
+(cd target/cifar10 && ~/projects/tpu/edgetpu_compiler.sh -s resnet8.tflite)
+cargo run --release --example bench_compare -- [--dir target/cifar10] [--model resnet8] [--limit N]
 
 # Generated max pool vs every supported corpus model, field by field
 cargo run --example pool_check -- [filter]

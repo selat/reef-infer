@@ -837,3 +837,33 @@ pool FC and the dense head. **All 10000 test images on the TPU: 75.22%,
 byte-identical to the host reference on every image**, the same top-1 as
 TFLite CPU on all of them (6 of 100000 logits differ by 1); 25.6 ms per
 image, most of it 14 parameter loads and USB round trips per image.
+
+## Speed against edgetpu_compiler (2026-10-14)
+
+`examples/bench_compare.rs`: ResNet-8 (a retrained export, 68.9% int8,
+with static shapes so that `edgetpu_compiler` accepts it: all 14 ops in one
+subgraph, 115.75 KiB of parameters cached on chip, nothing streamed), the
+same `.tflite` for both, same TPU, first 1000 CIFAR-10 test images.
+
+| | edgetpu_compiler | ours |
+|---|---|---|
+| programs per image | 1 | 14 |
+| per image | 0.96 ms (1041 images/s) | 32.4 ms (31 images/s) |
+| parameter loading | 2.4 ms once | 10.6 ms per image (every layer reloads) |
+| inference with parameters resident | 0.96 ms | 14.5 ms (sum of 14 calls) |
+| accuracy / top-1 = TFLite CPU | 68.3% / 999 of 1000 | 68.4% / 1000 of 1000 |
+| logits differing from TFLite CPU | 800 of 10000 | 26 of 10000 |
+
+Our time is per-call overhead, not compute: every program sends its
+instructions and moves its whole input and output over USB (the 64 x 10 FC
+alone takes 0.34 ms, each 32x32 layer about 1.2 ms), and the compiled model
+keeps activations on chip across all 14 layers. Of the 10.6 ms of reloads,
+6.2 ms is the average-pool FC's 263 KB blob (the compiler's mesh reduction
+needs no parameters). About 7 ms is host glue (padding / cropping) and
+per-call setup. Numerically ours is closer to TFLite: our average pool
+rounds as TFLite does, and the compiler's program differs from TFLite's
+top-1 on one image.
+
+Closing the gap, in order: per-layer parameter placement (-10.6 ms), a
+native global average pool, then several layers per program with
+activations kept on chip (the only way to approach 1 ms).
