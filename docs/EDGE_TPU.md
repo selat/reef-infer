@@ -372,7 +372,7 @@ The model-by-model plan (which ops in which order) is in `ROADMAP.md`.
 | Conv 32x32 Cin 1 / 3 (an image's first layer, Cout 16 / 32): the compiler's layout, 8x8 one-word pixels per tile | Done; byte-identical to 16.0 on 5 corpus models, bit-exact on device |
 | Conv: Cout 64 for Cin 16, Cout 128+, Cin 4-15 at larger sizes (stopgap: zero-weight channels), Cin 8, other k, valid padding, sizes not a multiple of 16 (stopgap: host padding) | Next |
 | Scheduler/allocator for multi-layer graphs | Weeks to months |
-| PyTorch front end (`torch.export`, int8) | After the above |
+| PyTorch front end (`torch.export`, PT2E int8 with our quantizer, `tools/torch`, `Graph::from_torch`) | Done; PyTorch ResNet-8 bit-exact on device in one call |
 
 Our runner is compatible with generated programs: it is event-driven and
 tinycoral programs need no relocation. Generated programs can be handed to it
@@ -387,10 +387,10 @@ as in-memory executables.
    (2026-10-10, section 6.3), bit-exact on all 16 tiles.
 4. Load custom spline coefficients and compare with a host model.
 
-The fastest end-to-end path for PyTorch today is PyTorch -> ONNX -> onnx2tf
--> int8 TFLite -> `edgetpu_compiler` -> reef-infer. It depends on Google's
-compiler and gaps in the runner (shapes not exposed, int8 domain, output
-order).
+PyTorch models go straight to our generators: `torch.export`, PT2E
+quantization with `tools/torch/edgetpu_quant.py`, its JSON graph, then
+`Graph::from_torch` (no TFLite, no `edgetpu_compiler`; within the
+generators' supported ops and shapes).
 
 ## 9. Tools
 
@@ -448,6 +448,10 @@ cargo run --release --example eval -- [--dir target/mnist] [--model mlp|cnn] [--
 cargo run --release --example param_cache_hw   # layers' cached parameters at their own wide addresses coexist?
 cargo run --release --example chain_hw   # several layers in one call, activations on chip
 cargo run --release --example residual_hw   # ResNet-8 stages 1-2 (convs + adds) in one call
+
+# PyTorch ResNet-8: train, quantize (PT2E), export, then run it
+.venv/bin/python tools/torch/resnet8.py [--epochs 20]
+cargo run --release --example eval -- --dir target/cifar10 --model resnet8_torch --device
 
 # Field diff of two compiled models
 cargo run --example isa_diff -- a_edgetpu.tflite b_edgetpu.tflite

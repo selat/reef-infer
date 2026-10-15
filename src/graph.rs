@@ -352,14 +352,7 @@ impl Graph {
                             "MAX_POOL_2D: need 2x2, stride 2, valid, same quantization".into()
                         );
                     }
-                    let p = MaxPool {
-                        height: fit_size(y, &[16, 32]).ok_or("pool input too tall")?,
-                        width: fit_size(x, &[16, 32]).ok_or("pool input too wide")?,
-                        c,
-                        quant: tq(ins[0])?,
-                    };
-                    p.check()?;
-                    Layer::MaxPool(p)
+                    Layer::MaxPool(max_pool_layer((y, x, c), tq(ins[0])?)?)
                 }
                 BuiltinOperator::AVERAGE_POOL_2D => {
                     let o = op
@@ -383,21 +376,16 @@ impl Graph {
                     let o = op
                         .builtin_options_as_add_options()
                         .ok_or("ADD without options")?;
-                    let (y, x, c) = in0;
                     if shape(ins[1])? != in0 {
                         return Err("ADD: broadcasting not supported".into());
                     }
-                    let a = Add {
-                        height: fit_size(y, &[16, 32]).ok_or("add input too tall")?,
-                        width: fit_size(x, &[16, 32]).ok_or("add input too wide")?,
-                        c,
-                        a: tq(ins[0])?,
-                        b: tq(ins[1])?,
-                        output: tq(outs[0])?,
-                        relu: relu(o.fused_activation_function())?,
-                    };
-                    a.check()?;
-                    Layer::Add(a)
+                    Layer::Add(add_layer(
+                        in0,
+                        tq(ins[0])?,
+                        tq(ins[1])?,
+                        tq(outs[0])?,
+                        relu(o.fused_activation_function())?,
+                    )?)
                 }
                 c => return Err(format!("op {c:?} not supported").into()),
             };
@@ -405,19 +393,7 @@ impl Graph {
                 Layer::Add(_) => vec![input(ins[0])?, input(ins[1])?],
                 _ => vec![input(ins[0])?],
             };
-            for (i, s) in inputs.iter().zip(layer.shapes().0) {
-                if len(s) < len(i.shape) {
-                    return Err(format!("{layer:?}: input {:?} does not fit", i.shape).into());
-                }
-            }
-            let on_chip = layer.at_size(inputs[0].shape);
-            steps.push(Step {
-                layer,
-                on_chip,
-                inputs,
-                output: outs[0],
-                output_shape: output,
-            });
+            steps.push(Step::new(layer, inputs, outs[0], output)?);
             have.push(outs[0]);
         }
         let output_tensor = resolve(&alias, graph_out);
@@ -846,31 +822,38 @@ fn conv_layer(model: &Model<'_>, op: &Operator<'_>, (y, x, cin): Shape) -> Resul
     if kh != kw || wcin != cin || o.stride_h() != o.stride_w() || o.padding() != Padding::SAME {
         return Err("CONV_2D: need a square kernel, equal strides and same padding".into());
     }
-    let (height, width) = (
-        fit_size(y, &[16, 32, 64]).ok_or("conv input too tall")?,
-        fit_size(x, &[16, 32, 64]).ok_or("conv input too wide")?,
-    );
-    if (height, width) != (y, x) && stride != 1 {
-        return Err("CONV_2D: padding the image is exact only for stride 1".into());
-    }
     let (weights, w_scale, bias) = weights_bias(model, ins[1], ins.get(2).copied(), cout)?;
-    let mut conv = Conv {
+    fit_conv(Conv {
         cin,
         cout,
         k: kh,
         stride,
-        width,
-        height,
+        width: x,
+        height: y,
         weights,
         w_scale,
         bias,
         input: tensor_quant(model, ins[0])?,
         output: tensor_quant(model, out)?,
         relu: relu(o.fused_activation_function())?,
-    };
+        pad_before: None,
+    })
+}
+
+/// A conv on a `height x width` image (its real size) as a program takes
+/// it: the image padded up to 16 / 32 / 64 (exact for stride 1), and Cin
+/// to 16 with zero weights when the generator does not take it at that
+/// size.
+pub(crate) fn fit_conv(mut conv: Conv) -> Result<Conv, Error> {
+    let (y, x) = (conv.height, conv.width);
+    conv.height = fit_size(y, &[16, 32, 64]).ok_or("conv input too tall")?;
+    conv.width = fit_size(x, &[16, 32, 64]).ok_or("conv input too wide")?;
+    if (conv.height, conv.width) != (y, x) && conv.stride != 1 {
+        return Err("CONV_2D: padding the image is exact only for stride 1".into());
+    }
+    let (cin, cout, k2) = (conv.cin, conv.cout, conv.k * conv.k);
     if conv.check().is_err() && cin < 16 {
         // feed Cin as 16 channels: zero weights for the extra ones
-        let k2 = kh * kw;
         conv.weights = (0..cout * k2)
             .flat_map(|i| (0..16).map(move |c| (i, c)))
             .map(|(i, c)| {
@@ -885,4 +868,62 @@ fn conv_layer(model: &Model<'_>, op: &Operator<'_>, (y, x, cin): Shape) -> Resul
     }
     conv.check()?;
     Ok(conv)
+}
+
+/// A 2x2 stride-2 max pool on a `(y, x, c)` tensor.
+pub(crate) fn max_pool_layer((y, x, c): Shape, quant: Quant) -> Result<MaxPool, Error> {
+    let p = MaxPool {
+        height: fit_size(y, &[16, 32]).ok_or("pool input too tall")?,
+        width: fit_size(x, &[16, 32]).ok_or("pool input too wide")?,
+        c,
+        quant,
+    };
+    p.check()?;
+    Ok(p)
+}
+
+/// An add of two `(y, x, c)` tensors.
+pub(crate) fn add_layer(
+    (y, x, c): Shape,
+    a: Quant,
+    b: Quant,
+    output: Quant,
+    relu: bool,
+) -> Result<Add, Error> {
+    let add = Add {
+        height: fit_size(y, &[16, 32]).ok_or("add input too tall")?,
+        width: fit_size(x, &[16, 32]).ok_or("add input too wide")?,
+        c,
+        a,
+        b,
+        output,
+        relu,
+    };
+    add.check()?;
+    Ok(add)
+}
+
+impl Step {
+    /// The step running `layer` on `inputs` (checked to fit its program),
+    /// with its native on-chip form where the program pads.
+    pub(crate) fn new(
+        layer: Layer,
+        inputs: Vec<Input>,
+        output: i32,
+        output_shape: Shape,
+    ) -> Result<Step, Error> {
+        for (i, s) in inputs.iter().zip(layer.shapes().0) {
+            if len(s) < len(i.shape) {
+                return Err(format!("{layer:?}: input {:?} does not fit", i.shape).into());
+            }
+        }
+        let on_chip = layer.at_size(inputs[0].shape);
+        Ok(Step {
+            layer,
+            on_chip,
+            inputs,
+            output,
+            output_shape,
+        })
+    }
 }

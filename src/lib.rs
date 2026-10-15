@@ -9,6 +9,7 @@ pub mod parser;
 pub mod runner;
 #[allow(warnings)]
 pub mod schema_v3_generated;
+pub mod torch;
 pub mod usb;
 
 pub use parser::{

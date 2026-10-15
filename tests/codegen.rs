@@ -443,6 +443,7 @@ fn conv_matches_compiler() {
             input: quant(&e.input_layers[0]),
             output: quant(&e.output_layers[0]),
             relu,
+            pad_before: None,
         };
         let ours = conv.build().unwrap();
         for i in 0..2 {
@@ -844,6 +845,122 @@ fn resnet8_graph_matches_tflite() {
     }
 }
 
+/// The PyTorch front end on a hand-written JSON graph: int8 tensors to
+/// uint8, PyTorch's padding kept on the conv, a reshape aliasing its
+/// input, the add's inputs by tensor id, and errors naming the op.
+#[test]
+fn torch_json_front_end() {
+    use reef_infer::graph::{Graph, Layer};
+    let conv = |input: i32,
+                out: i32,
+                k: usize,
+                stride: usize,
+                pad: usize,
+                cin: usize,
+                cout: usize,
+                hw: usize| {
+        serde_json::json!({
+            "op": "conv", "inputs": [input], "output": out, "shape": [hw, hw, cout],
+            "scale": 0.05, "zero_point": -128 + out, "relu": out == 1,
+            "kernel": k, "stride": stride, "pad": pad,
+            "weights": (0..cout * k * k * cin).map(|i| (i % 7) as i64 - 3).collect::<Vec<_>>(),
+            "weight_scales": vec![0.01; cout], "bias": vec![100; cout],
+        })
+    };
+    let ops = vec![
+        conv(0, 1, 3, 1, 1, 32, 32, 16),
+        serde_json::json!({"op": "add", "inputs": [1, 0], "output": 2, "shape": [16, 16, 32],
+            "scale": 0.08, "zero_point": -100, "relu": false}),
+        conv(2, 3, 3, 2, 1, 32, 64, 8),
+        conv(2, 4, 1, 2, 0, 32, 64, 8),
+        serde_json::json!({"op": "reshape", "inputs": [4], "output": 5, "shape": [8, 8, 64],
+            "scale": 0.05, "zero_point": -124}),
+    ];
+    let graph = |ops: &[serde_json::Value], output: i32| {
+        serde_json::json!({
+            "format": "reef-graph", "version": 1,
+            "input": {"tensor": 0, "shape": [16, 16, 32], "scale": 0.03, "zero_point": -128},
+            "output": output, "ops": ops,
+        })
+        .to_string()
+    };
+    let g = Graph::from_torch_json(&graph(&ops, 5)).unwrap();
+    assert_eq!(g.steps.len(), 4);
+    assert_eq!(g.input.zero_point, 0); // int8 -128 -> uint8 0
+    assert_eq!(g.output_tensor, 4); // through the reshape
+    let Layer::Conv(c) = &g.steps[2].layer else {
+        panic!("step 2 is not a conv")
+    };
+    assert_eq!((c.stride, c.pad_before), (2, Some(1)));
+    assert_eq!(c.output.zero_point, -128 + 3 + 128);
+    assert!(matches!(&g.steps[1].layer, Layer::Add(a) if !a.relu));
+    let ins: Vec<i32> = g.steps[1].inputs.iter().map(|i| i.tensor).collect();
+    assert_eq!(ins, [1, 0]);
+    assert_eq!(g.reference(&vec![7; 16 * 16 * 32]).len(), 8 * 8 * 64);
+    // errors name the op
+    let mut bad = ops.clone();
+    bad[1]["op"] = "sigmoid".into();
+    let e = Graph::from_torch_json(&graph(&bad, 5))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("op 1") && e.contains("sigmoid"), "{e}");
+    let mut bad = ops.clone();
+    bad[2]["shape"] = serde_json::json!([7, 7, 64]);
+    let e = Graph::from_torch_json(&graph(&bad, 5))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("op 2 (conv)"), "{e}");
+}
+
+/// ResNet-8 from `tools/torch/resnet8.py` (skipped when absent): the
+/// PyTorch graph runs in one call (stride-2 convs with PyTorch's padding),
+/// and the host reference stays within one step of PyTorch's own int8
+/// model.
+#[test]
+fn resnet8_torch_matches_pytorch() {
+    use reef_infer::graph::{Graph, Layer, u8_to_i8};
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/cifar10");
+    let (Ok(images), Ok(logits), Ok(g)) = (
+        std::fs::read(dir.join("test_images.bin")),
+        std::fs::read(dir.join("resnet8_torch_logits.bin")),
+        Graph::from_torch(dir.join("resnet8_torch.json").to_str().unwrap()),
+    ) else {
+        eprintln!("target/cifar10/resnet8_torch.* not found (tools/torch/resnet8.py); skipping");
+        return;
+    };
+    let count = |f: fn(&Layer) -> bool| g.steps.iter().filter(|s| f(&s.layer)).count();
+    assert_eq!(count(|l| matches!(l, Layer::Conv(_))), 9);
+    assert_eq!(count(|l| matches!(l, Layer::Add(_))), 3);
+    let padded = count(
+        |l| matches!(l, Layer::Conv(c) if c.stride == 2 && c.k == 3 && c.pad_before == Some(1)),
+    );
+    assert_eq!(padded, 2);
+    assert_eq!(g.chains().unwrap(), vec![0..14]);
+    let (s, zp) = (g.input.scale, g.input.zero_point - 128);
+    let px = g.input_len();
+    let mut same = 0;
+    for i in 0..200 {
+        let x: Vec<u8> = images[px * i..px * (i + 1)]
+            .iter()
+            .map(|&p| {
+                (((p as f32 / 255.0 / s).round_ties_even() + zp as f32).clamp(-128.0, 127.0) as i8
+                    as i16
+                    + 128) as u8
+            })
+            .collect();
+        let y = u8_to_i8(&g.reference(&x));
+        let t = &logits[10 * i..10 * (i + 1)];
+        assert!(
+            y.iter()
+                .zip(t)
+                .all(|(a, b)| (*a as i32 - *b as i8 as i32).abs() <= 1),
+            "image {i}"
+        );
+        same += (y.iter().zip(t).all(|(a, b)| *a == *b as i8)) as usize;
+    }
+    assert!(same > 100, "{same} of 200 images exactly as PyTorch");
+}
+
 /// `chain::splice` joins programs into one: a single start / end frame,
 /// tile sequence numbers strictly increasing across the parts, and every
 /// relocation still on a `mov` immediate.
@@ -870,6 +987,7 @@ fn splice_keeps_programs_well_formed() {
             zero_point: 128,
         },
         relu: false,
+        pad_before: None,
     };
     let (a, b) = (conv(16, 32), conv(32, 16));
     let pa = a
@@ -947,6 +1065,7 @@ fn conv_chain_planning() {
             zero_point: 128,
         },
         relu: false,
+        pad_before: None,
     };
     let (a, b, c, d) = (
         conv(3, 1, 32, 16, 32),

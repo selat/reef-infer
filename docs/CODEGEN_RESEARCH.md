@@ -1137,3 +1137,49 @@ image** (`bench_compare`: 1.59 ms against the compiler's 0.97 ms, 1.6x).
 The MNIST CNN's first conv also takes its image unpadded: 5.02 ms per
 image (5.41).
 
+## PyTorch front end (2026-10-15)
+
+A PyTorch model reaches the generators without TFLite: `torch.export`,
+int8 post-training quantization with PT2E (`torchao` 0.18; PyTorch
+2.14 no longer ships it), and our own exporter.
+
+- **Quantizer** (`tools/torch/edgetpu_quant.py`, `EdgeTpuQuantizer`):
+  annotates the exported graph with what the TPU computes. Activations
+  int8 per tensor (asymmetric), weights int8 per output channel
+  (symmetric, -127..127), biases int32 at `s_in s_w` (a
+  `DerivedQuantizationSpec` from the input's and the weights' observers),
+  a ReLU after a conv / linear / add fused (the output is observed after
+  it), pools, flatten and views sharing their input's quantization. The
+  shared specs matter: without them a flatten gets its own observer and
+  the graph would requantize between the pool and the FC.
+- **Exporter** (`export_graph`): `convert_pt2e` leaves a regular graph,
+  every tensor a `quantize_per_tensor` node and every op reading
+  `dequantize` nodes, weights int8 with `dequantize_per_channel`. The
+  exporter walks it into a JSON graph (`reef-graph` v1): tensors
+  numbered, NHWC shapes, conv weights OHWI, an FC's weights permuted when
+  a flatten crossed C x H x W, the int8 zero points.
+- **Rust** (`src/torch.rs`, `Graph::from_torch`): builds the same steps
+  as the TFLite front end through shared helpers (`fit_conv`,
+  `add_layer`, `max_pool_layer`, `Step::new`), so chaining, the 8x8
+  forms and everything after apply unchanged.
+
+Two semantics differ from TFLite. PyTorch's `padding = 1` on a 3x3
+stride-2 conv pads one pixel before and none after (TensorFlow's same
+padding: none before, one after): `Conv::pad_before` (`Some(p)`: p
+before, what the output size needs after, clamped at 0 when the last
+pixels go unread, as for a 1x1 stride-2 conv) feeds the patch and halo,
+which already handle any side's padding; four shapes are bit-exact on
+the TPU, and 16x16 / 32x32 stride-2 convs chain with it. A global
+average pool keeps its input's quantization and rounds the mean half to
+even: the native pool with centre = zero point and multiplier 1 / 64 is
+exactly that.
+
+ResNet-8 in PyTorch (`tools/torch/resnet8.py`: the same network as the
+Keras one, PyTorch's usual padding, batch norm folded before export, 20
+epochs on the CPU in about 3.5 min): 79.7% float, 79.6% int8 in PyTorch.
+On the TPU in one call: **all 10000 test images bit-exact with the host
+reference, 1.61 ms per image**, 79.54% accuracy. Against PyTorch's own
+int8 model (its q / dq graph, which computes each conv in float between
+quantize steps) the logits differ by at most 1 on 2.2% of them and
+top-1 agrees on 9994 of 10000 (the TFLite model: 0.3% and 9998).
+

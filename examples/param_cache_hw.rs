@@ -72,6 +72,7 @@ fn conv(cin: usize, cout: usize, seed: u64) -> Conv {
             zero_point: 120,
         },
         relu: false,
+        pad_before: None,
     }
 }
 

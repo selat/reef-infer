@@ -138,6 +138,7 @@ fn main() {
             input: quant(&e.input_layers[0]),
             output: quant(&e.output_layers[0]),
             relu: p["act"] == "relu",
+            pad_before: None,
         };
         // 32 / 64 wide or tall images use our superpixel / band layout,
         // not the compiler's: compared only with --all-sizes

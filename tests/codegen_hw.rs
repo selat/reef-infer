@@ -251,7 +251,7 @@ async fn generated_programs_on_tpu() {
 
     // Convolutions with random weights: 1x1, and 3x3 (halo exchange, zero
     // point padding at the image border).
-    for (k, stride, height, width, cin, cout, relu, in_zp, out_zp) in [
+    for ((k, stride, height, width, cin, cout, relu, in_zp, out_zp), pad_before) in [
         (1, 1, 16, 16, 16, 32, false, 127, 131),
         (1, 1, 16, 16, 16, 32, true, 100, 0),
         (3, 1, 16, 16, 16, 32, false, 127, 130),
@@ -299,7 +299,20 @@ async fn generated_programs_on_tpu() {
         (3, 2, 16, 16, 32, 64, true, 0, 0),
         (1, 2, 16, 16, 32, 64, false, 0, 54),
         (1, 1, 16, 16, 32, 64, false, 128, 128),
-    ] {
+    ]
+    .into_iter()
+    .map(|c| (c, None))
+    // PyTorch's `padding = 1` on stride 2: 1 before, 0 after (TensorFlow:
+    // 0 before, 1 after)
+    .chain(
+        [
+            (3, 2, 32, 32, 16, 32, true, 0, 0),
+            (3, 2, 16, 16, 32, 64, true, 0, 0),
+            (3, 2, 16, 16, 16, 32, false, 120, 128),
+            (3, 2, 64, 32, 16, 32, false, 120, 130),
+        ]
+        .map(|c| (c, Some(1))),
+    ) {
         let w = bytes(&mut seed, cout * k * k * cin);
         let conv = Conv {
             cin,
@@ -322,6 +335,7 @@ async fn generated_programs_on_tpu() {
                 zero_point: out_zp,
             },
             relu,
+            pad_before,
         };
         let loaded = dev
             .load_params(Arc::new(conv.build().unwrap()))
@@ -334,7 +348,7 @@ async fn generated_programs_on_tpu() {
             let bad = got.iter().zip(&want).filter(|(a, b)| a != b).count();
             assert!(
                 bad == 0,
-                "conv k={k} s={stride} {height}x{width} Cin={cin} Cout={cout} relu={relu} zp {in_zp}/{out_zp}: {bad}/{} wrong",
+                "conv k={k} s={stride} {height}x{width} Cin={cin} Cout={cout} relu={relu} zp {in_zp}/{out_zp} pad {pad_before:?}: {bad}/{} wrong",
                 want.len()
             );
         }
@@ -391,6 +405,7 @@ async fn generated_programs_on_tpu() {
             zero_point: 120,
         },
         relu: false,
+        pad_before: None,
     };
     let (ua, uc) = (fc_a.wide_units(), conv.wide_units());
     let la = dev
@@ -453,6 +468,7 @@ async fn chained(dev: &mut Device, seed: &mut u64) {
             zero_point: zp.1,
         },
         relu,
+        pad_before: None,
     };
     let a = conv(seed, 16, 32, (100, 0), true);
     let b = conv(seed, 32, 16, (0, 130), false);
@@ -570,6 +586,7 @@ async fn residual(dev: &mut Device, seed: &mut u64) {
         input: i,
         output: o,
         relu,
+        pad_before: None,
     };
     let (q0, q1, q2, q3) = (q(0.03, 100), q(0.2, 0), q(0.15, 120), q(0.25, 10));
     let a = conv(seed, 16, 32, q0, q1, true);
@@ -667,6 +684,7 @@ async fn stage_8x8(dev: &mut Device, seed: &mut u64) {
         input: i,
         output: o,
         relu,
+        pad_before: None,
     };
     let (q0, q1, q2, q3, q4) = (
         q(0.03, 110),

@@ -106,7 +106,7 @@ top-1 as TFLite CPU. The items it did not need stay open.
 | Resize (nearest / bilinear) | FPN-style heads | corpus `misc_opresize_*` | M |
 | Reshape / transpose | general graphs | DMA loop nests; corpus `misc_opreshape`, `misc_optranspose` | M |
 | SSD post-processing | box decode, NMS | on the host (as libedgetpu does) | S |
-| PyTorch front end | `torch.export` int8 -> our op list | after the TFLite front end proves the mapping | L |
+| PyTorch front end | `torch.export` int8 -> our op list | **done (2026-10-15)**: PT2E with our `EdgeTpuQuantizer`, a JSON graph, `Graph::from_torch`; PyTorch's padding on stride-2 convs; ResNet-8 bit-exact in one call. Other ops (max pool, more shapes) follow the generators | L |
 
 ## Speed today (2026-10-15)
 

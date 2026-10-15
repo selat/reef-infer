@@ -55,6 +55,7 @@ fn conv(cin: usize, cout: usize, seed: u64, in_zp: i32, out_zp: i32) -> Conv {
             zero_point: out_zp,
         },
         relu: false,
+        pad_before: None,
     }
 }
 

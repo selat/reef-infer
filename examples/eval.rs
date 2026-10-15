@@ -1,16 +1,19 @@
 //! A test set end to end without `edgetpu_compiler`: an int8 `.tflite`
-//! from `tools/mnist/train.py` or `tools/cifar10/train.py` ->
+//! from `tools/mnist/train.py` or `tools/cifar10/train.py`, or a PyTorch
+//! model exported as a JSON graph (`tools/torch/resnet8.py`) ->
 //! `graph::Graph` -> generated layer programs.
 //!
 //!     cargo run --release --example eval -- [--dir target/mnist] [--model mlp|cnn] [--limit N] [--device]
 //!     cargo run --release --example eval -- --dir target/cifar10 --model resnet8 [--device]
+//!     cargo run --release --example eval -- --dir target/cifar10 --model resnet8_torch [--device]
 //!
-//! The directory holds `<model>.tflite`, `test_images.bin` (uint8 pixels),
-//! `test_labels.bin` and `<model>_tflite_logits.bin` (int8, 10 per image).
+//! The directory holds `<model>.tflite` and `<model>_tflite_logits.bin`, or
+//! `<model>.json` and `<model>_logits.bin` (the framework's int8 logits, 10
+//! per image), and `test_images.bin` (uint8 pixels) and `test_labels.bin`.
 //!
-//! Always: the host reference (bit-exact with the TPU) against TFLite's CPU
-//! logits over the test set. With `--device`: every image on the TPU,
-//! checked against the host reference byte for byte.
+//! Always: the host reference (bit-exact with the TPU) against the
+//! framework's CPU logits over the test set. With `--device`: every image
+//! on the TPU, checked against the host reference byte for byte.
 
 use reef_infer::graph::{Graph, i8_to_u8, u8_to_i8};
 use reef_infer::runner::Device;
@@ -33,7 +36,16 @@ async fn main() {
     };
 
     let name = opt("--model").unwrap_or("mlp".into());
-    let graph = Graph::from_tflite(&format!("{dir}/{name}.tflite")).unwrap();
+    // a TFLite model, or a PyTorch one exported as a JSON graph
+    // (tools/torch), each with the framework's own int8 logits
+    let tflite_path = format!("{dir}/{name}.tflite");
+    let (graph, framework, logits_file) = if std::path::Path::new(&tflite_path).exists() {
+        let g = Graph::from_tflite(&tflite_path).unwrap();
+        (g, "TFLite", format!("{name}_tflite_logits.bin"))
+    } else {
+        let g = Graph::from_torch(&format!("{dir}/{name}.json")).unwrap();
+        (g, "PyTorch", format!("{name}_logits.bin"))
+    };
     for (i, s) in graph.steps.iter().enumerate() {
         let ins: Vec<_> = s.inputs.iter().map(|i| i.shape).collect();
         println!(
@@ -46,10 +58,7 @@ async fn main() {
     let images = read("test_images.bin");
     let px = graph.input_len(); // bytes per image
     let labels = read("test_labels.bin");
-    let tflite: Vec<i8> = read(&format!("{name}_tflite_logits.bin"))
-        .iter()
-        .map(|&b| b as i8)
-        .collect();
+    let tflite: Vec<i8> = read(&logits_file).iter().map(|&b| b as i8).collect();
     let n = opt("--limit")
         .map(|s| s.parse().unwrap())
         .unwrap_or(labels.len())
@@ -85,10 +94,10 @@ async fn main() {
     }
     let pct = |c: usize| 100.0 * c as f64 / n as f64;
     println!("{n} images");
-    println!("  TFLite CPU accuracy:     {:.2}%", pct(cpu_ok));
+    println!("  {framework} CPU accuracy: {:>7.2}%", pct(cpu_ok));
     println!("  host reference accuracy: {:.2}%", pct(ours_ok));
     println!(
-        "  reference vs TFLite: {bytes_diff} of {} logits differ (max {max_diff}), top-1 agrees on {same_top1}",
+        "  reference vs {framework}: {bytes_diff} of {} logits differ (max {max_diff}), top-1 agrees on {same_top1}",
         10 * n
     );
 

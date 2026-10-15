@@ -98,6 +98,11 @@ pub struct Conv {
     pub input: Quant,
     pub output: Quant,
     pub relu: bool,
+    /// Padding before the image on each axis: `None` for TensorFlow's
+    /// same padding (the far side gets the extra pixel), `Some(p)` for
+    /// PyTorch's `padding = p` (p before, what the output size needs
+    /// after). Either way the output is `ceil(size / stride)` pixels.
+    pub pad_before: Option<usize>,
 }
 
 impl Conv {
@@ -149,6 +154,16 @@ impl Conv {
                 self.cin, self.cout, self.k, self.width
             ));
         }
+        if let Some(p) = self.pad_before {
+            let (_, after) = self.pad();
+            if p >= self.k || after >= self.k as i64 {
+                return Err(format!(
+                    "padding {p} before a {k}x{k} stride-{s} window leaves {after} after",
+                    k = self.k,
+                    s = self.stride
+                ));
+            }
+        }
         if self.weights.len() != self.cout * self.k * self.k * self.cin
             || self.w_scale.len() != self.cout
             || self.bias.len() != self.cout
@@ -165,7 +180,11 @@ impl Conv {
         let (n, k, s) = (HW.0 as i64, self.k as i64, self.stride as i64);
         let out = (n + s - 1) / s;
         let total = ((out - 1) * s + k - n).max(0);
-        (total / 2, total - total / 2)
+        match self.pad_before {
+            None => (total / 2, total - total / 2),
+            // (a negative remainder: the last pixels are never read)
+            Some(p) => (p as i64, ((out - 1) * s + k - n - p as i64).max(0)),
+        }
     }
 
     /// Pixels per superpixel: a row of `width` pixels is loaded as 16

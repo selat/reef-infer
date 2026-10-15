@@ -67,6 +67,7 @@ async fn main() {
                 zero_point: 128,
             },
             relu: false,
+            pad_before: None,
         };
         let model = match conv.build_unchecked() {
             Ok(m) => m,

@@ -35,4 +35,15 @@ dev = [
     "numpy",
     "pillow",
     "opencv-python",
+    "torch>=2.8.0",
+    "torchao>=0.18.0",
 ]
+
+# PyTorch front end (tools/torch): the CPU build is enough
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
