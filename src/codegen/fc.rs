@@ -176,16 +176,38 @@ impl Fc {
 
     /// Builds the PARAMETER_CACHING and EXECUTION_ONLY executables.
     pub fn build(&self) -> Result<TfliteModel, Box<dyn std::error::Error>> {
-        self.build_with(self.parameters())
+        self.build_at(0)
+    }
+
+    /// [`Fc::build`] with the parameters cached from wide address `base`
+    /// (64 B units, a whole number of 256 B rows) instead of 0, so that
+    /// several layers' parameters can stay cached at once.
+    pub fn build_at(&self, base: i64) -> Result<TfliteModel, Box<dyn std::error::Error>> {
+        self.build_with_at(self.parameters(), base)
+    }
+
+    /// Wide address units (64 B) the parameters take on each compute tile
+    /// from their base: the 3 header rows and a row per 4 inputs.
+    pub fn wide_units(&self) -> i64 {
+        4 * (3 + self.k as i64 / 4)
     }
 
     /// [`Fc::build`] with a caller-supplied parameter blob (for experiments).
     pub fn build_with(&self, params: Vec<u8>) -> Result<TfliteModel, Box<dyn std::error::Error>> {
+        self.build_with_at(params, 0)
+    }
+
+    fn build_with_at(
+        &self,
+        params: Vec<u8>,
+        base: i64,
+    ) -> Result<TfliteModel, Box<dyn std::error::Error>> {
         self.check()?;
+        check_base(base)?;
         let caching = ExecInfo {
             exec_type: ExecutableType::PARAMETER_CACHING,
             parameters: params.clone(),
-            instruction_chunks: vec![self.caching_program(params.len())?],
+            instruction_chunks: vec![self.caching_program(params.len(), base)?],
             input_layers: vec![],
             output_layers: vec![],
             scratch_size_bytes: 0,
@@ -207,7 +229,7 @@ impl Fc {
         let exec = ExecInfo {
             exec_type: ExecutableType::EXECUTION_ONLY,
             parameters: vec![],
-            instruction_chunks: vec![self.execution_program()?],
+            instruction_chunks: vec![self.execution_program(base)?],
             input_layers: vec![layer("input", (1, 1, self.k), self.input)],
             output_layers: vec![output],
             scratch_size_bytes: 0,
@@ -217,14 +239,17 @@ impl Fc {
         })
     }
 
-    /// Streams each compute tile's parameter blob into its wide memory.
-    fn caching_program(&self, bytes: usize) -> Result<ChunkInfo, IsaError> {
+    /// Streams each compute tile's parameter blob into its wide memory from
+    /// `base`: header rows at `base`, `base + 4`, `base + 8`, weights from
+    /// `base + 12` (the consumer's `addr` is 2 above where its rows land,
+    /// as in conv).
+    fn caching_program(&self, bytes: usize, base: i64) -> Result<ChunkInfo, IsaError> {
         let kq = (self.k / 4) as i64;
         let tiles = self.out_tiles();
         let consumer = |t: usize| {
             vec![
                 ("tile_mask", 1i64 << t),
-                ("addr", 0xe),
+                ("addr", base + 0xe),
                 ("inc0", 1),
                 ("cnt0", kq - 1),
                 ("inc1", -(kq - 1)),
@@ -232,7 +257,8 @@ impl Fc {
                 ("inc3", -(kq - 1)),
                 ("sdims", 1),
                 ("aux_en0", 1),
-                ("aux_addr1", 8),
+                ("aux_addr0", base),
+                ("aux_addr1", base + 8),
                 ("aux_en1", 1),
                 // unexplained bits, set by the compiler with aux_en0/aux_en1
                 ("rsv286", 2),
@@ -248,7 +274,7 @@ impl Fc {
         a.finish()
     }
 
-    fn execution_program(&self) -> Result<ChunkInfo, IsaError> {
+    fn execution_program(&self, base: i64) -> Result<ChunkInfo, IsaError> {
         let k = self.k as i64;
         let kq = k / 4;
         let nq = self.tile_n().div_ceil(4) as i64;
@@ -456,11 +482,13 @@ impl Fc {
         a.emit(OP_SCSYNC, &[("sunits", 0xc)])?;
         sync(&mut a, 0x1ffff, 0x3ff, false)?;
 
-        // ── Per-channel multipliers / biases: wide 0 -> scaling memory (mode 2).
+        // ── Per-channel multipliers / biases: wide `base` -> scaling memory
+        // (mode 2).
         a.emit(
             OP_WIDE_TO_NARROW,
             &[
                 ("tile_mask", cmask),
+                ("wide_addr", base),
                 ("w_inc0", 1),
                 ("w_lim0", 1),
                 ("w_inc1", -1),
@@ -508,7 +536,7 @@ impl Fc {
             ("out_inc2", 1),
             ("out_mode7", 3),
             ("out_tflags", 1),
-            ("par_base", 0xc), // weights start after the 768 B header
+            ("par_base", base + 0xc), // weights start after the 3 header rows
             ("par_inc0", 1),
             ("par_cnt0", kq - 1),
             ("par_mode7", 1),
@@ -520,9 +548,9 @@ impl Fc {
             ("cfg2", 7),
             ("cfg3", 8),
             ("in_zp", self.input.zero_point as i64),
-            ("row_a", 2), // wide row of the weight zero points
+            ("row_a", base / 4 + 2), // wide row of the weight zero points
             ("row_m", 1),
-            ("row_c", 2),
+            ("row_c", base / 4 + 2),
             ("dp_mode", 1),
             ("reduce_mask", 1),
             ("out_ch_last", 4 * nq - 1),

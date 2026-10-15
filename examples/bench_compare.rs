@@ -6,9 +6,9 @@
 //! Needs `<model>.tflite` (with static shapes) and `<model>_edgetpu.tflite`
 //! (`edgetpu_compiler -s <model>.tflite`) next to the test set of
 //! `examples/eval.rs`. Reports, per image: the compiled model (weights
-//! cached once), our layer programs as `Graph::run` runs them (every layer
-//! reloads its weights), and a per-layer breakdown of ours into weight
-//! loading and inference with the weights already cached.
+//! cached once), our layer programs as `Graph::run` runs them (every
+//! layer's weights cached once, each at its own wide address), and a
+//! per-layer breakdown of ours into weight loading and inference.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -100,32 +100,32 @@ async fn main() {
         10 * n
     );
 
-    // ── Ours, as Graph::run runs it.
+    // ── Ours, as Graph::run runs it (after the compiled model's weights,
+    // so load ours again).
     let (mut ok, mut same_tflite, mut diff_bytes, mut not_ref) = (0, 0, 0, 0);
+    let t = Instant::now();
+    let ours = graph.load(&mut dev, &programs).await.unwrap();
+    let ours_load_ms = t.elapsed().as_secs_f64() * 1e3;
     for x in inputs.iter().take(3) {
-        graph.run(&mut dev, &programs, x).await.unwrap(); // warm-up
+        graph.run(&mut dev, &ours, x).await.unwrap(); // warm-up
     }
+    let refs: Vec<Vec<u8>> = inputs.iter().map(|x| graph.reference(x)).collect();
     let t = Instant::now();
     for (i, x) in inputs.iter().enumerate() {
-        let y = graph.run(&mut dev, &programs, x).await.unwrap();
-        not_ref += (y != graph.reference(x)) as usize;
+        let y = graph.run(&mut dev, &ours, x).await.unwrap();
+        not_ref += (y != refs[i]) as usize;
         let y = u8_to_i8(&y);
         let tl = &tflite[10 * i..10 * (i + 1)];
         ok += (argmax(&y) == labels[i] as usize) as usize;
         same_tflite += (argmax(&y) == argmax(tl)) as usize;
         diff_bytes += y.iter().zip(tl).filter(|(a, b)| a != b).count();
     }
-    // (the host reference check is inside the timed loop; time it alone)
-    let t_ref = Instant::now();
-    for x in &inputs {
-        std::hint::black_box(graph.reference(x));
-    }
-    let ref_ms = t_ref.elapsed().as_secs_f64() * 1e3 / n as f64;
-    let ours_ms = t.elapsed().as_secs_f64() * 1e3 / n as f64 - ref_ms;
+    let ours_ms = t.elapsed().as_secs_f64() * 1e3 / n as f64;
     println!(
-        "\nours ({} programs through the host, every layer reloads its weights):",
+        "\nours ({} programs through the host, weights cached once):",
         programs.len()
     );
+    println!("  weight load once:  {ours_load_ms:.2} ms");
     println!(
         "  per image:         {ours_ms:.3} ms  ({:.0} images/s)",
         1e3 / ours_ms
@@ -176,7 +176,7 @@ async fn main() {
     }
     println!("  {:<38} {sum_load:>10.3} {sum_infer:>12.3}", "total");
     println!(
-        "\nsummary: compiled {comp_ms:.2} ms / image; ours {ours_ms:.2} ms ({:.1}x), of which {sum_infer:.2} ms is inference with cached weights ({:.1}x the compiled model)",
+        "\nsummary: compiled {comp_ms:.2} ms / image; ours {ours_ms:.2} ms ({:.1}x), of which {sum_infer:.2} ms is the layers' calls ({:.1}x the compiled model) and the rest host glue",
         ours_ms / comp_ms,
         sum_infer / comp_ms
     );

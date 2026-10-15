@@ -14,7 +14,7 @@ the findings.
 | FC (`fc`) | K <= 2048 or 3073-4096 (multiple of 8, input spread over tiles and gathered), N 4-64 or 64 per tile up to 1024 | byte-identical (31 corpus models), on device |
 | MAX_POOL_2D (`pool`) | 2x2 stride 2 valid; H, W 16 / 32; C 32 / 64 / 128 | byte-identical (5 corpus models), on device |
 | ADD (`add`) | two equal-shape inputs, requantized, fused RELU; H, W 16 / 32; image row 512 / 1024 / 2048 B | byte-identical (8 corpus models), on device |
-| Front end (`graph`) | CPU int8 `.tflite` as a DAG: CONV_2D, MAX_POOL_2D, ADD, global AVERAGE_POOL_2D (as an FC), FC, RESHAPE; host pads / crops between layers | MNIST MLP (97.35%), CNN (98.66%) and CIFAR-10 ResNet-8 (75.22%) on device, bit-exact with the host reference |
+| Front end (`graph`) | CPU int8 `.tflite` as a DAG: CONV_2D, MAX_POOL_2D, ADD, global AVERAGE_POOL_2D (8x8x64 native, else as an FC), FC, RESHAPE; host pads / crops between layers; every layer's parameters cached once at its own wide address | MNIST MLP (97.35%), CNN (98.66%) and CIFAR-10 ResNet-8 (75.22%) on device, bit-exact with the host reference |
 | CONV_2D (`conv`) | same padding; k 1 / 3; stride 1 / 2; 16x16 with Cin 1-128 (k 3), up to 64x64 with Cin >= 16; Cout 8-32 | byte-identical at 16x16, on device up to 64x64 |
 | Loopback broadcast | tile -> scalar memory -> all tiles | on device |
 
@@ -82,7 +82,7 @@ top-1 as TFLite CPU. The items it did not need stay open.
 | Conv Cout 64-256 | wider layers | Cout 64 done (Cin >= 32, 16x16; 1x1 Cin 32 in two passes); 128-256: compiler uses `loop3` 64-channel blocks | M |
 | Conv Cin 8 | odd widths in small nets | the 18-weight-row scheme seen in the corpus; open | S-M |
 | Valid padding | many Keras models | corpus models use 12-38 TensorOps (edge tiles special-cased); our own: no halo fill, smaller output; open | M |
-| Global average pool / MEAN | classifier heads | **done as an FC lowering** (sum per channel, TFLite's rounding, bit-exact); the compiler's own program (a mesh reduction across tiles, 127 instructions) is not decoded | M |
+| Global average pool / MEAN | classifier heads | **done for 8x8x64** (`codegen::avg_pool`): the compiler's mesh reduction into tile 0, byte-identical, no parameters, with TFLite's rounding; other shapes still lowered to an FC (sum per channel, bit-exact) | M |
 | Output > 2 KiB per tile | larger feature maps | wide staging above 0x207f untested; or produce in chunks | S-M |
 | Images > 64x64 (32x32 done) | 96-128 px inputs | patch memory per tile grows; needs a capacity model (experiment: largest patch that runs) | M |
 
@@ -108,17 +108,21 @@ top-1 as TFLite CPU. The items it did not need stay open.
 | SSD post-processing | box decode, NMS | on the host (as libedgetpu does) | S |
 | PyTorch front end | `torch.export` int8 -> our op list | after the TFLite front end proves the mapping | L |
 
-## Speed today (2026-10-14)
+## Speed today (2026-10-15)
 
 ResNet-8 on CIFAR-10, same `.tflite` and TPU (`examples/bench_compare.rs`):
-`edgetpu_compiler` 0.96 ms per image, ours 32.4 ms (14 programs, every
-layer reloading its parameters; 14.5 ms with parameters resident). The gap
-is per-call overhead, so items 1 and 4 below matter most.
+`edgetpu_compiler` 0.97 ms per image, ours 14.8 ms (14 programs, every
+layer's parameters cached once at its own wide address; 25.6 ms when every
+layer reloaded them). The 14 calls take all of it: the remaining gap is
+per-call overhead (instructions and activations over USB per layer), so
+item 4 below matters most.
 
 ## Cross-cutting, in order of when they start to matter
 
-1. **Parameter cache placement** (milestone 0 experiment): needed as soon
-   as two layers exist.
+1. ~~**Parameter cache placement**~~: done (2026-10-15). Each layer's
+   parameters at their own wide address range (4 units per row), all
+   cached once; verified on the TPU (`examples/param_cache_hw.rs`).
+   Tile-shifted placement is not needed below ~480 KiB per tile.
 2. **Memory capacity model** (milestone 3): narrow / wide / partial-sum
    sizes per tile, from hardware experiments (largest patch, largest
    partial-sum area, wide addresses above 0x207f). Turns size checks from

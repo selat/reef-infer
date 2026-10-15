@@ -1,5 +1,6 @@
 //! Builds `codegen::pool` programs for the corpus MAX_POOL_2D models it
-//! supports and diffs them against the compiler's, field by field.
+//! supports, and `codegen::avg_pool` for the global average pool, and diffs
+//! them against the compiler's, field by field.
 //!
 //!     cargo run --example pool_check -- [filter] [--all-diffs]
 //!
@@ -8,6 +9,7 @@
 use std::path::PathBuf;
 
 use reef_infer::codegen::Quant;
+use reef_infer::codegen::avg_pool::GlobalAvgPool;
 use reef_infer::codegen::pool::MaxPool;
 use reef_infer::isa;
 use reef_infer::model::{ExecInfo, LayerInfo, TfliteModel, load_tflite_model};
@@ -76,7 +78,7 @@ fn main() {
         .find(|a| !a.starts_with("--"))
         .cloned()
         .unwrap_or_default();
-    let max = if args.iter().any(|a| a == "--all-diffs") {
+    let max_diffs = if args.iter().any(|a| a == "--all-diffs") {
         usize::MAX
     } else {
         8
@@ -98,7 +100,9 @@ fn main() {
         )
         .unwrap();
         let get = |k: &str| p[k].as_u64().unwrap() as usize;
-        if p["op"] != "max" || p["pad"] != "valid" || get("size") != 2 || get("stride") != 2 {
+        let global = p["op"] == "avg" && get("size") == get("H") && get("size") == get("W");
+        let max = p["op"] == "max" && p["pad"] == "valid" && get("size") == 2 && get("stride") == 2;
+        if !(global || max) {
             continue;
         }
         let compiled: TfliteModel = load_tflite_model(
@@ -109,19 +113,36 @@ fn main() {
         )
         .unwrap();
         let e = &compiled.executables[0];
-        let pool = MaxPool {
-            height: get("H"),
-            width: get("W"),
-            c: get("C"),
-            quant: quant(&e.input_layers[0]),
+        let q = quant(&e.input_layers[0]);
+        let ours = if global {
+            // the compiler's form: centred on the zero point, mult 1 / n
+            let pool = GlobalAvgPool {
+                height: get("H"),
+                width: get("W"),
+                c: get("C"),
+                center: q.zero_point,
+                mult: 1.0 / (get("H") * get("W")) as f32,
+                quant: q,
+            };
+            if pool.check().is_err() {
+                continue;
+            }
+            pool.build().unwrap().into_model()
+        } else {
+            let pool = MaxPool {
+                height: get("H"),
+                width: get("W"),
+                c: get("C"),
+                quant: q,
+            };
+            if pool.check().is_err() {
+                continue;
+            }
+            pool.build().unwrap().into_model()
         };
-        if pool.check().is_err() {
-            continue;
-        }
         total += 1;
-        let ours = pool.build().unwrap().into_model();
         let mut report = Vec::new();
-        if let Some(d) = diff(&ours.executables[0], e, max) {
+        if let Some(d) = diff(&ours.executables[0], e, max_diffs) {
             report.push(format!(" {:?}:\n{d}", e.exec_type));
         }
         let lay = |m: &ExecInfo| format!("{:?}", m.output_layers[0].output_layout);

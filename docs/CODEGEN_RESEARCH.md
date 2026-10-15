@@ -867,3 +867,80 @@ top-1 on one image.
 Closing the gap, in order: per-layer parameter placement (-10.6 ms), a
 native global average pool, then several layers per program with
 activations kept on chip (the only way to approach 1 ms).
+
+(Correction, 2026-10-15: the 32.4 ms included one host-reference pass per
+image, about 6.5 ms; `bench_compare` read its clock after timing the
+reference separately. `eval` measured the same code at 25.6 ms, and host
+glue is under 0.1 ms, not 7 ms.)
+
+## Parameter placement and a native average pool (2026-10-15)
+
+**Placement.** Wide memory addresses are 64 B units, a 256 B row is 4 of
+them (`row_a` 0x7ff is address 0x1ffc), and every generator keeps its own
+wide buffers above 0x1e00 (conv weight slots from 0x1e60, staging from
+0x2000). `Fc::build_at(base)` / `Conv::build_at(base)` move a layer's
+cached parameters up by `base` units (a whole row):
+
+- FC: caching ringConsumer `addr` 0xe + base, `aux_addr0` base,
+  `aux_addr1` 8 + base; header wideToNarrow `wide_addr` base; TensorOp
+  `par_base` 0xc + base, `row_a` / `row_c` 2 + base / 4.
+- Conv: caching ringConsumer `addr` 2 + base; the multicast ringProducer
+  reads from `addr` base. (In both, the caching consumer's `addr` is 2
+  above where its rows land.)
+
+`examples/param_cache_hw.rs`, on the TPU, each case loading layers one
+after the other and then running all of them: two FCs (one on 2 tiles),
+two convs, FC + conv + FC packed back to back, and bases 0x1000 / 0x1d74
+are all exact after every load. Two layers at base 0 still overwrite each
+other. **A parameter row takes 4 units** (256 B) even when it holds less:
+packing an FC 1024 x 64 or a conv 64 -> 32 at one unit per row corrupts
+it (2-3 units per row untested). So `wide_units` = 4 x (3 header rows +
+weight rows) per tile, and `Graph::build` places the layers one after the
+other from 0 (ResNet-8: 0x7a8 of 0x1e00 units, 122.5 KiB), `Graph::load` caches them
+all once and `Graph::run` sends only instructions and activations.
+
+**Global average pool** (`codegen::avg_pool`, ResNet-8's 8x8x64 head),
+decoded from `pool_C64_H8_W8_opavg_padvalid_size8_stride8`. **Byte-identical
+to 16.0** (output layout included; no parameters) and bit-exact on the TPU.
+The program:
+
+1. The band loader with a 2x2 patch per tile (staging at narrow 0, patch at
+   0x1000). It has no `counters 0x800` sync after the input descriptor at
+   256 B per tile; `band::load` now emits it only above 256 B (pool / add
+   unchanged).
+2. Column gather (mesh north, 0x17): row-0 tiles copy their patch to 0x1100
+   through wide 0x2034 and receive the tiles below at 0x1200 / 0x1300 /
+   0x1400. Tiles in between forward through a one-slot buffer at 0x1500;
+   a forwarder `hop` tiles from the sender has sync records `s0_val` =
+   256 (hop - 1) + 4, `s1_val` = 256 hop - 4 (ids 0xa / 0xe). The
+   compiler orders the moves: all columns at distance 1, then distance 2's
+   sends, then per column the rest.
+3. Row gather (mesh west, 0x16): tile 0 spreads its own 1 KiB column block
+   into an 8x8 image at narrow 0 (through wide 0x2034, rows of 2 pixels at
+   a 512 B stride) and receives tiles 1-3's blocks at x = 2, 4, 6 of every
+   row (forwarding at 0x1510, records 1 KiB (hop - 1) + 4 / 1 KiB hop - 4,
+   ids 8 / 0x14).
+4. A mesh fill puts the word 1 at 0x1520; the max pool's regroup moves the
+   image into 16 wide words of 4 pixels at 0x2040 (plus undecoded
+   narrowToWide bits 554-756, copied).
+5. One TensorOp on tile 0 with the pool op's `cfg0` 0x127 and an 8x8 window
+   (`loop0` / `loop1` 7): the image on the parameter path minus `w_zp`,
+   times the input word 1, summed over the window; `mult` 1 / 64, `out_zp`
+   = `w_zp` = the zero point. Tile 0 outfeeds 64 B.
+
+The compiler's `mult` 1 / 64 rounds ties to even, where TFLite rounds the
+raw sum / 64 half away from zero; that is most of its 800 differing logits.
+`GlobalAvgPool::tflite` centres on 128 (int8) or 0 (uint8) and takes the
+smallest f32 above 1 / 64 that reproduces TFLite's rounding for every sum
+(`avg_pool::exact_multiplier`, also used by the FC lowering, which stays
+for other shapes). ResNet-8's host reference is unchanged (same 334 of
+100000 logits from TFLite as with the FC).
+
+**Results** (ResNet-8, same TPU and images): all 10000 test images on the
+TPU bit-exact with the host reference, 14.8 ms per image (`eval`; 25.6 ms
+before on the same 1000 images). `bench_compare`: compiled 0.97 ms, ours
+14.8 ms; parameters load once in 4.6 ms (2.2 ms for the compiled model);
+the 14 calls alone take 14.7 ms (the average pool 0.55 ms instead of an FC
+with a 263 KB blob), so what remains is per-call overhead: instructions and
+activations over USB for every layer. MNIST MLP 3.8 -> 0.85 ms, CNN 5.4 ms,
+both bit-exact on all 10000 images.

@@ -9,13 +9,20 @@
 //!   bundled schema and assumed 1);
 //! - MAX_POOL_2D 2x2, stride 2;
 //! - ADD of two equal-shape tensors (fused NONE / RELU);
-//! - AVERAGE_POOL_2D over the whole image (global), lowered to an FC that
-//!   sums each channel's pixels and rounds exactly as TFLite does;
+//! - AVERAGE_POOL_2D over the whole image (global): 8x8x64 natively
+//!   (`codegen::avg_pool`, a mesh reduction with no parameters), other
+//!   shapes lowered to an FC that sums each channel's pixels; both round
+//!   exactly as TFLite does;
 //! - RESHAPE (free in NHWC). Ops computing a reshape's int32 shape (SHAPE,
 //!   STRIDED_SLICE, PACK, ...) are skipped.
 //!
 //! Activations are uint8 on the TPU: TFLite's int8 tensors map to uint8 by
 //! adding 128 to the values and the zero point. Weights stay int8.
+//!
+//! Parameters stay cached on the chip: [`Graph::build`] gives every layer
+//! with parameters its own range of wide memory (consecutive from address
+//! 0, [`Layer::wide_units`] each), so [`Graph::load`] caches all of them
+//! once and [`Graph::run`] only sends instructions and activations.
 //!
 //! Host glue between layers: the generators cover image sizes 16 / 32 /
 //! 64, so the host pads an activation at the bottom / right with its zero
@@ -29,13 +36,14 @@ use std::sync::Arc;
 
 use std::collections::HashMap;
 
-use crate::codegen::Quant;
 use crate::codegen::add::Add;
+use crate::codegen::avg_pool::{GlobalAvgPool, exact_multiplier};
 use crate::codegen::conv::Conv;
 use crate::codegen::fc::Fc;
 use crate::codegen::pool::MaxPool;
+use crate::codegen::{PARAM_WIDE_LIMIT, Quant};
 use crate::model::TfliteModel;
-use crate::runner::{Device, DeviceError};
+use crate::runner::{Device, DeviceError, LoadedParams};
 use crate::schema_v3_generated::tflite::{
     ActivationFunctionType, BuiltinOperator, Model, Operator, Padding, TensorType, root_as_model,
 };
@@ -56,16 +64,33 @@ pub enum Layer {
     Fc(Fc),
     Conv(Conv),
     MaxPool(MaxPool),
+    AvgPool(GlobalAvgPool),
     Add(Add),
 }
 
 impl Layer {
     pub fn build(&self) -> Result<TfliteModel, Box<dyn std::error::Error>> {
+        self.build_at(0)
+    }
+
+    /// The program with its parameters (if any) cached from wide address
+    /// `base` (64 B units).
+    pub fn build_at(&self, base: i64) -> Result<TfliteModel, Box<dyn std::error::Error>> {
         match self {
-            Layer::Fc(f) => f.build(),
-            Layer::Conv(c) => c.build(),
+            Layer::Fc(f) => f.build_at(base),
+            Layer::Conv(c) => c.build_at(base),
             Layer::MaxPool(p) => Ok(p.build()?.into_model()),
+            Layer::AvgPool(p) => Ok(p.build()?.into_model()),
             Layer::Add(a) => Ok(a.build()?.into_model()),
+        }
+    }
+
+    /// Wide memory (64 B units per tile) its cached parameters take.
+    pub fn wide_units(&self) -> i64 {
+        match self {
+            Layer::Fc(f) => f.wide_units(),
+            Layer::Conv(c) => c.wide_units(),
+            Layer::MaxPool(_) | Layer::AvgPool(_) | Layer::Add(_) => 0,
         }
     }
 
@@ -76,6 +101,7 @@ impl Layer {
             Layer::Fc(f) => f.reference(&x[0]),
             Layer::Conv(c) => c.reference(&x[0]),
             Layer::MaxPool(p) => p.reference(&x[0]),
+            Layer::AvgPool(p) => p.reference(&x[0]),
             Layer::Add(a) => a.reference(&x[0], &x[1]),
         }
     }
@@ -92,6 +118,7 @@ impl Layer {
                 )
             }
             Layer::MaxPool(p) => (vec![(p.height, p.width, p.c)], p.out_shape()),
+            Layer::AvgPool(p) => (vec![(p.height, p.width, p.c)], (1, 1, p.c)),
             Layer::Add(a) => {
                 let sh = (a.height, a.width, a.c);
                 (vec![sh, sh], sh)
@@ -311,7 +338,12 @@ impl Graph {
                     {
                         return Err("AVERAGE_POOL_2D: only global pools, same quantization".into());
                     }
-                    Layer::Fc(average_fc(y * x, c)?)
+                    let int8 = tensors.get(ins[0] as usize).type_() == INT8;
+                    match GlobalAvgPool::tflite(y, x, c, tq(ins[0])?, int8) {
+                        Ok(p) => Layer::AvgPool(p),
+                        Err(_) if int8 => Layer::Fc(average_fc(y * x, c)?),
+                        Err(e) => return Err(e.into()),
+                    }
                 }
                 BuiltinOperator::ADD => {
                     let o = op
@@ -386,27 +418,65 @@ impl Graph {
         acts.remove(&self.output_tensor).unwrap()
     }
 
-    /// Builds every layer's program.
+    /// Wide address (64 B units) of each step's cached parameters: the
+    /// layers one after the other from 0.
+    pub fn wide_bases(&self) -> Result<Vec<i64>, Error> {
+        let mut next = 0;
+        let bases = self
+            .steps
+            .iter()
+            .map(|s| {
+                let base = next;
+                next += s.layer.wide_units();
+                base
+            })
+            .collect();
+        if next > PARAM_WIDE_LIMIT {
+            return Err(format!(
+                "parameters need {next:#x} wide units per tile, {PARAM_WIDE_LIMIT:#x} available"
+            )
+            .into());
+        }
+        Ok(bases)
+    }
+
+    /// Builds every layer's program, each with its parameters at its own
+    /// wide address ([`Graph::wide_bases`]).
     pub fn build(&self) -> Result<Vec<Arc<TfliteModel>>, Error> {
         self.steps
             .iter()
-            .map(|s| Ok(Arc::new(s.layer.build()?)))
+            .zip(self.wide_bases()?)
+            .map(|(s, base)| Ok(Arc::new(s.layer.build_at(base)?)))
             .collect()
     }
 
-    /// Runs `programs` (from [`Graph::build`]) on the TPU, uint8 in and
-    /// out. Every layer reloads its parameters: the layers' parameter
-    /// blobs share tile wide memory from address 0.
-    pub async fn run(
+    /// Caches every layer's parameters on the TPU (programs from
+    /// [`Graph::build`]). They stay valid until another model's parameters
+    /// are loaded.
+    pub async fn load(
         &self,
         dev: &mut Device,
         programs: &[Arc<TfliteModel>],
+    ) -> Result<Vec<LoadedParams>, DeviceError> {
+        let mut loaded = Vec::with_capacity(programs.len());
+        for p in programs {
+            loaded.push(dev.load_params(Arc::clone(p)).await?);
+        }
+        Ok(loaded)
+    }
+
+    /// Runs the layers loaded by [`Graph::load`] on the TPU, uint8 in and
+    /// out.
+    pub async fn run(
+        &self,
+        dev: &mut Device,
+        loaded: &[LoadedParams],
         x: &[u8],
     ) -> Result<Vec<u8>, DeviceError> {
         let mut acts: HashMap<i32, Vec<u8>> = HashMap::from([(self.input_tensor, x.to_vec())]);
-        for (s, p) in self.steps.iter().zip(programs) {
+        for (s, p) in self.steps.iter().zip(loaded) {
             let ins: Vec<&[u8]> = s.inputs.iter().map(|i| &acts[&i.tensor][..]).collect();
-            let y = dev.run_model(Arc::clone(p), s.fit(&ins).concat()).await?;
+            let y = dev.run_inference(p, s.fit(&ins).concat()).await?;
             acts.insert(s.output, s.crop(&y));
         }
         Ok(acts.remove(&self.output_tensor).unwrap())
@@ -425,31 +495,9 @@ fn average_fc(n: usize, c: usize) -> Result<Fc, Error> {
         scale: 1.0,
         zero_point: 128,
     };
-    let tflite = |sum: i64| {
-        let n = n as i64;
-        if sum > 0 {
-            (sum + n / 2) / n
-        } else {
-            (sum - n / 2) / n
-        }
-    };
-    let mut m = (1.0 / (127.0 * n as f64)) as f32;
-    let fits = |m: f32| {
-        (-128 * n as i64..=127 * n as i64).all(|sum| {
-            let v = ((127 * sum) as f32 * m)
-                .clamp(-128.0, 127.0)
-                .round_ties_even();
-            v as i64 == tflite(sum)
-        })
-    };
-    let mut tries = 0;
-    while !fits(m) {
-        m = f32::from_bits(m.to_bits() + 1);
-        tries += 1;
-        if tries > 1000 {
-            return Err(format!("average pool over {n} pixels: no exact multiplier").into());
-        }
-    }
+    let ni = n as i64;
+    let m = exact_multiplier(ni, 127, -128 * ni..=127 * ni, -128.0, 127.0)
+        .ok_or(format!("average pool over {n} pixels: no exact multiplier"))?;
     let k = n * c;
     let fc = Fc {
         k,

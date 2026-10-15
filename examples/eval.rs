@@ -97,10 +97,11 @@ async fn main() {
     }
     let programs = graph.build().unwrap();
     let mut dev = Device::open().await.expect("no Edge TPU");
+    let loaded = graph.load(&mut dev, &programs).await.unwrap();
     let (mut tpu_ok, mut mismatched) = (0, 0);
     let t0 = std::time::Instant::now();
     for (i, (x, want)) in refs.iter().enumerate() {
-        let y = match graph.run(&mut dev, &programs, x).await {
+        let y = match graph.run(&mut dev, &loaded, x).await {
             Ok(y) => u8_to_i8(&y),
             Err(e) => panic!("image {i}: {e:?} after {:.1} s", t0.elapsed().as_secs_f64()),
         };
@@ -132,6 +133,7 @@ fn summary(l: &reef_infer::graph::Layer) -> String {
             c.k, c.k, c.cin, c.cout, c.height, c.width, c.relu
         ),
         Layer::MaxPool(p) => format!("MAXPOOL 2x2 at {}x{}x{}", p.height, p.width, p.c),
+        Layer::AvgPool(p) => format!("AVGPOOL global at {}x{}x{}", p.height, p.width, p.c),
         Layer::Add(a) => format!(
             "ADD at {}x{}x{} relu={} weights {:?}",
             a.height,

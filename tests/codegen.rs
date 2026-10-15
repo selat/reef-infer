@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use reef_infer::codegen::Quant;
+use reef_infer::codegen::avg_pool::GlobalAvgPool;
 use reef_infer::codegen::conv::Conv;
 use reef_infer::codegen::elementwise::{self, Requant};
 use reef_infer::codegen::fc::Fc;
@@ -613,6 +614,96 @@ fn pool_matches_compiler() {
     }
 }
 
+/// The corpus global average pool (ResNet-8's head, 8x8x64) in the
+/// compiler's form (centre = zero point, mult 1 / 64): instructions and
+/// output layout.
+#[test]
+fn avg_pool_matches_compiler() {
+    let name = "pool/pool_C64_H8_W8_opavg_padvalid_size8_stride8";
+    let Some(path) = corpus(name) else {
+        eprintln!("ISA corpus model {name} not found; skipping");
+        return;
+    };
+    let compiled = load_tflite_model(&path).unwrap();
+    let e = &compiled.executables[0];
+    let q = quant(&e.input_layers[0]);
+    let ours = GlobalAvgPool {
+        height: 8,
+        width: 8,
+        c: 64,
+        center: q.zero_point,
+        mult: 1.0 / 64.0,
+        quant: q,
+    }
+    .build()
+    .unwrap()
+    .into_model();
+    let o = &ours.executables[0];
+    assert_eq!(
+        o.instruction_chunks[0].bitstream,
+        e.instruction_chunks[0].bitstream
+    );
+    assert!(o.parameters.is_empty() && e.parameters.is_empty());
+    assert_eq!(
+        format!("{:?}", o.output_layers[0].output_layout),
+        format!("{:?}", e.output_layers[0].output_layout)
+    );
+}
+
+/// `GlobalAvgPool::tflite` rounds every channel sum as TFLite's integer
+/// AVERAGE_POOL_2D does (sum / 64, half away from zero), ties included,
+/// where the compiler's mult 1 / 64 rounds them to even.
+#[test]
+fn avg_pool_rounds_as_tflite() {
+    let q = Quant {
+        scale: 0.03,
+        zero_point: 127,
+    };
+    for int8 in [true, false] {
+        let p = GlobalAvgPool::tflite(8, 8, 64, q, int8).unwrap();
+        let center = if int8 { 128 } else { 0 };
+        let tflite = |x: &[u8]| -> Vec<u8> {
+            (0..64)
+                .map(|z| {
+                    let s: i32 = (0..64).map(|i| x[64 * i + z] as i32 - center).sum();
+                    let r = if s > 0 { (s + 32) / 64 } else { (s - 32) / 64 };
+                    (r + center) as u8
+                })
+                .collect()
+        };
+        let mut seed = 7u64;
+        let mut inputs: Vec<Vec<u8>> = (0..256u32)
+            .map(|v| {
+                // channel z: 32 pixels at v, 32 at v + z (ties at odd z / 2)
+                (0..4096)
+                    .map(|i: u32| (v + (i / 64 % 2) * (i % 64)).min(255) as u8)
+                    .collect()
+            })
+            .collect();
+        inputs.extend((0..64).map(|_| {
+            (0..4096)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed >> 32) as u8
+                })
+                .collect()
+        }));
+        let compiler_form = GlobalAvgPool {
+            center,
+            mult: 1.0 / 64.0,
+            ..p.clone()
+        };
+        let mut compiler_differs = 0;
+        for x in &inputs {
+            assert_eq!(p.reference(x), tflite(x), "int8 {int8}");
+            compiler_differs += (compiler_form.reference(x) != tflite(x)) as usize;
+        }
+        assert!(compiler_differs > 0, "the ties should tell the two apart");
+    }
+}
+
 /// Every corpus element-wise ADD `codegen::add` supports (shapes 16x16x32 /
 /// 16x16x64 / 32x32x16 / 32x32x64, scale ratios 1/4 .. 4, RELU):
 /// instructions (weights, multiplier, clamps included) and output layout.
@@ -712,7 +803,8 @@ fn resnet8_graph_matches_tflite() {
     let count = |f: fn(&Layer) -> bool| g.steps.iter().filter(|s| f(&s.layer)).count();
     assert_eq!(count(|l| matches!(l, Layer::Conv(_))), 9);
     assert_eq!(count(|l| matches!(l, Layer::Add(_))), 3);
-    assert_eq!(count(|l| matches!(l, Layer::Fc(_))), 2); // average pool + dense
+    assert_eq!(count(|l| matches!(l, Layer::Fc(_))), 1); // dense
+    assert_eq!(count(|l| matches!(l, Layer::AvgPool(_))), 1);
     // each ADD reads a tensor produced before the step right before it
     // (the shortcut)
     let made_at = |t: i32| g.steps.iter().position(|s| s.output == t);
@@ -723,6 +815,10 @@ fn resnet8_graph_matches_tflite() {
         }
     }
     assert_eq!(g.build().unwrap().len(), 14);
+    // every layer's parameters at its own wide range, back to back
+    let bases = g.wide_bases().unwrap();
+    let end = bases[13] + g.steps[13].layer.wide_units();
+    assert_eq!(end, 0x7a8);
     let px = g.input_len();
     for i in 0..100 {
         let y = u8_to_i8(&g.reference(&images[px * i..px * (i + 1)]));

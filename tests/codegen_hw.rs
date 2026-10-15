@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use reef_infer::codegen::Quant;
 use reef_infer::codegen::add::Add;
+use reef_infer::codegen::avg_pool::GlobalAvgPool;
 use reef_infer::codegen::conv::Conv;
 use reef_infer::codegen::elementwise::{self, Requant, SIZE};
 use reef_infer::codegen::fc::Fc;
@@ -211,6 +212,43 @@ async fn generated_programs_on_tpu() {
         }
     }
 
+    // Global 8x8x64 average pool: the compiler's form (centre = zero point,
+    // mult 1 / 64) and TFLite's exact rounding (int8 and uint8), on random
+    // images, the extremes, and images whose every channel sum is a tie.
+    let q = Quant {
+        scale: 0.03,
+        zero_point: 127,
+    };
+    let ties: Vec<u8> = (0..64 * 64)
+        .map(|i| (4 * (i % 64) + (i / 64) % 2) as u8)
+        .collect();
+    for pool in [
+        GlobalAvgPool {
+            height: 8,
+            width: 8,
+            c: 64,
+            center: 127,
+            mult: 1.0 / 64.0,
+            quant: q,
+        },
+        GlobalAvgPool::tflite(8, 8, 64, q, true).unwrap(),
+        GlobalAvgPool::tflite(8, 8, 64, q, false).unwrap(),
+    ] {
+        let model = Arc::new(pool.build().unwrap().into_model());
+        let loaded = dev.load_params(model).await.unwrap();
+        let mut inputs = vec![vec![0u8; 4096], vec![255u8; 4096], ties.clone()];
+        inputs.extend((0..3).map(|_| bytes(&mut seed, 4096)));
+        for x in inputs {
+            let got = dev.run_inference(&loaded, x.clone()).await.unwrap();
+            assert!(
+                got == pool.reference(&x),
+                "average pool centre {} mult {}",
+                pool.center,
+                pool.mult
+            );
+        }
+    }
+
     // Convolutions with random weights: 1x1, and 3x3 (halo exchange, zero
     // point padding at the image border).
     for (k, stride, height, width, cin, cout, relu, in_zp, out_zp) in [
@@ -294,6 +332,84 @@ async fn generated_programs_on_tpu() {
             );
         }
     }
+
+    // Cached parameters at their own wide addresses coexist: load an FC
+    // on 2 tiles, a conv and a small FC one after the other, then run all.
+    let fc_a = Fc {
+        k: 784,
+        n: 128,
+        weights: bytes(&mut seed, 784 * 128)
+            .iter()
+            .map(|&b| b as i8)
+            .collect(),
+        w_scale: vec![0.004; 128],
+        bias: (0..128).map(|i| 100 * i).collect(),
+        input: Quant {
+            scale: 0.03,
+            zero_point: 120,
+        },
+        output: Quant {
+            scale: 1.0,
+            zero_point: 128,
+        },
+        relu: false,
+    };
+    let fc_b = Fc {
+        k: 128,
+        n: 10,
+        weights: bytes(&mut seed, 1280).iter().map(|&b| b as i8).collect(),
+        w_scale: vec![0.004; 10],
+        bias: vec![0; 10],
+        ..fc_a.clone()
+    };
+    let conv = Conv {
+        cin: 32,
+        cout: 32,
+        k: 3,
+        stride: 1,
+        width: 16,
+        height: 16,
+        weights: bytes(&mut seed, 32 * 9 * 32)
+            .iter()
+            .map(|&b| b as i8)
+            .collect(),
+        w_scale: vec![0.0004; 32],
+        bias: vec![-2000; 32],
+        input: Quant {
+            scale: 0.03,
+            zero_point: 100,
+        },
+        output: Quant {
+            scale: 0.2,
+            zero_point: 120,
+        },
+        relu: false,
+    };
+    let (ua, uc) = (fc_a.wide_units(), conv.wide_units());
+    let la = dev
+        .load_params(Arc::new(fc_a.build_at(0).unwrap()))
+        .await
+        .unwrap();
+    let lc = dev
+        .load_params(Arc::new(conv.build_at(ua).unwrap()))
+        .await
+        .unwrap();
+    let lb = dev
+        .load_params(Arc::new(fc_b.build_at(ua + uc).unwrap()))
+        .await
+        .unwrap();
+    let x = bytes(&mut seed, 784);
+    assert_eq!(
+        dev.run_inference(&la, x.clone()).await.unwrap(),
+        fc_a.reference(&x)
+    );
+    let x = bytes(&mut seed, 16 * 16 * 32);
+    assert!(dev.run_inference(&lc, x.clone()).await.unwrap() == conv.reference(&x));
+    let x = bytes(&mut seed, 128);
+    assert_eq!(
+        dev.run_inference(&lb, x.clone()).await.unwrap(),
+        fc_b.reference(&x)
+    );
 
     loopback(&mut dev).await;
 }

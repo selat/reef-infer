@@ -1,4 +1,4 @@
-//! The 16-tile band loader shared by the pool and add programs (the
+//! The 16-tile band loader shared by the pool, average pool and add programs (the
 //! compiler's element-wise layout): each tile holds a `tw x th` patch of a
 //! `4 tw x 4 th x C` image, pixel after pixel from a narrow address.
 //!
@@ -165,7 +165,10 @@ pub(crate) fn load(
     )?;
     descriptor_addr(a)?;
     descriptor_send(a, 16 * b, TAG_INPUT)?;
-    a.emit(OP_SYNC, &[("tiles", ALL_TILES), ("counters", 0x800)])?;
+    if b > 256 {
+        // not at 256 B per tile (the compiled 8x8x64 average pool)
+        a.emit(OP_SYNC, &[("tiles", ALL_TILES), ("counters", 0x800)])?;
+    }
     // Ring -> narrow per tile column: column `col` skips its left
     // neighbours' `tw * cw` words of each image row.
     let row_words = s * 64; // words per image row

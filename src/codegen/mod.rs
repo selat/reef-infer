@@ -7,6 +7,7 @@
 //! compiled model.
 
 pub mod add;
+pub mod avg_pool;
 pub(crate) mod band;
 pub mod conv;
 pub mod elementwise;
@@ -497,6 +498,22 @@ fn param_descriptor(a: &mut Asm, len: i64, tag: i64) -> Result<(), IsaError> {
     )?;
     a.emit(OP_SCALAR, &[("v_op", 0xa), ("v_offset", 3), ("vs_reg", 7)])?;
     a.emit(OP_SCALAR, &[("v_op", 0xc)])?;
+    Ok(())
+}
+
+/// Wide address units (64 B) per tile below which cached parameters may
+/// be placed: every generator keeps its own wide buffers (input staging,
+/// weight slots, constants, output rows) above 0x1e00.
+pub const PARAM_WIDE_LIMIT: i64 = 0x1e00;
+
+/// A parameter base must be a whole 256 B row (4 units) below
+/// [`PARAM_WIDE_LIMIT`].
+pub fn check_base(base: i64) -> Result<(), String> {
+    if base % 4 != 0 || !(0..PARAM_WIDE_LIMIT).contains(&base) {
+        return Err(format!(
+            "wide base {base:#x}: need a multiple of 4 below {PARAM_WIDE_LIMIT:#x}"
+        ));
+    }
     Ok(())
 }
 

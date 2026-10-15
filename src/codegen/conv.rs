@@ -286,19 +286,37 @@ impl Conv {
     }
 
     pub fn build(&self) -> Result<TfliteModel, Box<dyn std::error::Error>> {
+        self.build_at(0)
+    }
+
+    /// [`Conv::build`] with the parameters cached in tile 0's wide memory
+    /// from address `base` (64 B units, a whole number of 256 B rows)
+    /// instead of 0, so that several layers' parameters can stay cached.
+    pub fn build_at(&self, base: i64) -> Result<TfliteModel, Box<dyn std::error::Error>> {
         self.check()?;
-        self.build_unchecked()
+        self.build_unchecked_at(base)
+    }
+
+    /// Wide address units (64 B) the parameters take on tile 0 from their
+    /// base: a row per parameter word (3 header words, then the weights).
+    pub fn wide_units(&self) -> i64 {
+        4 * self.param_words()
     }
 
     /// [`Conv::build`] without [`Conv::check`], for hardware experiments on
     /// shapes outside the verified set.
     #[doc(hidden)]
     pub fn build_unchecked(&self) -> Result<TfliteModel, Box<dyn std::error::Error>> {
+        self.build_unchecked_at(0)
+    }
+
+    fn build_unchecked_at(&self, base: i64) -> Result<TfliteModel, Box<dyn std::error::Error>> {
+        check_base(base)?;
         let params = self.parameters();
         let caching = ExecInfo {
             exec_type: ExecutableType::PARAMETER_CACHING,
             parameters: params.clone(),
-            instruction_chunks: vec![self.caching_program(params.len())?],
+            instruction_chunks: vec![self.caching_program(params.len(), base)?],
             input_layers: vec![],
             output_layers: vec![],
             scratch_size_bytes: 0,
@@ -308,7 +326,7 @@ impl Conv {
         let exec = ExecInfo {
             exec_type: ExecutableType::EXECUTION_ONLY,
             parameters: vec![],
-            instruction_chunks: vec![self.execution_program()?],
+            instruction_chunks: vec![self.execution_program(base)?],
             input_layers: vec![layer("input", (h, w, self.cin), self.input)],
             output_layers: vec![LayerInfo {
                 output_layout: Some(output_layout(
@@ -330,7 +348,9 @@ impl Conv {
         3 + (self.k * self.k * self.cin_pad() / 4) as i64
     }
 
-    fn caching_program(&self, bytes: usize) -> Result<ChunkInfo, IsaError> {
+    /// Streams the blob into tile 0's wide memory from `base` (the
+    /// consumer's `addr` is 2 above it; the multicast reads from `base`).
+    fn caching_program(&self, bytes: usize, base: i64) -> Result<ChunkInfo, IsaError> {
         let words = self.param_words();
         let mut a = Asm::new();
         param_caching(
@@ -339,7 +359,7 @@ impl Conv {
             (self.cout_pad() / 16) as i64 - 1,
             &[
                 ("tile_mask", 1),
-                ("addr", 2),
+                ("addr", base + 2),
                 ("inc0", 1),
                 ("cnt0", words - 1),
                 ("inc1", -(words - 1)),
@@ -351,7 +371,7 @@ impl Conv {
         a.finish()
     }
 
-    fn execution_program(&self) -> Result<ChunkInfo, IsaError> {
+    fn execution_program(&self, base: i64) -> Result<ChunkInfo, IsaError> {
         const IN_NAME: &str = "input";
         const OUT_NAME: &str = "output";
         let pt = self.patch();
@@ -897,6 +917,7 @@ impl Conv {
             OP_RING_PRODUCER,
             &[
                 ("tile_mask", 1),
+                ("addr", base),
                 ("inc0", 1),
                 ("cnt0", words - 1),
                 ("inc1", -(words - 1)),
