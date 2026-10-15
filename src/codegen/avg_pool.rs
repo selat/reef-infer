@@ -114,10 +114,48 @@ impl GlobalAvgPool {
 
     pub fn build(&self) -> Result<Program, Box<dyn std::error::Error>> {
         self.check()?;
-        Ok(self.program()?)
+        Ok(self.program(None)?)
     }
 
-    fn program(&self) -> Result<Program, IsaError> {
+    /// The tile patch a chained pool reads: the plain 2x2 pixels.
+    pub fn input_patch(&self) -> Patch {
+        Patch {
+            rows: self.height as i64 / 4,
+            cols: self.width as i64 / 4,
+            ..Patch::plain(self.c)
+        }
+    }
+
+    /// End (bytes) of the narrow memory the program uses itself (the
+    /// image gathered on tile 0, the column blocks, forward slots and the
+    /// constant).
+    pub fn narrow_end(&self) -> i64 {
+        0x1600
+    }
+
+    /// The program with its input already on every tile at narrow `.0`
+    /// (geometry `.1`, [`GlobalAvgPool::input_patch`]) instead of from the
+    /// host; the output goes to the host ("output").
+    pub fn chain_program(
+        &self,
+        input_at: (i64, Patch),
+    ) -> Result<ChunkInfo, Box<dyn std::error::Error>> {
+        self.check()?;
+        let (at, p) = input_at;
+        if p != self.input_patch() || at < self.narrow_end() || at % 4 != 0 {
+            return Err(format!(
+                "chained average pool: input {p:?} at {at:#x}, need {:?} above {:#x}",
+                self.input_patch(),
+                self.narrow_end()
+            )
+            .into());
+        }
+        Ok(self.program(Some(at))?.chunk)
+    }
+
+    /// `input_at`: the patch's narrow address when chained (`None`: from
+    /// the host).
+    fn program(&self, input_at: Option<i64>) -> Result<Program, IsaError> {
         const IN_NAME: &str = "input";
         const OUT_NAME: &str = "output";
         let g = Grid::new(self.height, self.width, self.c);
@@ -132,20 +170,25 @@ impl GlobalAvgPool {
         let row_words = self.width as i64 * g.cw(); // one image row
         let col_words = g.tw * g.cw(); // one tile column's pixels in a row
 
+        // where the tiles' patches are: loaded at `patch`, or chained
+        let src = input_at.unwrap_or(patch);
+
         let mut a = Asm::new();
         prologue(&mut a)?;
-        band::constants(&mut a, const_n, const_w)?;
-        band::copy_op(&mut a, &g, const_w & 0xff, true, 0, patch)?;
-        band::load(&mut a, &g, IN_NAME, 0, stage_w)?;
-        band::copy_op(&mut a, &g, const_w & 0xff, false, 0, patch)?;
-        sync(&mut a, 0x1ffff, 0x3ff, false)?;
+        if input_at.is_none() {
+            band::constants(&mut a, const_n, const_w)?;
+            band::copy_op(&mut a, &g, const_w & 0xff, true, 0, patch)?;
+            band::load(&mut a, &g, IN_NAME, 0, stage_w)?;
+            band::copy_op(&mut a, &g, const_w & 0xff, false, 0, patch)?;
+            sync(&mut a, 0x1ffff, 0x3ff, false)?;
+        }
         sync(&mut a, 0x1ffff, 0x3ff, false)?;
 
         // ── Column gather into row 0: own patch -> `col`, row r's -> `col + r b`.
         a.emit(
             OP_NARROW_TO_WIDE,
             &[
-                &[("tile_mask", 0xf), ("narrow_addr", patch / 4)][..],
+                &[("tile_mask", 0xf), ("narrow_addr", src / 4)][..],
                 &walk1(bw - 1),
                 &[
                     ("wide_addr", gather_w),
@@ -182,7 +225,7 @@ impl GlobalAvgPool {
             .concat(),
         )?;
         let north = |a: &mut Asm, f: Vec<(&str, i64)>| a.emit(OP_MESH_N, &f).map(|_| ());
-        let send = |tiles: i64| mesh_send(tiles, patch, bw);
+        let send = |tiles: i64| mesh_send(tiles, src, bw);
         let recv = |tiles: i64, at: i64| mesh_recv(tiles, at, bw);
         let fwd = |tiles: i64, hop: i64| mesh_fwd(tiles, fwd_n, bw, hop, (0xa, 0xe), b);
         north(&mut a, send(0xf0))?;

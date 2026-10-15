@@ -7,7 +7,8 @@
 //! relocations move with their part.
 //!
 //! [`program`] chains layers with the activations kept on chip: convs
-//! and residual adds as a small graph ([`Node`]). Every intermediate
+//! and residual adds as a small graph ([`Node`]), possibly ending in a
+//! global average pool. Every intermediate
 //! tensor is stored once, in a padded patch in narrow memory ([`plan`]),
 //! from the layer that writes it ([`conv::Io::output_to`],
 //! [`add::Io::output_to`]) until the last layer that reads it, so a
@@ -16,6 +17,7 @@
 //! back. [`convs`] is the plain sequence.
 
 use super::add::{self, Add};
+use super::avg_pool::GlobalAvgPool;
 use super::conv::{self, Conv};
 use super::*;
 use crate::isa;
@@ -87,11 +89,13 @@ pub fn rename(chunk: &mut ChunkInfo, from: &str, to: &str) {
 pub const NARROW_BYTES: i64 = 192 * 1024;
 
 /// A layer of a chain: a conv with its parameters cached at a wide base,
-/// or an add (no parameters).
+/// an add, or a global average pool (last only: its output goes to the
+/// host).
 #[derive(Debug, Clone, Copy)]
 pub enum Op<'a> {
     Conv(&'a Conv, i64),
     Add(&'a Add),
+    AvgPool(&'a GlobalAvgPool),
 }
 
 /// A chain layer and the tensors it reads: 0 is the chain's input, `k + 1`
@@ -116,7 +120,7 @@ pub struct Plan {
 /// the larger padding on every side.
 fn union(p: Option<Patch>, q: Patch) -> Result<Patch, Error> {
     let Some(p) = p else { return Ok(q) };
-    if p.cin != q.cin || p.rows != q.rows {
+    if p.cin != q.cin || p.rows != q.rows || p.cols != q.cols {
         return Err(format!("chain: a tensor is read as {p:?} and as {q:?}").into());
     }
     Ok(Patch {
@@ -149,6 +153,8 @@ pub fn plan(nodes: &[Node]) -> Result<Plan, Error> {
         let want = match node.op {
             Op::Conv(..) => 1,
             Op::Add(_) => 2,
+            Op::AvgPool(_) if k + 1 == n => 1,
+            Op::AvgPool(_) => return Err("chain: an average pool must come last".into()),
         };
         if node.inputs.len() != want || node.inputs.iter().any(|&t| t > k) {
             return Err(format!("chain: layer {k} reads {:?}", node.inputs).into());
@@ -170,6 +176,7 @@ pub fn plan(nodes: &[Node]) -> Result<Plan, Error> {
             let q = match node.op {
                 Op::Conv(c, _) => c.input_patch(),
                 Op::Add(a) => a.patch(),
+                Op::AvgPool(p) => p.input_patch(),
             };
             patch[t] = Some(union(patch[t], q)?);
         }
@@ -192,6 +199,7 @@ pub fn plan(nodes: &[Node]) -> Result<Plan, Error> {
         .iter()
         .filter_map(|l| match l.op {
             Op::Conv(c, _) => Some(c.narrow_end()),
+            Op::AvgPool(p) => Some(p.narrow_end()),
             Op::Add(_) => None,
         })
         .max()
@@ -203,7 +211,7 @@ pub fn plan(nodes: &[Node]) -> Result<Plan, Error> {
             .enumerate()
             .filter_map(|(k, l)| match l.op {
                 Op::Add(a) => Some(up(a.scratch_bytes(k + 1 == n))),
-                Op::Conv(..) => None,
+                Op::Conv(..) | Op::AvgPool(_) => None,
             })
             .max()
             .unwrap_or(0);
@@ -270,6 +278,7 @@ pub fn program(nodes: &[Node]) -> Result<ChunkInfo, Error> {
                         scratch: plan.scratch,
                     })
                 }
+                Op::AvgPool(p) => p.chain_program(plan.at[node.inputs[0]].unwrap()),
             }
         })
         .collect::<Result<Vec<_>, _>>()?;

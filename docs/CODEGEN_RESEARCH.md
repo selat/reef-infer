@@ -1059,3 +1059,28 @@ bit-exact with the host reference, **6.9 ms per image** (14.8 ms before;
 `edgetpu_compiler` 0.94 ms). MNIST models have no chain (conv -> pool)
 and are unchanged.
 
+**Native 8x8** (same day). A 16x16 stride-2 conv leaves 2x2 pixels per
+tile, which is already the 8x8 layout of the compiler's average pool
+(the band loader's 2x2 patch per tile). So 8x8 layers need no new layout,
+only patches whose interior is 2 pixels wide: `Patch` gained `cols` (4,
+or 2 at 8x8), and the conv's columns (`Conv::cols`), output pixels per
+tile, its halo moves (row width, east / west column addresses) and the
+chaining checks follow it. The conv op itself only sees strides and
+counts. An 8x8 conv (3x3 stride 1, Cin >= 16) and an 8x8 add run only
+chained, with the input already on chip (their host loaders are not
+verified); the parameter blob does not depend on the image size, so the
+8x8 conv reads what its 16x16 program cached. The average pool takes its
+input from a plain 2x2 patch in narrow memory (`chain_program`): only
+the column gather's source address changes; it stays the chain's last
+layer and outfeeds its 64 bytes.
+
+In the graph, a step whose program runs padded (8x8 as 16x16) keeps its
+native form (`Step::on_chip`), used inside chains. ResNet-8 then plans as
+steps 0-12 in one call (9 convs, 3 adds, the pool) and the FC in a
+second. **Bit-exact on the first run**: all 10000 test images match the
+host reference, **2.24 ms per image** (6.9 ms with 7 calls, 14.8 ms with
+14; `edgetpu_compiler` 0.98 ms, so 2.3x). `tests/codegen_hw.rs` runs a
+synthetic stage 3 (16x16 -> stride 2 -> 8x8 conv, 1x1 stride-2 shortcut,
+8x8 add, pool); a mutation putting the halo's east column back at x = 4
+fails it.
+

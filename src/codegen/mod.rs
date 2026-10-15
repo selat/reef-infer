@@ -525,15 +525,18 @@ pub fn done(a: &mut Asm) -> Result<(), IsaError> {
     descriptor_send(a, 0, TAG_DONE)
 }
 
-/// One tile's 4x4 pixel patch of a `cin`-channel uint8 tensor, stored
-/// pixel-major (`[y][x][cin]`) with a halo of `top` / `left` pixels before
-/// and `bottom` / `right` after it (a convolution's padding).
+/// One tile's patch of a `cin`-channel uint8 tensor, `rows` x `cols`
+/// pixels (4x4 at 16x16; 2x2 at 8x8), stored pixel-major (`[y][x][cin]`)
+/// with a halo of `top` / `left` pixels before and `bottom` / `right` after
+/// it (a convolution's padding).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Patch {
     pub cin: i64,
     /// Interior rows (4, or more for taller images; the loader moves them
     /// in bands of 4).
     pub rows: i64,
+    /// Interior columns (4; 2 for an 8x8 image).
+    pub cols: i64,
     pub top: i64,
     pub bottom: i64,
     pub left: i64,
@@ -545,6 +548,7 @@ impl Patch {
         Patch {
             cin: cin as i64,
             rows: 4,
+            cols: 4,
             top: 0,
             bottom: 0,
             left: 0,
@@ -557,7 +561,7 @@ impl Patch {
     }
     /// Padded width / height in pixels.
     pub fn pw(&self) -> i64 {
-        4 + self.left + self.right
+        self.cols + self.left + self.right
     }
     pub fn ph(&self) -> i64 {
         self.rows + self.top + self.bottom

@@ -54,7 +54,6 @@ async fn main() {
     let programs = g.build().unwrap();
     let mut dev = Device::open().await.expect("no Edge TPU");
     let loaded = g.load(&mut dev, &programs).await.unwrap();
-    assert_eq!(g.chains().unwrap()[0], 0..8);
     let chained = dev
         .load_params(Arc::new(g.chain(0..8).unwrap()))
         .await

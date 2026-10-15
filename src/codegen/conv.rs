@@ -105,20 +105,25 @@ pub struct Conv {
 impl Conv {
     pub fn check(&self) -> Result<(), String> {
         let m = self.width / 16;
+        // 8x8: 2x2 pixels per tile, only with the input already on chip
+        // (`chain_program`)
+        let small = self.width == 8 && self.height == 8 && self.stride == 1 && self.cin >= 16;
         let wide_ok = match self.width {
+            8 => small,
             16 => true,
             // superpixels of m pixels must be a loader-verified channel count
             32 | 64 => self.cin >= 16 && [32, 64, 128].contains(&(self.cin * m)),
             _ => false,
         };
         let tall_ok = match self.height {
+            8 => small,
             16 => true,
             // bands of 4 rows through the verified loader: >= 16 superpixel
             // channels (the linear and circular input forms)
             32 | 64 => self.cin_pad() * m >= 16,
             _ => false,
         };
-        let ob = (self.height / 4 / self.stride) * (4 * m / self.stride) * self.cout;
+        let ob = (self.opx().0 * self.opx().1) as usize * self.cout;
         let ok = [1, 2].contains(&self.stride)
             && wide_ok
             && tall_ok
@@ -130,13 +135,13 @@ impl Conv {
                         && ([8, 16, 32].contains(&self.cout)
                             // 1 KiB of output per tile; Cin 16 moves the
                             // compiler's narrow buffers (not derived)
-                            || (self.cout == 64 && self.cin >= 32 && self.width == 16))
+                            || (self.cout == 64 && self.cin >= 32 && self.width <= 16))
                 }
                 _ => false,
             };
         if !ok {
             return Err(format!(
-                "Cin={} Cout={} k={} width={}: supported are k 1 (Cin 16, Cout 32) and k 3 (Cin 1, 3, 4, 16, 32, 64, 128; Cout 8, 16 or 32, or 64 for Cin >= 32 at width 16), width 16, or 32 / 64 with Cin x width / 16 in 32..=128 and at most 2 KiB of output per tile",
+                "Cin={} Cout={} k={} width={}: supported are k 1 (Cin 16, Cout 32) and k 3 (Cin 1, 3, 4, 16, 32, 64, 128; Cout 8, 16 or 32, or 64 for Cin >= 32 at width 8 / 16), width 16, 32 / 64 with Cin x width / 16 in 32..=128, or 8x8 stride 1 with Cin >= 16 (chained only), and at most 2 KiB of output per tile",
                 self.cin, self.cout, self.k, self.width
             ));
         }
@@ -163,24 +168,31 @@ impl Conv {
     /// superpixels of `width / 16` pixels (the 16x16 loader with
     /// `Cin x width / 16` channels).
     fn spx(&self) -> i64 {
-        (self.width / 16) as i64
+        (self.width / 16).max(1) as i64
+    }
+
+    /// Patch columns per tile: 4 superpixels, or the 2 pixels of an 8x8
+    /// image.
+    fn cols(&self) -> i64 {
+        (self.width / 4).min(4) as i64
     }
 
     /// Output pixels per tile along y and x.
     fn opx(&self) -> (i64, i64) {
         let s = self.stride as i64;
-        ((self.height / 4) as i64 / s, 4 * self.spx() / s)
+        ((self.height / 4) as i64 / s, self.cols() * self.spx() / s)
     }
 
-    /// The tile patch in superpixels: 4x4 of them, the padding as a halo
-    /// (rounded up to whole superpixels along x; the conv op addresses real
-    /// pixels inside).
+    /// The tile patch in superpixels: 4 of them across (2 pixels at 8x8),
+    /// the padding as a halo (rounded up to whole superpixels along x; the
+    /// conv op addresses real pixels inside).
     fn patch(&self) -> Patch {
         let (before, after) = self.pad();
         let m = self.spx();
         Patch {
             cin: self.cin_pad() as i64 * m,
             rows: (self.height / 4) as i64,
+            cols: self.cols(),
             top: before,
             bottom: after,
             left: (before + m - 1) / m,
@@ -312,6 +324,9 @@ impl Conv {
     /// instead of 0, so that several layers' parameters can stay cached.
     pub fn build_at(&self, base: i64) -> Result<TfliteModel, Box<dyn std::error::Error>> {
         self.check()?;
+        if self.width < 16 {
+            return Err("an 8x8 conv takes its input on chip only (chain_program)".into());
+        }
         self.build_unchecked_at(base)
     }
 
@@ -406,6 +421,9 @@ impl Conv {
     ) -> Result<ChunkInfo, Box<dyn std::error::Error>> {
         self.check()?;
         check_base(base)?;
+        if io.input_at.is_none() && self.width < 16 {
+            return Err("an 8x8 conv takes its input on chip only".into());
+        }
         if let Some((_, p)) = io.input_at {
             if self.cin < 4 {
                 return Err("chained conv: Cin 1 / 3 widen the host input; not chained".into());
@@ -413,12 +431,13 @@ impl Conv {
             let own = self.patch();
             let covers = p.cin == own.cin
                 && p.rows == own.rows
+                && p.cols == own.cols
                 && p.top >= own.top
                 && p.bottom >= own.bottom
                 && p.left >= own.left
                 && p.right >= own.right;
             // a 1x1 stride-1 op walks the pixels as one run
-            let plain = self.k > 1 || self.stride > 1 || p.pw() == 4;
+            let plain = self.k > 1 || self.stride > 1 || p.pw() == p.cols;
             if !covers || !plain {
                 return Err(format!(
                     "chained conv: stored input patch {p:?} does not hold this layer's {own:?}"
@@ -429,7 +448,7 @@ impl Conv {
         if let Some((at, p)) = io.output_to {
             let (oy, ox) = self.opx();
             let c = self.cout as i64;
-            if p.cin % c != 0 || p.rows != oy || 4 * (p.cin / c) != ox {
+            if p.cin % c != 0 || p.rows != oy || p.cols * (p.cin / c) != ox {
                 return Err(format!(
                     "chained conv: {oy}x{ox} output pixels per tile do not fill the next patch ({} rows of 4 x {} B)",
                     p.rows, p.cin
@@ -1286,7 +1305,7 @@ fn halo(a: &mut Asm, pt: &Patch, zp: i32, nb: i64) -> Result<(), IsaError> {
     // a pixel's words move in beats of at most 16; the beats of a wider
     // pixel are the outermost loop
     let (beat, beats) = (cq.min(16), (cq / 16).max(1));
-    let rows = |n: i64| vec![(beat, 1), (4, cq), (n, rs), (beats, 16)];
+    let rows = |n: i64| vec![(beat, 1), (pt.cols, cq), (n, rs), (beats, 16)];
     let ph = pt.ph();
     let cols = |n: i64| vec![(beat, 1), (n, cq), (ph, rs), (beats, 16)];
     let (t, b, l, r) = (pt.top, pt.bottom, pt.left, pt.right);
@@ -1313,7 +1332,7 @@ fn halo(a: &mut Asm, pt: &Patch, zp: i32, nb: i64) -> Result<(), IsaError> {
         Move {
             op: OP_MESH_W,
             o_addr: pt.at(-t, 0),
-            i_addr: pt.at(-t, 4),
+            i_addr: pt.at(-t, pt.cols),
             dims: cols(r),
             groups: [0x1111, 0x6666, 0x8888],
             synced: true,
@@ -1321,7 +1340,7 @@ fn halo(a: &mut Asm, pt: &Patch, zp: i32, nb: i64) -> Result<(), IsaError> {
         // east: right interior columns -> the eastern tile's left halo
         Move {
             op: OP_MESH_E,
-            o_addr: pt.at(-t, 4 - l),
+            o_addr: pt.at(-t, pt.cols - l),
             i_addr: pt.at(-t, -l),
             dims: cols(l),
             groups: [0x8888, 0x6666, 0x1111],

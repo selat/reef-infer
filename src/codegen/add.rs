@@ -205,12 +205,15 @@ impl Add {
         0x100 + if to_host { self.grid().b() } else { 0 }
     }
 
-    /// The patch interior this add reads and writes, unpadded.
+    /// The patch interior this add reads and writes, unpadded: 4
+    /// (super)pixels across, or the 2 pixels of an 8x8 image.
     pub fn patch(&self) -> Patch {
         let g = self.grid();
+        let cols = g.tw.min(4);
         Patch {
             rows: g.th,
-            cin: g.tw * g.c / 4,
+            cols,
+            cin: g.tw * g.c / cols,
             ..Patch::plain(0)
         }
     }
@@ -218,7 +221,15 @@ impl Add {
     /// The execution program with the inputs on chip as `io` says; its
     /// output layer (host output only) is "output".
     pub fn chain_program(&self, io: Io) -> Result<ChunkInfo, Box<dyn std::error::Error>> {
-        self.check()?;
+        // 8x8 (2x2 pixels per tile) only on chip: the host loader is not
+        // verified for it
+        let small = self.height == 8 && self.width == 8 && self.c % 16 == 0;
+        if !small {
+            self.check()?;
+        }
+        if small && io.output_to.is_none() {
+            return Err("an 8x8 add sends no output to the host".into());
+        }
         // the op reads A then B at a positive offset: swap the operands
         // (the arithmetic is symmetric) to keep A below B
         if io.b < io.a {
@@ -234,7 +245,7 @@ impl Add {
             });
         }
         let own = self.patch();
-        let fits = |p: &Patch| p.rows == own.rows && p.cin == own.cin;
+        let fits = |p: &Patch| p.rows == own.rows && p.cols == own.cols && p.cin == own.cin;
         if !fits(&io.patch) || io.output_to.is_some_and(|(_, p)| !fits(&p)) {
             return Err(format!(
                 "chained add: patches {:?} / {:?} do not hold {}x{}x{}",

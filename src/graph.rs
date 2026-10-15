@@ -113,6 +113,29 @@ impl Layer {
         }
     }
 
+    /// This conv or add natively at the input size `(h, w)` if that is
+    /// smaller than its program's and supported on chip ([`Step::on_chip`]).
+    pub fn at_size(&self, (h, w, _): Shape) -> Option<Layer> {
+        match self {
+            Layer::Conv(c) if (h, w) != (c.height, c.width) => {
+                let n = Conv {
+                    height: h,
+                    width: w,
+                    ..c.clone()
+                };
+                n.check().is_ok().then_some(Layer::Conv(n))
+            }
+            Layer::Add(a) if (h, w) != (a.height, a.width) && (h, w) == (8, 8) => {
+                Some(Layer::Add(Add {
+                    height: h,
+                    width: w,
+                    ..a.clone()
+                }))
+            }
+            _ => None,
+        }
+    }
+
     /// The program's input shapes and output shape.
     pub fn shapes(&self) -> (Vec<Shape>, Shape) {
         match self {
@@ -147,6 +170,9 @@ pub struct Input {
 #[derive(Debug, Clone)]
 pub struct Step {
     pub layer: Layer,
+    /// The layer at its TFLite size where its program runs it padded
+    /// (8x8 as 16x16): used inside on-chip chains, where no host pads.
+    pub on_chip: Option<Layer>,
     pub inputs: Vec<Input>,
     /// The output tensor id and its TFLite shape (the program's may be
     /// larger).
@@ -383,8 +409,10 @@ impl Graph {
                     return Err(format!("{layer:?}: input {:?} does not fit", i.shape).into());
                 }
             }
+            let on_chip = layer.at_size(inputs[0].shape);
             steps.push(Step {
                 layer,
+                on_chip,
                 inputs,
                 output: outs[0],
                 output_shape: output,
@@ -507,7 +535,13 @@ impl Graph {
         let mut nodes = Vec::new();
         for k in steps.clone() {
             let s = &self.steps[k];
-            let (ins, out) = s.layer.shapes();
+            // the native size inside; the last layer's output reaches the
+            // host as its own program sends it
+            let layer = match &s.on_chip {
+                Some(l) if k + 1 < steps.end => l,
+                _ => &s.layer,
+            };
+            let (ins, out) = layer.shapes();
             let internal = k + 1 < steps.end;
             if internal && out != s.output_shape {
                 return None;
@@ -520,9 +554,10 @@ impl Graph {
                     _ => return None,
                 }
             }
-            let op = match &s.layer {
+            let op = match layer {
                 Layer::Conv(c) => Op::Conv(c, bases[k]),
                 Layer::Add(a) => Op::Add(a),
+                Layer::AvgPool(p) => Op::AvgPool(p),
                 _ => return None,
             };
             nodes.push(Node { op, inputs });

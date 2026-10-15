@@ -413,6 +413,7 @@ async fn generated_programs_on_tpu() {
 
     chained(&mut dev, &mut seed).await;
     residual(&mut dev, &mut seed).await;
+    stage_8x8(&mut dev, &mut seed).await;
     loopback(&mut dev).await;
 }
 
@@ -632,6 +633,121 @@ async fn residual(dev: &mut Device, seed: &mut u64) {
             let got = dev.run_inference(&loaded, x).await.unwrap();
             assert!(got == want, "residual chain {k}");
         }
+    }
+}
+
+/// ResNet-8's stage 3 shape on chip: 16x16 stride 2 -> native 8x8 (2x2
+/// pixels per tile) convs, an 8x8 add with a 1x1 stride-2 shortcut, and
+/// the global average pool reading the sum from narrow memory.
+async fn stage_8x8(dev: &mut Device, seed: &mut u64) {
+    use reef_infer::codegen::chain::{Node, Op, program};
+    use reef_infer::executable_generated::platforms::darwinn::ExecutableType;
+    use reef_infer::model::{ExecInfo, TfliteModel};
+    let q = |scale, zero_point| Quant { scale, zero_point };
+    let conv = |seed: &mut u64, k, stride, hw, cin: usize, cout: usize, i, o, relu| Conv {
+        cin,
+        cout,
+        k,
+        stride,
+        width: hw,
+        height: hw,
+        weights: bytes(seed, cout * k * k * cin)
+            .iter()
+            .map(|&b| b as i8)
+            .collect(),
+        w_scale: vec![0.0007 * 16.0 / cin as f32; cout],
+        bias: (0..cout).map(|i| 200 * i as i32 - 6000).collect(),
+        input: i,
+        output: o,
+        relu,
+    };
+    let (q0, q1, q2, q3, q4) = (
+        q(0.03, 110),
+        q(0.2, 0),
+        q(0.15, 120),
+        q(0.18, 128),
+        q(0.25, 5),
+    );
+    let a = conv(seed, 3, 2, 16, 32, 64, q0, q1, true);
+    let b = conv(seed, 3, 1, 8, 64, 64, q1, q2, false);
+    let c = conv(seed, 1, 2, 16, 32, 64, q0, q3, false);
+    let sum = Add {
+        height: 8,
+        width: 8,
+        c: 64,
+        a: q3,
+        b: q2,
+        output: q4,
+        relu: true,
+    };
+    let pool = GlobalAvgPool::tflite(8, 8, 64, q4, true).unwrap();
+    // b's parameters as its 16x16 form caches them (the same blob)
+    let b16 = Conv {
+        width: 16,
+        height: 16,
+        ..b.clone()
+    };
+    assert!(b.build().is_err(), "8x8 convs take no host input");
+    let mut bases = Vec::new();
+    let mut next = 0;
+    for l in [&a, &b16, &c] {
+        dev.load_params(Arc::new(l.build_at(next).unwrap()))
+            .await
+            .unwrap();
+        bases.push(next);
+        next += l.wide_units();
+    }
+    let node = |op, inputs: &[usize]| Node {
+        op,
+        inputs: inputs.to_vec(),
+    };
+    let nodes = [
+        node(Op::Conv(&a, bases[0]), &[0]),
+        node(Op::Conv(&b, bases[1]), &[1]),
+        node(Op::Conv(&c, bases[2]), &[0]),
+        node(Op::Add(&sum), &[3, 2]),
+        node(Op::AvgPool(&pool), &[4]),
+    ];
+    // only the first layer may read the chain input: a 16x16 conv first
+    // makes the tensor both branches read
+    assert!(program(&nodes).is_err());
+    let pre = conv(seed, 3, 1, 16, 32, 32, q0, q0, false);
+    dev.load_params(Arc::new(pre.build_at(next).unwrap()))
+        .await
+        .unwrap();
+    let nodes = [
+        node(Op::Conv(&pre, next), &[0]),
+        node(Op::Conv(&a, bases[0]), &[1]),
+        node(Op::Conv(&b, bases[1]), &[2]),
+        node(Op::Conv(&c, bases[2]), &[1]),
+        node(Op::Add(&sum), &[4, 3]),
+        node(Op::AvgPool(&pool), &[5]),
+    ];
+    let mut first = pre.build().unwrap();
+    let model = TfliteModel {
+        executables: vec![ExecInfo {
+            exec_type: ExecutableType::EXECUTION_ONLY,
+            parameters: vec![],
+            instruction_chunks: vec![program(&nodes).unwrap()],
+            input_layers: first.executables.remove(0).input_layers,
+            output_layers: pool
+                .build()
+                .unwrap()
+                .into_model()
+                .executables
+                .remove(0)
+                .output_layers,
+            scratch_size_bytes: 0,
+        }],
+    };
+    let loaded = dev.load_params(Arc::new(model)).await.unwrap();
+    for _ in 0..3 {
+        let x = bytes(seed, 16 * 16 * 32);
+        let x1 = pre.reference(&x);
+        let want =
+            pool.reference(&sum.reference(&c.reference(&x1), &b.reference(&a.reference(&x1))));
+        let got = dev.run_inference(&loaded, x).await.unwrap();
+        assert!(got == want, "stage 3 at 8x8 on chip");
     }
 }
 
