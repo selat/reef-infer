@@ -500,7 +500,7 @@ fn mnist_graph_matches_tflite() {
         })
         .collect();
     assert_eq!(shapes, [(784, 128, true), (128, 10, false)]);
-    assert_eq!(g.build().unwrap().len(), 2);
+    assert_eq!(g.build().unwrap().calls(), 2);
     // input scale 1/255, zero point -128: the uint8 input is the pixel
     assert_eq!((g.input.scale, g.input.zero_point), (1.0 / 255.0, 0));
     let tflite = std::fs::read(dir.join("mlp_tflite_logits.bin")).unwrap();
@@ -558,7 +558,7 @@ fn mnist_cnn_graph_matches_tflite() {
             "fc3136"
         ]
     );
-    assert_eq!(g.build().unwrap().len(), 5);
+    assert_eq!(g.build().unwrap().calls(), 5);
     for i in 0..100 {
         let y = u8_to_i8(&g.reference(&images[784 * i..784 * (i + 1)]));
         let t: Vec<i8> = tflite[10 * i..10 * (i + 1)]
@@ -814,7 +814,12 @@ fn resnet8_graph_matches_tflite() {
             assert!(earliest.is_some_and(|p| p + 1 < k), "step {k}");
         }
     }
-    assert_eq!(g.build().unwrap().len(), 14);
+    // stages 1-2 (6 convs, 2 adds) run on chip in one call; stage 3's
+    // stride-2 conv makes an 8x8 image the host pads
+    let p = g.build().unwrap();
+    assert_eq!(p.steps.len(), 14);
+    assert_eq!(g.chains().unwrap()[0], 0..8);
+    assert_eq!(p.calls(), 7);
     // every layer's parameters at its own wide range, back to back
     let bases = g.wide_bases().unwrap();
     let end = bases[13] + g.steps[13].layer.wide_units();
@@ -876,7 +881,7 @@ fn splice_keeps_programs_well_formed() {
         .chain_program(
             a.wide_units(),
             Io {
-                input_at: Some(0x1000),
+                input_at: Some((0x1000, b.input_patch())),
                 ..Io::default()
             },
         )
@@ -912,12 +917,13 @@ fn splice_keeps_programs_well_formed() {
     assert_eq!(count(D::BASE_ADDRESS_OUTPUT_ACTIVATION), 2);
 }
 
-/// `chain::convs` places the patch buffers above every layer's own narrow
-/// memory, and refuses chains whose output does not fill the next patch
-/// (16x16 stride 2 -> an 8x8 image the generators do not lay out).
+/// `chain::plan` places the patches above every layer's own narrow
+/// memory, reuses a patch's memory once it is dead, and `chain::convs`
+/// refuses chains whose output does not fill the next patch (16x16 stride
+/// 2 -> an 8x8 image the generators do not lay out).
 #[test]
 fn conv_chain_planning() {
-    use reef_infer::codegen::chain::{conv_buffers, convs};
+    use reef_infer::codegen::chain::{Node, Op, convs, plan};
     let conv = |k: usize, stride: usize, hw: usize, cin: usize, cout: usize| Conv {
         cin,
         cout,
@@ -938,22 +944,38 @@ fn conv_chain_planning() {
         },
         relu: false,
     };
-    let (a, b, c) = (
+    let (a, b, c, d) = (
         conv(3, 1, 32, 16, 32),
+        conv(3, 1, 32, 32, 32),
         conv(3, 1, 32, 32, 32),
         conv(3, 2, 32, 32, 32),
     );
-    let bufs = conv_buffers(&[&a, &b, &c]).unwrap();
-    for l in [&a, &b, &c] {
-        assert!(bufs[0] >= l.narrow_end());
+    let layers = [&a, &b, &c, &d];
+    let nodes: Vec<Node> = (0..4)
+        .map(|k| Node {
+            op: Op::Conv(layers[k], 0),
+            inputs: vec![k],
+        })
+        .collect();
+    let p = plan(&nodes).unwrap();
+    let at: Vec<(i64, _)> = (1..4).map(|t| p.at[t].unwrap()).collect();
+    for l in layers {
+        assert!(at.iter().all(|&(x, _)| x >= l.narrow_end()));
     }
     // 32x32 Cin 32: the layer's own buffers end past 0x1000
     assert!(b.narrow_end() > 0x1000);
-    assert!(bufs[1] >= bufs[0] + b.input_patch().tp().max(c.input_patch().tp()));
-    assert!(convs(&[(&a, 0), (&b, 0x400), (&c, 0x800)]).is_ok());
+    // each tensor is the next layer's patch; 1 and 2 are live together,
+    // 3 takes 1's place
+    for t in 0..3 {
+        assert_eq!(at[t].1, layers[t + 1].input_patch());
+    }
+    assert!(at[1].0 >= at[0].0 + at[0].1.tp());
+    assert_eq!(at[2].0, at[0].0);
+    assert!(p.at[0].is_none() && p.at[4].is_none());
+    assert!(convs(&[(&a, 0), (&b, 0x400), (&d, 0x800)]).is_ok());
     // 32x32 stride 1 -> 16x16: 8x8 pixels per tile do not fill a 4x4 patch
-    let d = conv(3, 1, 16, 32, 32);
-    assert!(convs(&[(&b, 0), (&d, 0x400)]).is_err());
+    let d16 = conv(3, 1, 16, 32, 32);
+    assert!(convs(&[(&b, 0), (&d16, 0x400)]).is_err());
     // 16x16 stride 2 -> 8x8: not laid out on the 4x4 grid
     let (e, f) = (conv(3, 2, 16, 32, 32), conv(3, 1, 16, 32, 32));
     assert!(convs(&[(&e, 0), (&f, 0x400)]).is_err());

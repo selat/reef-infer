@@ -6,9 +6,10 @@
 //! Needs `<model>.tflite` (with static shapes) and `<model>_edgetpu.tflite`
 //! (`edgetpu_compiler -s <model>.tflite`) next to the test set of
 //! `examples/eval.rs`. Reports, per image: the compiled model (weights
-//! cached once), our layer programs as `Graph::run` runs them (every
-//! layer's weights cached once, each at its own wide address), and a
-//! per-layer breakdown of ours into weight loading and inference.
+//! cached once), our programs as `Graph::run` runs them (every layer's
+//! weights cached once, each at its own wide address; on-chip chains in
+//! one call), and a per-layer breakdown of ours (one call per layer) into
+//! weight loading and inference.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -66,8 +67,14 @@ async fn main() {
     let programs = graph.build().unwrap();
     let mut dev = Device::open().await.expect("no Edge TPU");
     println!(
-        "{name}: {n} images, {} generated programs\n",
-        programs.len()
+        "{name}: {n} images, {} generated layer programs, {} calls per image (chains {:?})\n",
+        programs.steps.len(),
+        programs.calls(),
+        programs
+            .chains
+            .iter()
+            .map(|c| c.0.clone())
+            .collect::<Vec<_>>()
     );
 
     // ── edgetpu_compiler: weights cached once, then one call per image.
@@ -122,8 +129,8 @@ async fn main() {
     }
     let ours_ms = t.elapsed().as_secs_f64() * 1e3 / n as f64;
     println!(
-        "\nours ({} programs through the host, weights cached once):",
-        programs.len()
+        "\nours ({} calls through the host, weights cached once):",
+        programs.calls()
     );
     println!("  weight load once:  {ours_load_ms:.2} ms");
     println!(
@@ -142,7 +149,7 @@ async fn main() {
     println!("  {:<38} {:>10} {:>12}", "layer", "load ms", "infer ms");
     let mut acts = std::collections::HashMap::from([(graph.input_tensor, inputs[0].clone())]);
     let (mut sum_load, mut sum_infer) = (0.0, 0.0);
-    for (st, p) in graph.steps.iter().zip(&programs) {
+    for (st, p) in graph.steps.iter().zip(&programs.steps) {
         let ins: Vec<&[u8]> = st.inputs.iter().map(|i| &acts[&i.tensor][..]).collect();
         let x = st.fit(&ins).concat();
         let mut loads = Vec::new();
@@ -176,7 +183,7 @@ async fn main() {
     }
     println!("  {:<38} {sum_load:>10.3} {sum_infer:>12.3}", "total");
     println!(
-        "\nsummary: compiled {comp_ms:.2} ms / image; ours {ours_ms:.2} ms ({:.1}x), of which {sum_infer:.2} ms is the layers' calls ({:.1}x the compiled model) and the rest host glue",
+        "\nsummary: compiled {comp_ms:.2} ms / image; ours {ours_ms:.2} ms ({:.1}x); one call per layer would spend {sum_infer:.2} ms in the calls alone ({:.1}x the compiled model)",
         ours_ms / comp_ms,
         sum_infer / comp_ms
     );

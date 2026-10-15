@@ -96,6 +96,16 @@ async fn main() {
         return;
     }
     let programs = graph.build().unwrap();
+    println!(
+        "TPU: {} layers in {} calls per image (on-chip chains: {:?})",
+        programs.steps.len(),
+        programs.calls(),
+        programs
+            .chains
+            .iter()
+            .map(|c| c.0.clone())
+            .collect::<Vec<_>>()
+    );
     let mut dev = Device::open().await.expect("no Edge TPU");
     let loaded = graph.load(&mut dev, &programs).await.unwrap();
     let (mut tpu_ok, mut mismatched) = (0, 0);

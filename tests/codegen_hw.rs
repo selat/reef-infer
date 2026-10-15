@@ -412,6 +412,7 @@ async fn generated_programs_on_tpu() {
     );
 
     chained(&mut dev, &mut seed).await;
+    residual(&mut dev, &mut seed).await;
     loopback(&mut dev).await;
 }
 
@@ -466,7 +467,7 @@ async fn chained(dev: &mut Device, seed: &mut u64) {
         .chain_program(
             ua,
             Io {
-                input_at: Some(0x1000),
+                input_at: Some((0x1000, b.input_patch())),
                 ..Io::default()
             },
         )
@@ -533,6 +534,104 @@ async fn chained(dev: &mut Device, seed: &mut u64) {
         let want = layers.iter().fold(x.clone(), |y, c| c.reference(&y));
         let got = dev.run_inference(&loaded, x).await.unwrap();
         assert!(got == want, "chained 32x32 -> stride 2 -> 16x16");
+    }
+}
+
+/// Residual blocks on chip through `chain::program`: the shortcut stays in
+/// narrow memory across a conv, an add reads both from there (its inputs
+/// in either address order) and writes into the next conv's patch, or
+/// sends the sum to the host.
+async fn residual(dev: &mut Device, seed: &mut u64) {
+    use reef_infer::codegen::chain::{Node, Op, program};
+    use reef_infer::executable_generated::platforms::darwinn::ExecutableType;
+    use reef_infer::model::{ExecInfo, TfliteModel};
+    let q = |scale, zero_point| Quant { scale, zero_point };
+    let conv = |seed: &mut u64, cin: usize, cout: usize, i: Quant, o: Quant, relu| Conv {
+        cin,
+        cout,
+        k: 3,
+        stride: 1,
+        width: 16,
+        height: 16,
+        weights: bytes(seed, cout * 9 * cin)
+            .iter()
+            .map(|&b| b as i8)
+            .collect(),
+        w_scale: vec![0.0007 * 16.0 / cin as f32; cout],
+        bias: (0..cout).map(|i| 300 * i as i32 - 4000).collect(),
+        input: i,
+        output: o,
+        relu,
+    };
+    let (q0, q1, q2, q3) = (q(0.03, 100), q(0.2, 0), q(0.15, 120), q(0.25, 10));
+    let a = conv(seed, 16, 32, q0, q1, true);
+    let b = conv(seed, 32, 32, q1, q2, false);
+    let d = conv(seed, 32, 16, q3, q(0.2, 128), false);
+    let add = |a: Quant, b: Quant| Add {
+        height: 16,
+        width: 16,
+        c: 32,
+        a,
+        b,
+        output: q3,
+        relu: true,
+    };
+    // the second input (a's output) lies below the first (b's)
+    let (sum_ba, sum_ab) = (add(q2, q1), add(q1, q2));
+    let mut bases = Vec::new();
+    let mut next = 0;
+    for c in [&a, &b, &d] {
+        dev.load_params(Arc::new(c.build_at(next).unwrap()))
+            .await
+            .unwrap();
+        bases.push(next);
+        next += c.wide_units();
+    }
+    let node = |op, inputs: &[usize]| Node {
+        op,
+        inputs: inputs.to_vec(),
+    };
+    let chains = [
+        vec![
+            node(Op::Conv(&a, bases[0]), &[0]),
+            node(Op::Conv(&b, bases[1]), &[1]),
+            node(Op::Add(&sum_ba), &[2, 1]),
+            node(Op::Conv(&d, bases[2]), &[3]),
+        ],
+        vec![
+            node(Op::Conv(&a, bases[0]), &[0]),
+            node(Op::Conv(&b, bases[1]), &[1]),
+            node(Op::Add(&sum_ab), &[1, 2]),
+        ],
+    ];
+    for (k, nodes) in chains.iter().enumerate() {
+        let last = if k == 0 {
+            d.build().unwrap()
+        } else {
+            sum_ab.build().unwrap().into_model()
+        };
+        let model = TfliteModel {
+            executables: vec![ExecInfo {
+                exec_type: ExecutableType::EXECUTION_ONLY,
+                parameters: vec![],
+                instruction_chunks: vec![program(nodes).unwrap()],
+                input_layers: a.build().unwrap().executables.remove(0).input_layers,
+                output_layers: last.executables.into_iter().next().unwrap().output_layers,
+                scratch_size_bytes: 0,
+            }],
+        };
+        let loaded = dev.load_params(Arc::new(model)).await.unwrap();
+        for _ in 0..3 {
+            let x = bytes(seed, 16 * 16 * 16);
+            let (x1, x2) = (a.reference(&x), b.reference(&a.reference(&x)));
+            let want = if k == 0 {
+                d.reference(&sum_ba.reference(&x2, &x1))
+            } else {
+                sum_ab.reference(&x1, &x2)
+            };
+            let got = dev.run_inference(&loaded, x).await.unwrap();
+            assert!(got == want, "residual chain {k}");
+        }
     }
 }
 

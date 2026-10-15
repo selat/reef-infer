@@ -63,10 +63,12 @@ use super::*;
 /// is the host for both.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Io {
-    /// The padded input patch ([`Conv::input_patch`]) is already on every
-    /// tile at this narrow byte address, interior filled (the halo is
-    /// not): no host input.
-    pub input_at: Option<i64>,
+    /// The input is already on every tile at narrow byte address `.0`, in
+    /// a patch of geometry `.1` with its interior filled (the halo is
+    /// not): no host input. The patch is [`Conv::input_patch`] or one with
+    /// more padding on any side (a tensor read by several layers is stored
+    /// once, padded for all of them).
+    pub input_at: Option<(i64, Patch)>,
     /// Write the output into the next layer's padded patch at narrow byte
     /// address `.0` (geometry `.1`) instead of sending it to the host. The
     /// address must lie above this layer's own buffers
@@ -404,8 +406,25 @@ impl Conv {
     ) -> Result<ChunkInfo, Box<dyn std::error::Error>> {
         self.check()?;
         check_base(base)?;
-        if io.input_at.is_some() && self.cin < 4 {
-            return Err("chained conv: Cin 1 / 3 widen the host input; not chained".into());
+        if let Some((_, p)) = io.input_at {
+            if self.cin < 4 {
+                return Err("chained conv: Cin 1 / 3 widen the host input; not chained".into());
+            }
+            let own = self.patch();
+            let covers = p.cin == own.cin
+                && p.rows == own.rows
+                && p.top >= own.top
+                && p.bottom >= own.bottom
+                && p.left >= own.left
+                && p.right >= own.right;
+            // a 1x1 stride-1 op walks the pixels as one run
+            let plain = self.k > 1 || self.stride > 1 || p.pw() == 4;
+            if !covers || !plain {
+                return Err(format!(
+                    "chained conv: stored input patch {p:?} does not hold this layer's {own:?}"
+                )
+                .into());
+            }
         }
         if let Some((at, p)) = io.output_to {
             let (oy, ox) = self.opx();
@@ -463,7 +482,8 @@ impl Conv {
         let mut a = Asm::new();
         prologue(&mut a)?;
         // narrow base of the padded patch (0 unless chained)
-        let nb = io.input_at.unwrap_or(0);
+        // and its geometry (this layer's own, or a stored one padded more)
+        let (nb, ip) = io.input_at.unwrap_or((0, pt));
         if io.input_at.is_none() {
             // ── Constant setup (as in elementwise): one-hot words at narrow
             // tp + 2 tb, copied to wide just below the input buffer.
@@ -748,7 +768,7 @@ impl Conv {
             }
         }
         if self.k > 1 {
-            halo(&mut a, &pt, self.input.zero_point, nb)?;
+            halo(&mut a, &ip, self.input.zero_point, nb)?;
         }
         sync(&mut a, 0, 0x3ff, true)?;
         wait_tiles(&mut a)?;
@@ -841,10 +861,10 @@ impl Conv {
         // ── The conv TensorOp.
         let (lo, hi) = self.fc().clamp();
         let mut f: Vec<(String, i64)> = Vec::new();
-        let rs = pt.pw() * pt.cq(); // padded row stride in words
+        let rs = ip.pw() * ip.cq(); // padded row stride in words
         // first window's origin: padded row 0 is the top halo; along x the
         // halo is whole superpixels, so start `left m - pad` real pixels in
-        let (pad_y, pad_x) = (pt.top - self.pad().0, pt.left * self.spx() - self.pad().0);
+        let (pad_y, pad_x) = (ip.top - self.pad().0, ip.left * self.spx() - self.pad().0);
         let in_base = 4 * (pad_y * rs + pad_x * cq);
         let k = self.k as i64;
         let (in_dims, loops): (Vec<(i64, i64)>, [i64; 3]) = if k1_split {

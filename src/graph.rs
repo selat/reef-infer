@@ -24,6 +24,11 @@
 //! 0, [`Layer::wide_units`] each), so [`Graph::load`] caches all of them
 //! once and [`Graph::run`] only sends instructions and activations.
 //!
+//! Layers that can run back to back on chip are chained into one call
+//! ([`Graph::chains`], `codegen::chain`): convs and residual adds whose
+//! intermediate tensors (shortcuts included) stay in narrow memory, so
+//! only the chain's input and output cross the host.
+//!
 //! Host glue between layers: the generators cover image sizes 16 / 32 /
 //! 64, so the host pads an activation at the bottom / right with its zero
 //! point up to the program's size and crops the program's output back.
@@ -32,17 +37,19 @@
 //! kept, so the result is exact. Channels a conv generator does not take
 //! (Cin 1 at 32x32) are padded to 16 with zero weights.
 
-use std::sync::Arc;
-
 use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::Arc;
 
 use crate::codegen::add::Add;
 use crate::codegen::avg_pool::{GlobalAvgPool, exact_multiplier};
+use crate::codegen::chain::{self, Node, Op};
 use crate::codegen::conv::Conv;
 use crate::codegen::fc::Fc;
 use crate::codegen::pool::MaxPool;
 use crate::codegen::{PARAM_WIDE_LIMIT, Quant};
-use crate::model::TfliteModel;
+use crate::executable_generated::platforms::darwinn::ExecutableType;
+use crate::model::{ExecInfo, TfliteModel};
 use crate::runner::{Device, DeviceError, LoadedParams};
 use crate::schema_v3_generated::tflite::{
     ActivationFunctionType, BuiltinOperator, Model, Operator, Padding, TensorType, root_as_model,
@@ -441,46 +448,178 @@ impl Graph {
     }
 
     /// Builds every layer's program, each with its parameters at its own
-    /// wide address ([`Graph::wide_bases`]).
-    pub fn build(&self) -> Result<Vec<Arc<TfliteModel>>, Error> {
-        self.steps
+    /// wide address ([`Graph::wide_bases`]), and the chains run in place
+    /// of their layers ([`Graph::chains`]).
+    pub fn build(&self) -> Result<Programs, Error> {
+        let steps = self
+            .steps
             .iter()
             .zip(self.wide_bases()?)
             .map(|(s, base)| Ok(Arc::new(s.layer.build_at(base)?)))
-            .collect()
+            .collect::<Result<_, Error>>()?;
+        let chains = self
+            .chains()?
+            .into_iter()
+            .filter(|r| r.len() > 1)
+            .map(|r| Ok((r.clone(), Arc::new(self.chain(r)?))))
+            .collect::<Result<_, Error>>()?;
+        Ok(Programs { steps, chains })
     }
 
-    /// Caches every layer's parameters on the TPU (programs from
-    /// [`Graph::build`]). They stay valid until another model's parameters
-    /// are loaded.
-    pub async fn load(
-        &self,
-        dev: &mut Device,
-        programs: &[Arc<TfliteModel>],
-    ) -> Result<Vec<LoadedParams>, DeviceError> {
-        let mut loaded = Vec::with_capacity(programs.len());
-        for p in programs {
-            loaded.push(dev.load_params(Arc::clone(p)).await?);
+    /// The steps as runs that each go in one call: greedily from the
+    /// first step, the longest run [`Graph::chain`] takes, else the step
+    /// alone.
+    pub fn chains(&self) -> Result<Vec<Range<usize>>, Error> {
+        let bases = self.wide_bases()?;
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < self.steps.len() {
+            let end = (i + 2..=self.steps.len())
+                .rev()
+                .find(|&j| self.chain_nodes(i..j, &bases).is_some())
+                .unwrap_or(i + 1);
+            out.push(i..end);
+            i = end;
         }
-        Ok(loaded)
+        Ok(out)
     }
 
-    /// Runs the layers loaded by [`Graph::load`] on the TPU, uint8 in and
-    /// out.
+    /// `steps` as chain nodes, if they can run on chip in one call: the
+    /// first reads one tensor from outside, every other input is made
+    /// inside, nothing but the last output is read outside, no host glue
+    /// pads or crops a tensor that stays inside, and the chain plans.
+    fn chain_nodes<'a>(&'a self, steps: Range<usize>, bases: &[i64]) -> Option<Vec<Node<'a>>> {
+        let made: HashMap<i32, usize> = steps
+            .clone()
+            .map(|k| (self.steps[k].output, k + 1 - steps.start))
+            .collect();
+        let last = self.steps[steps.end - 1].output;
+        let escapes = |t: i32| {
+            t == self.output_tensor
+                || self.steps[..steps.start]
+                    .iter()
+                    .chain(&self.steps[steps.end..])
+                    .any(|s| s.inputs.iter().any(|i| i.tensor == t))
+        };
+        if made.keys().any(|&t| t != last && escapes(t)) {
+            return None;
+        }
+        let mut nodes = Vec::new();
+        for k in steps.clone() {
+            let s = &self.steps[k];
+            let (ins, out) = s.layer.shapes();
+            let internal = k + 1 < steps.end;
+            if internal && out != s.output_shape {
+                return None;
+            }
+            let mut inputs = Vec::new();
+            for (i, shape) in s.inputs.iter().zip(&ins) {
+                match made.get(&i.tensor) {
+                    Some(&t) if i.shape == *shape => inputs.push(t),
+                    None if k == steps.start => inputs.push(0),
+                    _ => return None,
+                }
+            }
+            let op = match &s.layer {
+                Layer::Conv(c) => Op::Conv(c, bases[k]),
+                Layer::Add(a) => Op::Add(a),
+                _ => return None,
+            };
+            nodes.push(Node { op, inputs });
+        }
+        chain::program(&nodes).is_ok().then_some(nodes)
+    }
+
+    /// One EXECUTION_ONLY program running `steps` on chip (a run from
+    /// [`Graph::chains`]), the layers' parameters cached by their own
+    /// programs. Input: the first step's program input; output: the last
+    /// one's program output.
+    pub fn chain(&self, steps: Range<usize>) -> Result<TfliteModel, Error> {
+        let bases = self.wide_bases()?;
+        let nodes = self
+            .chain_nodes(steps.clone(), &bases)
+            .ok_or(format!("steps {steps:?} do not chain"))?;
+        let chunk = chain::program(&nodes)?;
+        let exec = |k: usize| -> Result<ExecInfo, Error> {
+            Ok(self.steps[k]
+                .layer
+                .build_at(bases[k])?
+                .executables
+                .into_iter()
+                .find(|e| e.exec_type != ExecutableType::PARAMETER_CACHING)
+                .ok_or("no execution program")?)
+        };
+        let (first, last) = (exec(steps.start)?, exec(steps.end - 1)?);
+        Ok(TfliteModel {
+            executables: vec![ExecInfo {
+                exec_type: ExecutableType::EXECUTION_ONLY,
+                parameters: Vec::new(),
+                instruction_chunks: vec![chunk],
+                input_layers: first.input_layers,
+                output_layers: last.output_layers,
+                scratch_size_bytes: 0,
+            }],
+        })
+    }
+
+    /// Caches every layer's parameters on the TPU and loads the chains
+    /// (programs from [`Graph::build`]). The parameters stay valid until
+    /// another model's are loaded.
+    pub async fn load(&self, dev: &mut Device, programs: &Programs) -> Result<Loaded, DeviceError> {
+        let mut steps = Vec::with_capacity(programs.steps.len());
+        for p in &programs.steps {
+            steps.push(dev.load_params(Arc::clone(p)).await?);
+        }
+        let mut chains = Vec::with_capacity(programs.chains.len());
+        for (r, p) in &programs.chains {
+            chains.push((r.clone(), dev.load_params(Arc::clone(p)).await?));
+        }
+        Ok(Loaded { steps, chains })
+    }
+
+    /// Runs the graph loaded by [`Graph::load`] on the TPU, a chain in one
+    /// call and every other layer in its own, uint8 in and out.
     pub async fn run(
         &self,
         dev: &mut Device,
-        loaded: &[LoadedParams],
+        loaded: &Loaded,
         x: &[u8],
     ) -> Result<Vec<u8>, DeviceError> {
         let mut acts: HashMap<i32, Vec<u8>> = HashMap::from([(self.input_tensor, x.to_vec())]);
-        for (s, p) in self.steps.iter().zip(loaded) {
-            let ins: Vec<&[u8]> = s.inputs.iter().map(|i| &acts[&i.tensor][..]).collect();
-            let y = dev.run_inference(p, s.fit(&ins).concat()).await?;
-            acts.insert(s.output, s.crop(&y));
+        let mut k = 0;
+        while k < self.steps.len() {
+            let (end, p) = match loaded.chains.iter().find(|(r, _)| r.start == k) {
+                Some((r, p)) => (r.end, p),
+                None => (k + 1, &loaded.steps[k]),
+            };
+            let (first, last) = (&self.steps[k], &self.steps[end - 1]);
+            let ins: Vec<&[u8]> = first.inputs.iter().map(|i| &acts[&i.tensor][..]).collect();
+            let y = dev.run_inference(p, first.fit(&ins).concat()).await?;
+            acts.insert(last.output, last.crop(&y));
+            k = end;
         }
         Ok(acts.remove(&self.output_tensor).unwrap())
     }
+}
+
+/// A graph's programs ([`Graph::build`]): every layer's own (they also
+/// cache its parameters), and the chains that replace runs of them.
+pub struct Programs {
+    pub steps: Vec<Arc<TfliteModel>>,
+    pub chains: Vec<(Range<usize>, Arc<TfliteModel>)>,
+}
+
+impl Programs {
+    /// Calls per inference.
+    pub fn calls(&self) -> usize {
+        self.steps.len() - self.chains.iter().map(|(r, _)| r.len() - 1).sum::<usize>()
+    }
+}
+
+/// A graph on the TPU ([`Graph::load`]).
+pub struct Loaded {
+    pub steps: Vec<LoadedParams>,
+    pub chains: Vec<(Range<usize>, LoadedParams)>,
 }
 
 /// A global average pool over `n` pixels of `c` channels as an FC on the

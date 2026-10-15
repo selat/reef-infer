@@ -111,11 +111,12 @@ top-1 as TFLite CPU. The items it did not need stay open.
 ## Speed today (2026-10-15)
 
 ResNet-8 on CIFAR-10, same `.tflite` and TPU (`examples/bench_compare.rs`):
-`edgetpu_compiler` 0.97 ms per image, ours 14.8 ms (14 programs, every
-layer's parameters cached once at its own wide address; 25.6 ms when every
-layer reloaded them). The 14 calls take all of it: the remaining gap is
-per-call overhead (instructions and activations over USB per layer), so
-item 4 below matters most.
+`edgetpu_compiler` 0.94 ms per image, ours 6.9 ms: 7 calls, the first
+running stages 1-2 (six convs and two residual adds) on chip, every
+layer's parameters cached once at its own wide address (14.8 ms as 14
+calls, 25.6 ms when every layer reloaded its parameters). The remaining
+gap is per-call overhead (instructions and activations over USB per
+call), so item 4 below matters most.
 
 ## Cross-cutting, in order of when they start to matter
 
@@ -135,7 +136,10 @@ item 4 below matters most.
    call (`codegen::chain`), and convs hand their output to the next conv's
    patch in narrow memory at 16x16, 32x32 and across 32x32 stride 2 ->
    16x16, bit-exact (ResNet-8's five stage 1-2 convs: 1.41 ms in one call,
-   5.58 ms as five). Next: add with a kept shortcut, native 8x8, pool -> FC.
+   5.58 ms as five). Residual adds chain too, the shortcuts kept in narrow
+   memory (`chain::plan`), and `Graph::run` makes one call per chain:
+   ResNet-8 stages 1-2 in one call, 7 calls per image in all. Next:
+   native 8x8 (stage 3), pool -> FC.
 
 ## Not planned
 

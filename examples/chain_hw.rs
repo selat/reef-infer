@@ -258,7 +258,7 @@ async fn main() {
         .chain_program(
             ua,
             Io {
-                input_at: Some(NB),
+                input_at: Some((NB, b.input_patch())),
                 ..Io::default()
             },
         )
@@ -313,7 +313,7 @@ async fn main() {
     }
     const BUF: [i64; 2] = [0x1000, 0x2000];
     let io = |i: usize| Io {
-        input_at: (i > 0).then(|| BUF[(i + 1) % 2]),
+        input_at: (i > 0).then(|| (BUF[(i + 1) % 2], layers[i].input_patch())),
         output_to: (i < 2).then(|| (BUF[i % 2], layers[i + 1].input_patch())),
     };
     let mut parts = Vec::new();

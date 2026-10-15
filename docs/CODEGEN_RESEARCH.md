@@ -1004,3 +1004,58 @@ have no 8x8 layout, the graph pads 8x8 to 16x16 on the host). Next for
 ResNet-8: add (two patches, the shortcut kept alive in narrow memory),
 native 8x8 layers, and pool -> FC from tile 0.
 
+**Residual adds** (same day). The compiler's add op already reads two
+patches of one layout: word pairs of A, then B at a word offset (its
+second loop level), pixels at the pixel stride, rows at the row stride;
+it writes the sum with its own walk. Chained (`Add::chain_program`,
+`add::Io`), those strides come from the patches the inputs are stored in:
+`in_base` is A's first interior byte, the B offset is the distance
+between the two patches, the input row stride the padded patch row, and
+the output goes into the next layer's patch interior at that patch's row
+stride (or into a plain buffer for the outfeed). The program keeps only
+the weight fill, its narrowToWide to 0x2070 and the op; with the output
+on chip its epilogue waits for nothing (`thr5` 0, `thr6` 0). The op wants
+B above A; the arithmetic is symmetric (weights from the two scales,
+offset from both zero points), so a chained add whose inputs lie the
+other way swaps A and B.
+
+A tensor read by several layers is stored once: `chain::plan` gives it
+the union of its readers' patches (the larger padding on every side;
+interiors must agree), and an add's two inputs one geometry. A conv may
+read a patch padded more than its own (`conv::Io::input_at` carries the
+geometry): its halo exchange fills the stored patch's halo and its op
+starts `top - pad` rows / `left m - pad` pixels in, at the stored row
+stride (1x1 stride 1 excepted: it walks the pixels as one run). Tensors
+then get the lowest 256 B aligned narrow address not used by a tensor
+live at the same time (writer to last reader), above every conv's
+`narrow_end` and the adds' scratch (weights; the output on its way to
+the host). For ResNet-8 stages 1-2 (`examples/residual_hw.rs`):
+
+| tensor | read by | patch padding (t b l r) | narrow |
+|---|---|---|---|
+| conv 0 out (shortcut 1) | conv 1, add 3 | 1 1 1 1 | 0x0f00 |
+| conv 1 out | conv 2 | 1 1 1 1 | 0x1700 |
+| conv 2 out | add 3 (as the shortcut) | 1 1 1 1 | 0x1f00 |
+| add 3 out (shortcut 2) | conv 4 (3x3 s2), conv 6 (1x1 s2) | 0 1 0 1 | 0x1700 |
+| conv 4 out | conv 5 | 1 1 1 1 | 0x0f00 |
+| conv 5 out | add 7 | 0 0 0 0 | 0x1400 |
+| conv 6 out | add 7 | 0 0 0 0 | 0x0f00 |
+
+**Bit-exact on the first run**: steps 0-7 (six convs, two adds) as one
+call agree with the host reference on 200 test images, 1.62 ms against
+9.36 ms as eight calls. `tests/codegen_hw.rs` adds a 16x16 block with the
+add's inputs in reverse address order feeding a conv, and one ending in
+an add to the host (a mutation dropping the add's interior offset fails
+it).
+
+**In the graph.** `Graph::chains` splits the steps greedily into the
+longest runs `chain::plan` accepts (the first a conv reading one tensor
+from outside, no tensor but the last read outside the run, no host pad /
+crop inside it); `Graph::build` adds an EXECUTION_ONLY program per run
+(the layers' own programs still cache the parameters) and `Graph::run`
+makes one call per run. ResNet-8 runs as 7 calls (steps 0-7, then
+stride-2 conv, conv, conv, add, pool and FC): all 10000 test images
+bit-exact with the host reference, **6.9 ms per image** (14.8 ms before;
+`edgetpu_compiler` 0.94 ms). MNIST models have no chain (conv -> pool)
+and are unchanged.
+

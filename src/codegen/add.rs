@@ -14,9 +14,43 @@
 //! weight), `offset = -(wa za + wb zb)` and `mult = s_big / (w_big s_out)`.
 //! The weights are mesh-filled into narrow memory and moved to wide 0x2070
 //! (the op's parameter path); the output overwrites B's patch.
+//!
+//! Chained on chip ([`Add::chain_program`], [`super::chain`]) both inputs
+//! are already in narrow memory, in padded patches of one geometry: the op
+//! walks their interiors (B at a word offset from A) and writes the sum
+//! into the next layer's patch, or into a plain buffer for the host.
 
 use super::band::{self, Grid, walk};
 use super::*;
+
+/// Where a chained add's inputs are and its output goes.
+#[derive(Debug, Clone, Copy)]
+pub struct Io {
+    /// Narrow byte addresses of A and B, each in a patch of geometry
+    /// `patch` with its interior filled (the halo is not read).
+    pub a: i64,
+    pub b: i64,
+    pub patch: Patch,
+    /// Write the output into a patch at narrow `.0` of geometry `.1`, or
+    /// (`None`) send it to the host.
+    pub output_to: Option<(i64, Patch)>,
+    /// Free narrow bytes ([`Add::scratch_bytes`]): the weights, and the
+    /// output on its way to the host.
+    pub scratch: i64,
+}
+
+/// Where the op's operands are and its output goes, in narrow bytes and
+/// words: A's first interior byte, B's offset from it (words) and the
+/// input row stride (words), the output's first byte and row stride, the
+/// weights.
+struct Place {
+    in_base: i64,
+    b_off: i64,
+    in_rs: i64,
+    out_base: i64,
+    out_rs: i64,
+    weights: i64,
+}
 
 #[derive(Debug, Clone)]
 pub struct Add {
@@ -166,15 +200,104 @@ impl Add {
         Ok(self.program()?)
     }
 
+    /// Narrow bytes a chained add needs to itself ([`Io::scratch`]).
+    pub fn scratch_bytes(&self, to_host: bool) -> i64 {
+        0x100 + if to_host { self.grid().b() } else { 0 }
+    }
+
+    /// The patch interior this add reads and writes, unpadded.
+    pub fn patch(&self) -> Patch {
+        let g = self.grid();
+        Patch {
+            rows: g.th,
+            cin: g.tw * g.c / 4,
+            ..Patch::plain(0)
+        }
+    }
+
+    /// The execution program with the inputs on chip as `io` says; its
+    /// output layer (host output only) is "output".
+    pub fn chain_program(&self, io: Io) -> Result<ChunkInfo, Box<dyn std::error::Error>> {
+        self.check()?;
+        // the op reads A then B at a positive offset: swap the operands
+        // (the arithmetic is symmetric) to keep A below B
+        if io.b < io.a {
+            let swapped = Add {
+                a: self.b,
+                b: self.a,
+                ..self.clone()
+            };
+            return swapped.chain_program(Io {
+                a: io.b,
+                b: io.a,
+                ..io
+            });
+        }
+        let own = self.patch();
+        let fits = |p: &Patch| p.rows == own.rows && p.cin == own.cin;
+        if !fits(&io.patch) || io.output_to.is_some_and(|(_, p)| !fits(&p)) {
+            return Err(format!(
+                "chained add: patches {:?} / {:?} do not hold {}x{}x{}",
+                io.patch, io.output_to, self.height, self.width, self.c
+            )
+            .into());
+        }
+        if io.b - io.a < io.patch.tp() || io.a % 4 != 0 || io.b % 4 != 0 {
+            return Err(format!("chained add: inputs at {:#x} / {:#x} overlap", io.a, io.b).into());
+        }
+        let rs = |p: &Patch| p.pw() * p.cq();
+        let (out_base, out_rs) = match io.output_to {
+            Some((at, p)) => (at + p.at(0, 0), rs(&p)),
+            None => (io.scratch + 0x100, rs(&own)),
+        };
+        let place = Place {
+            in_base: io.a + io.patch.at(0, 0),
+            b_off: (io.b - io.a) / 4,
+            in_rs: rs(&io.patch),
+            out_base,
+            out_rs,
+            weights: io.scratch,
+        };
+        Ok(self.emit(Some(place), io.output_to.is_none())?.0)
+    }
+
     /// The program; its input layers are "input_a" and "input_b" (the
     /// host sends them back to back).
     pub fn program(&self) -> Result<Program, IsaError> {
+        let (chunk, output) = self.emit(None, true)?;
+        let shape = (self.height, self.width, self.c);
+        Ok(Program {
+            chunk,
+            parameters: Vec::new(),
+            input: layer("input_a", shape, self.a),
+            extra_inputs: vec![layer("input_b", shape, self.b)],
+            output,
+        })
+    }
+
+    /// The bitstream: host inputs (`place` `None`) or chained, the output to
+    /// the host or not, and the host output layer.
+    fn emit(
+        &self,
+        place: Option<Place>,
+        to_host: bool,
+    ) -> Result<(ChunkInfo, LayerInfo), IsaError> {
         const A_NAME: &str = "input_a";
         const B_NAME: &str = "input_b";
         const OUT_NAME: &str = "output";
         let g = self.grid();
         let (tw, th, cw, b, s) = (g.tw, g.th, g.cw(), g.b(), g.slots());
         let w = b / 4; // words per patch
+        let chained = place.is_some();
+        // host inputs: A at 0, B right above it, the output over B
+        let p = place.unwrap_or(Place {
+            in_base: 0,
+            b_off: w,
+            in_rs: tw * cw,
+            out_base: b,
+            out_rs: tw * cw,
+            weights: 2 * b,
+        });
         // Wide memory: with a 2-slot image row the constants sit on top and
         // the staging below them; otherwise the staging on top.
         let (stage_w, const_w) = if s == 2 {
@@ -187,27 +310,29 @@ impl Add {
 
         let mut a = Asm::new();
         prologue(&mut a)?;
-        band::constants(&mut a, const_n, const_w)?;
-        // input A: staged at b, patch at 0
-        band::copy_op(&mut a, &g, par, true, b, 0)?;
-        band::load(&mut a, &g, A_NAME, b, stage_w)?;
-        band::copy_op(&mut a, &g, par, false, b, 0)?;
-        sync(&mut a, 0x1ffff, 0x3ff, false)?;
-        a.emit(OP_SCSYNC, &[("smask", 5), ("sunits", 0xc)])?;
-        sync(&mut a, 0, 0x3ff, true)?;
-        wait_tiles(&mut a)?;
-        a.emit(OP_SYNC, &[("tiles", ALL_TILES), ("units", 0x20)])?;
-        // input B: staged at 2b, patch at b
-        band::copy_op(&mut a, &g, par, true, 2 * b, b)?;
-        band::load(&mut a, &g, B_NAME, 2 * b, stage_w)?;
-        band::copy_op(&mut a, &g, par, false, 2 * b, b)?;
-        sync(&mut a, 0x1ffff, 0x3ff, false)?;
+        if !chained {
+            band::constants(&mut a, const_n, const_w)?;
+            // input A: staged at b, patch at 0
+            band::copy_op(&mut a, &g, par, true, b, 0)?;
+            band::load(&mut a, &g, A_NAME, b, stage_w)?;
+            band::copy_op(&mut a, &g, par, false, b, 0)?;
+            sync(&mut a, 0x1ffff, 0x3ff, false)?;
+            a.emit(OP_SCSYNC, &[("smask", 5), ("sunits", 0xc)])?;
+            sync(&mut a, 0, 0x3ff, true)?;
+            wait_tiles(&mut a)?;
+            a.emit(OP_SYNC, &[("tiles", ALL_TILES), ("units", 0x20)])?;
+            // input B: staged at 2b, patch at b
+            band::copy_op(&mut a, &g, par, true, 2 * b, b)?;
+            band::load(&mut a, &g, B_NAME, 2 * b, stage_w)?;
+            band::copy_op(&mut a, &g, par, false, 2 * b, b)?;
+            sync(&mut a, 0x1ffff, 0x3ff, false)?;
+        }
         sync(&mut a, 0x1ffff, 0x3ff, false)?;
 
         // ── Weights: wa, wb as 16-bit halves at narrow 2b, filled from the
         // four mesh directions, then moved to wide 0x2070.
         let (wa, wb) = self.weights();
-        let wn = 2 * b;
+        let wn = p.weights;
         let zero4: &[(&str, i64)] = &[
             ("i_cnt0", 3),
             ("i_inc1", -3),
@@ -290,7 +415,7 @@ impl Add {
             ("in_hmode", 2),
             ("in_mode7", 3),
             ("in_tflags", 0xf),
-            ("out_base", b),
+            ("out_base", p.out_base),
             ("out_mode7", 3),
             ("out_tflags", 7),
             ("par_base", 0x70),
@@ -335,7 +460,17 @@ impl Add {
         const IN_MODE: [&str; 7] = [
             "in_mode0", "in_mode1", "in_mode2", "in_mode3", "in_mode4", "in_mode5", "in_mode6",
         ];
-        let in_levels = [(1, 2), (w, 2), (cw, tw), (tw * cw, th), (w, 1), (1, cw)];
+        if p.in_base != 0 {
+            f.push(("in_base", p.in_base));
+        }
+        let in_levels = [
+            (1, 2),
+            (p.b_off, 2),
+            (cw, tw),
+            (p.in_rs, th),
+            (p.b_off, 1),
+            (1, cw),
+        ];
         for (k, (inc, cnt)) in walk(&in_levels, 8).into_iter().enumerate() {
             if k > 0 {
                 f.push((IN_INC[k], inc)); // the first level's stride is implicit
@@ -352,7 +487,7 @@ impl Add {
             "out_inc7",
         ];
         const OUT_CNT: [&str; 5] = ["out_cnt0", "out_cnt1", "out_cnt2", "out_cnt3", "out_cnt4"];
-        let out_levels = [(1, 1), (cw, tw), (tw * cw, th), (w, 1), (1, cw)];
+        let out_levels = [(1, 1), (cw, tw), (p.out_rs, th), (p.b_off, 1), (1, cw)];
         for (k, (inc, cnt)) in walk(&out_levels, 8).into_iter().enumerate() {
             f.push((OUT_INC[k], inc));
             if k < 5 {
@@ -363,6 +498,11 @@ impl Add {
         sync(&mut a, 0x1ffff, 0x3ff, false)?;
         sync(&mut a, 0, 0x3ff, true)?;
         wait_tiles(&mut a)?;
+        if !to_host {
+            // the output stays on chip
+            epilogue(&mut a, 0, 0)?;
+            return Ok((a.finish()?, layer(OUT_NAME, (0, 0, 0), self.output)));
+        }
 
         // ── Output: narrow b -> wide 0x2078 on every tile, then each tile in
         // turn produces its b bytes for the outfeed.
@@ -370,7 +510,7 @@ impl Add {
         descriptor_addr(&mut a)?;
         let mut f: Vec<(&str, i64)> = vec![
             ("tile_mask", ALL_TILES),
-            ("narrow_addr", b / 4),
+            ("narrow_addr", p.out_base / 4),
             ("narrow_lvl_mask", 7),
             ("wide_addr", 0x2078),
             ("w_lim0", b / 256 - 1),
@@ -443,12 +583,6 @@ impl Add {
             y_coordinate_to_local_y_offset: (0..shape.0).map(|y| (y % py) as i32).collect(),
             x_coordinate_to_local_y_row_size: vec![(px * nz) as i32; shape.1],
         });
-        Ok(Program {
-            chunk: a.finish()?,
-            parameters: Vec::new(),
-            input: layer(A_NAME, shape, self.a),
-            extra_inputs: vec![layer(B_NAME, shape, self.b)],
-            output,
-        })
+        Ok((a.finish()?, output))
     }
 }

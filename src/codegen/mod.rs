@@ -528,7 +528,7 @@ pub fn done(a: &mut Asm) -> Result<(), IsaError> {
 /// One tile's 4x4 pixel patch of a `cin`-channel uint8 tensor, stored
 /// pixel-major (`[y][x][cin]`) with a halo of `top` / `left` pixels before
 /// and `bottom` / `right` after it (a convolution's padding).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Patch {
     pub cin: i64,
     /// Interior rows (4, or more for taller images; the loader moves them
