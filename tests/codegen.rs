@@ -834,3 +834,80 @@ fn resnet8_graph_matches_tflite() {
         );
     }
 }
+
+/// `chain::splice` joins programs into one: a single start / end frame,
+/// tile sequence numbers strictly increasing across the parts, and every
+/// relocation still on a `mov` immediate.
+#[test]
+fn splice_keeps_programs_well_formed() {
+    use reef_infer::codegen::chain::splice;
+    use reef_infer::codegen::conv::Io;
+    let conv = |cin: usize, cout: usize| Conv {
+        cin,
+        cout,
+        k: 3,
+        stride: 1,
+        width: 16,
+        height: 16,
+        weights: vec![1; cout * 9 * cin],
+        w_scale: vec![0.001; cout],
+        bias: vec![0; cout],
+        input: Quant {
+            scale: 0.03,
+            zero_point: 128,
+        },
+        output: Quant {
+            scale: 0.2,
+            zero_point: 128,
+        },
+        relu: false,
+    };
+    let (a, b) = (conv(16, 32), conv(32, 16));
+    let pa = a
+        .chain_program(
+            0,
+            Io {
+                output_to: Some((0x1000, b.input_patch())),
+                ..Io::default()
+            },
+        )
+        .unwrap();
+    let pb = b
+        .chain_program(
+            a.wide_units(),
+            Io {
+                input_at: Some(0x1000),
+                ..Io::default()
+            },
+        )
+        .unwrap();
+    let joined = splice(&[pa, pb]).unwrap();
+    let ins = isa::split(&joined.bitstream).unwrap();
+    let ops: Vec<u8> = ins.iter().map(|i| i.opcode()).collect();
+    assert_eq!(ops.iter().filter(|&&o| o == 0x3e).count(), 1); // start
+    assert_eq!(ops.iter().filter(|&&o| o == 0x3f).count(), 1); // end
+    let seqs: Vec<i64> = ins
+        .iter()
+        .filter_map(|i| i.decode().unwrap().get("seq"))
+        .collect();
+    assert!(seqs.windows(2).all(|w| w[0] < w[1]), "sequence numbers");
+    let words = isa::words(&joined.bitstream).unwrap();
+    for r in &joined.field_offsets {
+        let w = r.offset_bit as usize / 128;
+        let d = isa::layout(isa::opcode(words[w]))
+            .unwrap()
+            .decode(&words[w..w + 1])
+            .unwrap();
+        assert_eq!(
+            d.get("s_op"),
+            Some(0x2f),
+            "relocation at bit {}",
+            r.offset_bit
+        );
+    }
+    // one input relocation pair (first part) and one output pair (last)
+    use reef_infer::executable_generated::platforms::darwinn::Description as D;
+    let count = |d: D| joined.field_offsets.iter().filter(|r| r.desc == d).count();
+    assert_eq!(count(D::BASE_ADDRESS_INPUT_ACTIVATION), 2);
+    assert_eq!(count(D::BASE_ADDRESS_OUTPUT_ACTIVATION), 2);
+}

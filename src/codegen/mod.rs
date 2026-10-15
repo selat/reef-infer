@@ -9,6 +9,7 @@
 pub mod add;
 pub mod avg_pool;
 pub(crate) mod band;
+pub mod chain;
 pub mod conv;
 pub mod elementwise;
 pub mod fc;

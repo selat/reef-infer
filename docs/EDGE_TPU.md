@@ -364,6 +364,7 @@ The model-by-model plan (which ops in which order) is in `ROADMAP.md`.
 | MAX_POOL_2D 2x2 stride 2 (`codegen::pool`): H, W 16 / 32, C 32 / 64 / 128 | Done; byte-identical to 16.0 on 5 corpus models, bit-exact on device |
 | Global AVERAGE_POOL_2D 8x8x64 (`codegen::avg_pool`): mesh reduction into tile 0, no parameters, TFLite's rounding | Done; byte-identical to 16.0 (compiler form), bit-exact on device |
 | Parameter placement (`build_at`, `Graph::build`): each layer's cached parameters at their own wide address | Done; coexistence verified on device (`examples/param_cache_hw.rs`) |
+| Several layers in one call (`codegen::chain::splice`); conv -> conv with the activation in narrow memory (`conv::Io`), 16x16 stride 1 | Done; bit-exact on device (`examples/chain_hw.rs`); other shapes and ops next |
 | FC K 2048 / 3073-4096 (128 / 256 B per input tile); conv Cout 64 (Cin >= 32, 16x16) | Done; byte-identical to 16.0 (parameters included), bit-exact on device |
 | On-chip loopback broadcast (`elementwise::build_broadcast`) | Done; bit-exact on device; landing layout is the compiler's depthwise one |
 | CONV_2D (`codegen::conv`): same padding, stride 1 or 2, 16x16; k 1 (Cin 16, Cout 32) and k 3 (Cin 1, 3, 4, 16-128; Cout 8 / 16 / 32) | Done; byte-identical to 16.0 on 16 corpus models (parameters included), bit-exact on device |
@@ -444,6 +445,7 @@ cargo run --example pool_check -- [filter]
 .venv/bin/python tools/mnist/train.py [--model mlp|cnn]
 cargo run --release --example eval -- [--dir target/mnist] [--model mlp|cnn] [--limit N] [--device]
 cargo run --release --example param_cache_hw   # layers' cached parameters at their own wide addresses coexist?
+cargo run --release --example chain_hw   # several layers in one call, activations on chip
 
 # Field diff of two compiled models
 cargo run --example isa_diff -- a_edgetpu.tflite b_edgetpu.tflite

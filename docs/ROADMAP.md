@@ -131,7 +131,10 @@ item 4 below matters most.
    scheme and buffer placement from the shape and the capacity model;
    generators become emitters for a plan.
 4. **On-chip chaining** (milestone 4): the biggest performance step;
-   depends on 2 and 3.
+   depends on 2 and 3. Started (2026-10-15): programs splice into one
+   call (`codegen::chain`), and 16x16 stride-1 convs hand their output to
+   the next conv's patch in narrow memory, bit-exact (three convs: 0.81 ms
+   in one call, 2.22 ms as three).
 
 ## Not planned
 

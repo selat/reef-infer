@@ -411,7 +411,83 @@ async fn generated_programs_on_tpu() {
         fc_b.reference(&x)
     );
 
+    chained(&mut dev, &mut seed).await;
     loopback(&mut dev).await;
+}
+
+/// Two convs in one program with the activation kept on chip: the first
+/// writes into the second's padded patch at narrow 0x1000.
+async fn chained(dev: &mut Device, seed: &mut u64) {
+    use reef_infer::codegen::chain::splice;
+    use reef_infer::codegen::conv::Io;
+    use reef_infer::executable_generated::platforms::darwinn::ExecutableType;
+    use reef_infer::model::{ExecInfo, TfliteModel};
+    let conv = |seed: &mut u64, cin: usize, cout: usize, zp: (i32, i32), relu| Conv {
+        cin,
+        cout,
+        k: 3,
+        stride: 1,
+        width: 16,
+        height: 16,
+        weights: bytes(seed, cout * 9 * cin)
+            .iter()
+            .map(|&b| b as i8)
+            .collect(),
+        w_scale: vec![0.0007 * 16.0 / cin as f32; cout],
+        bias: (0..cout).map(|i| 300 * i as i32 - 4000).collect(),
+        input: Quant {
+            scale: 0.03,
+            zero_point: zp.0,
+        },
+        output: Quant {
+            scale: 0.2,
+            zero_point: zp.1,
+        },
+        relu,
+    };
+    let a = conv(seed, 16, 32, (100, 0), true);
+    let b = conv(seed, 32, 16, (0, 130), false);
+    let ua = a.wide_units();
+    for (c, base) in [(&a, 0), (&b, ua)] {
+        dev.load_params(Arc::new(c.build_at(base).unwrap()))
+            .await
+            .unwrap();
+    }
+    let pa = a
+        .chain_program(
+            0,
+            Io {
+                output_to: Some((0x1000, b.input_patch())),
+                ..Io::default()
+            },
+        )
+        .unwrap();
+    let pb = b
+        .chain_program(
+            ua,
+            Io {
+                input_at: Some(0x1000),
+                ..Io::default()
+            },
+        )
+        .unwrap();
+    let (mut ea, mut eb) = (a.build().unwrap(), b.build().unwrap());
+    let model = TfliteModel {
+        executables: vec![ExecInfo {
+            exec_type: ExecutableType::EXECUTION_ONLY,
+            parameters: vec![],
+            instruction_chunks: vec![splice(&[pa, pb]).unwrap()],
+            input_layers: ea.executables[0].input_layers.drain(..).collect(),
+            output_layers: eb.executables[0].output_layers.drain(..).collect(),
+            scratch_size_bytes: 0,
+        }],
+    };
+    let loaded = dev.load_params(Arc::new(model)).await.unwrap();
+    for _ in 0..3 {
+        let x = bytes(seed, 4096);
+        let got = dev.run_inference(&loaded, x.clone()).await.unwrap();
+        assert!(got == b.reference(&a.reference(&x)), "chained conv -> conv");
+    }
 }
 
 /// Generated loopback: tile `SRC` -> scalar memory -> all 16 tiles. The

@@ -944,3 +944,38 @@ the 14 calls alone take 14.7 ms (the average pool 0.55 ms instead of an FC
 with a 263 KB blob), so what remains is per-call overhead: instructions and
 activations over USB for every layer. MNIST MLP 3.8 -> 0.85 ms, CNN 5.4 ms,
 both bit-exact on all 10000 images.
+
+## Layers chained on chip in one call (2026-10-15)
+
+Where a ResNet-8 inference goes (14 calls): 98 KB of instructions, 250 KB
+of activations to the TPU and 150 KB back, against the compiled model's
+25.5 KB, 3 KB and 16 B. Moving activations is most of the time, so the
+layers have to hand them over on chip. `examples/chain_hw.rs`, on the
+TPU:
+
+1. **Splicing** (`codegen::chain::splice`): two complete conv programs as
+   one bitstream, each with its own host input and output, run in one
+   call, both exact. Each part keeps its prologue and epilogue; only the
+   inner `halt` / nops / `end` go, the tile sequence numbers continue,
+   and relocations move with their part. The first part's completion
+   event mid-program is harmless (the runner waits for the outputs).
+2. **conv -> conv on chip** (`conv::Io`): A's conv TensorOp writes its
+   output straight into B's padded patch interior, at narrow 0x1000 on
+   every tile, with a 3-level output walk (words, x, then y at the padded
+   row stride). A skips its output stage; its epilogue waits for no
+   outfeeds (`thr5` 0, `thr6` the weight words as before). B skips
+   constants, copy ops and infeed, and its halo exchange and conv op read
+   the patch at 0x1000. **Bit-exact**, also for 16 -> 32 -> 32 -> 16 with
+   ReLU and the patches alternating between 0x1000 and 0x2000 (10 inputs).
+   This works because every layer splits the image over the same 4x4 tile
+   grid, so a conv's output pixels are already on the tile the next
+   layer's patch needs.
+3. **Speed:** those three convs take 0.81 ms as one chained call against
+   2.22 ms as three calls.
+
+Limits so far: 16x16, stride 1, conv only (`chain_program` refuses
+others). Next for ResNet-8: chaining at 32x32 (superpixel patches,
+4-row bands) and stride 2, add (two patches, the shortcut kept alive in
+narrow memory), native 8x8 layers instead of host padding, and pool -> FC
+from tile 0.
+

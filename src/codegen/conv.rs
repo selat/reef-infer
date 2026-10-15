@@ -58,6 +58,20 @@
 use super::fc::Fc;
 use super::*;
 
+/// Where a conv program's input comes from and its output goes, for
+/// layers chained on chip in one program ([`super::chain`]). The default
+/// is the host for both.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Io {
+    /// The padded input patch ([`Conv::input_patch`]) is already on every
+    /// tile at this narrow byte address, interior filled (the halo is
+    /// not): no host input.
+    pub input_at: Option<i64>,
+    /// Write the output into the next layer's padded patch at narrow byte
+    /// address `.0` (geometry `.1`) instead of sending it to the host.
+    pub output_to: Option<(i64, Patch)>,
+}
+
 /// Spatial size (y, x) the layout is fixed to.
 pub const HW: (usize, usize) = (16, 16);
 /// Pixels per tile (a 4x4 patch).
@@ -326,7 +340,7 @@ impl Conv {
         let exec = ExecInfo {
             exec_type: ExecutableType::EXECUTION_ONLY,
             parameters: vec![],
-            instruction_chunks: vec![self.execution_program(base)?],
+            instruction_chunks: vec![self.execution_program(base, Io::default())?],
             input_layers: vec![layer("input", (h, w, self.cin), self.input)],
             output_layers: vec![LayerInfo {
                 output_layout: Some(output_layout(
@@ -371,7 +385,34 @@ impl Conv {
         a.finish()
     }
 
-    fn execution_program(&self, base: i64) -> Result<ChunkInfo, IsaError> {
+    /// The tile patch the conv reads (padded, in superpixels): what a
+    /// previous layer chained into this one writes ([`Io::output_to`]).
+    pub fn input_patch(&self) -> Patch {
+        self.patch()
+    }
+
+    /// The execution program with parameters at wide `base` and the input
+    /// / output as `io` says (16x16, stride 1 only when chained).
+    pub fn chain_program(
+        &self,
+        base: i64,
+        io: Io,
+    ) -> Result<ChunkInfo, Box<dyn std::error::Error>> {
+        self.check()?;
+        check_base(base)?;
+        let chained = io.input_at.is_some() || io.output_to.is_some();
+        if chained && (self.width, self.height, self.stride) != (16, 16, 1) {
+            return Err("chained conv: only 16x16, stride 1".into());
+        }
+        if let Some((_, p)) = io.output_to {
+            if p.cin != self.cout as i64 || p.rows != 4 {
+                return Err("chained conv: the next patch must take Cout channels, 4 rows".into());
+            }
+        }
+        Ok(self.execution_program(base, io)?)
+    }
+
+    fn execution_program(&self, base: i64, io: Io) -> Result<ChunkInfo, IsaError> {
         const IN_NAME: &str = "input";
         const OUT_NAME: &str = "output";
         let pt = self.patch();
@@ -395,290 +436,293 @@ impl Conv {
         let buf = if small { 0x2070 } else { 0x2078 - 8 * (sw - 1) };
         let mut a = Asm::new();
         prologue(&mut a)?;
-
-        // ── Constant setup (as in elementwise): one-hot words at narrow
-        // tp + 2 tb, copied to wide just below the input buffer.
-        let const_narrow = tp + 2 * lb;
-        let const_wide = if small { 0x2078 } else { buf - 4 };
-        for (i, fill) in [1i64, 0x100, 0x10000, 0x1000000].into_iter().enumerate() {
-            let mut f = vec![
-                ("tile_mask", ALL_TILES),
-                ("i_addr", const_narrow + 4 * i as i64),
-                ("i_inc0", 1),
-                ("fill_en", 1),
-                ("fill", fill),
-            ];
-            if i == 3 && !small {
-                f.push(("in_mode", 3));
-            }
-            a.emit(OP_MESH_N, &f)?;
-        }
-        if small {
-            // a zero word after the one-hot words; both go to wide 0x2078
-            let mut f = vec![("tile_mask", ALL_TILES), ("fill_en", 1)];
-            let w = mesh_walk("i", const_narrow + 16, &[(64, 1)]).0;
-            let w: Vec<(&str, i64)> = w.iter().map(|(n, v)| (n.as_str(), *v)).collect();
-            f.extend(w);
-            a.emit(OP_MESH_N, &f)?;
-            sync(&mut a, 0, 0x3ff, false)?;
-            a.emit(
-                OP_NARROW_TO_WIDE,
-                &[
+        // narrow base of the padded patch (0 unless chained)
+        let nb = io.input_at.unwrap_or(0);
+        if io.input_at.is_none() {
+            // ── Constant setup (as in elementwise): one-hot words at narrow
+            // tp + 2 tb, copied to wide just below the input buffer.
+            let const_narrow = tp + 2 * lb;
+            let const_wide = if small { 0x2078 } else { buf - 4 };
+            for (i, fill) in [1i64, 0x100, 0x10000, 0x1000000].into_iter().enumerate() {
+                let mut f = vec![
                     ("tile_mask", ALL_TILES),
-                    ("narrow_addr", const_narrow / 4),
-                    ("n_inc0", 1),
-                    ("n_lim0", 0x43),
-                    ("n_inc1", -0x43),
-                    ("n_inc2", -0x43),
-                    ("n_inc3", -0x43),
-                    ("n_inc4", -0x43),
-                    ("n_inc5", -0x43),
-                    ("narrow_lvl_mask", 1),
-                    ("wide_addr", const_wide),
-                    ("w_inc0", 1),
-                    ("w_lim0", 1),
-                    ("w_inc1", -1),
-                    ("w_inc2", -1),
-                    ("w_inc3", -1),
-                    ("wide_lvl_mask", 1),
-                    ("tail_lvl", 1),
-                    ("sync_en0", 0),
-                    ("sync_en1", 0),
-                    ("sync_en2", 0),
-                ],
-            )?;
-        } else {
-            a.emit(
-                OP_NARROW_TO_WIDE,
-                &[
-                    ("tile_mask", ALL_TILES),
-                    ("narrow_addr", const_narrow / 4),
-                    ("n_inc0", 1),
-                    ("n_lim0", 3),
-                    ("n_inc1", -3),
-                    ("n_inc2", -3),
-                    ("n_inc3", -3),
-                    ("n_inc4", -3),
-                    ("n_inc5", -3),
-                    ("narrow_lvl_mask", 1),
-                    ("wide_addr", const_wide),
-                    ("w_inc0", 1),
-                    ("sync_en0", 1),
-                    ("sync_f1", 1),
-                    ("sync_id", 5),
-                    ("sync_wait_lvl", 1),
-                    ("sync_en1", 1),
-                    ("sync_en2", 1),
-                    ("tail_lvl", 1),
-                ],
-            )?;
-        }
-        a.emit(OP_SYNC, &[("tiles", ALL_TILES), ("units", 0x20)])?;
-        self.copy(&mut a, &pt, const_wide & 0xff, true, 0)?;
-
-        // ── Input: 4 tb bytes per row of 4 tiles through the input buffer,
-        // landing at narrow tp; column c skips Cin * c words.
-        load_input_addr(&mut a, IN_NAME)?;
-        // the whole image is popped once; bands of 4 rows are infed in turn
-        let bands = pt.rows / 4;
-        let size = 16 * tbi * bands;
-        let units8 = size / 8;
-        a.emit(
-            OP_POP,
-            &[
-                ("stream", 1),
-                ("d0_stride", 1),
-                ("d0_limit", 0x3fff),
-                ("d1_stride", 0xc001),
-                ("d2_stride", 0xc001),
-                ("k121", 1),
-                ("k124", 1),
-                ("av140", 1),
-                ("count_m1", units8 - 1),
-                ("k157", 1),
-                ("count_neg", 0x4000 - units8),
-                ("k174", 1),
-                ("k178", 1),
-                ("k199", 1),
-                ("k215", 1),
-            ],
-        )?;
-        descriptor_addr(&mut a)?;
-        descriptor_send(&mut a, size, TAG_INPUT)?;
-        if tbi >= 256 {
-            a.emit(OP_SYNC, &[("tiles", ALL_TILES), ("counters", 0x800)])?;
-        }
-        let (nw, land) = (tbi / 4, tp / 4); // narrow words per tile, landing word
-        for h in 0..bands {
-            // band h: the verified 4-row loader and copy ops, landing in the
-            // same place, copied to rows 4 h.. of the patch
-            if h > 0 {
-                self.copy(&mut a, &pt, const_wide & 0xff, true, 4 * h)?;
+                    ("i_addr", const_narrow + 4 * i as i64),
+                    ("i_inc0", 1),
+                    ("fill_en", 1),
+                    ("fill", fill),
+                ];
+                if i == 3 && !small {
+                    f.push(("in_mode", 3));
+                }
+                a.emit(OP_MESH_N, &f)?;
             }
-            // the buffer's wide-side walk: one slot, 4 words in turn, or `sw`
-            // circular slots, 4 rounds
-            let wide: Vec<(&str, i64)> = if tbi < 256 {
-                // a row of 4 tiles is one word: one circular slot
-                vec![
-                    ("wide_addr", buf),
-                    ("w_inc0", 1),
-                    ("wide_circ", 1),
-                    ("wide_rows", 1),
-                    ("sync_wait_lvl", 1),
-                ]
-            } else if sw == 1 {
-                vec![("wide_addr", buf), ("w_lim0", 3), ("wide_rows", 1)]
-            } else {
-                vec![
-                    ("wide_addr", buf),
-                    ("w_inc0", 1),
-                    ("w_lim0", sw - 1),
-                    ("w_inc1", -(sw - 1)),
-                    ("w_lim1", 3),
-                    ("w_inc2", -(sw - 1)),
-                    ("w_inc3", -(sw - 1)),
-                    ("wide_lvl_mask", 1),
-                    ("wide_circ", 1),
-                    ("wide_rows", sw),
-                    ("sync_wait_lvl", 1),
-                ]
-            };
-            for col in 0..4i64 {
-                let mut f: Vec<(&str, i64)> = wide.clone();
-                f.extend([
-                    ("tile_mask", 0x1111 << col),
-                    ("narrow_addr", land),
-                    ("n_inc0", 1),
-                    ("n_lim0", nw - 1),
-                    ("n_lim1", if small { 4 } else { 3 }),
-                    ("narrow_lvl_mask", 1),
-                    ("mode", 1),
-                    ("size64", lb / 64),
-                ]);
-                for n in ["n_inc1", "n_inc2", "n_inc3", "n_inc4", "n_inc5"] {
-                    f.push((n, -(nw - 1)));
-                }
-                let skip = if small { self.cin as i64 } else { pt.cin } * col;
-                // head of the first narrow row; for Cin 1 / 3 the compiler's
-                // values (not derived; tail_words follows from them)
-                let head = match self.cin {
-                    1 => [43, 46, 45, 44][col as usize],
-                    3 => [15, 12, 9, 6][col as usize],
-                    _ => nw - 1 - skip,
-                };
-                if small {
-                    f.extend([
-                        ("head_words_m1", head),
-                        ("head_en", 1),
-                        ("tail_words", nw - (head + 1)),
-                    ]);
-                }
-                if col > 0 {
-                    if !small {
-                        f.extend([
-                            ("head_words_m1", head),
-                            ("head_en", 1),
-                            ("tail_words", skip),
-                        ]);
-                    }
-                    f.extend([
-                        ("skip_en0", 1),
-                        ("skip_base", land),
-                        ("skip_m1", skip - 1),
-                        ("skip_end", land + skip - 1),
-                        ("rsv543", 1),
-                    ]);
-                }
-                f.extend([
-                    ("sync_en0", 1),
-                    ("sync_id", 0xe),
-                    ("sync_en1", 1),
-                    ("sync_val", 0x8000),
-                    ("sync_en2", 1),
-                    ("sync_dec_lvl", 1),
-                    ("sync_dec", -1),
-                    ("sync_dec_mode", 3),
-                    ("tail_en870", 0),
-                    ("tail_f871", 1),
-                ]);
-                a.emit(OP_WIDE_TO_NARROW, &f)?;
-            }
-            let per_row = 4 * tbi / 8; // infeed units of 8 B
-            let consumer: Vec<(&str, i64)> = if tbi < 256 {
-                vec![
-                    ("addr", buf),
-                    ("inc0", 1),
-                    ("cbuf", 1),
-                    ("slots", 1),
-                    ("mode", 3),
-                    ("s_id", 0x2b),
-                ]
-            } else if sw == 1 {
-                vec![
-                    ("addr", buf),
-                    ("cnt0", 3),
-                    ("slots", 1),
-                    ("mode", 1),
-                    ("s_id", 0xb),
-                ]
-            } else {
-                vec![
-                    ("addr", buf),
-                    ("inc0", 1),
-                    ("cnt0", sw - 1),
-                    ("inc1", -(sw - 1)),
-                    ("cnt1", 3),
-                    ("inc2", -(sw - 1)),
-                    ("inc3", -(sw - 1)),
-                    ("sdims", 1),
-                    ("cbuf", 1),
-                    ("slots", sw),
-                    ("mode", 3),
-                    ("s_id", 0x2b),
-                ]
-            };
-            for row in 0..4i64 {
-                let mut f = consumer.clone();
-                f.extend([
-                    ("tile_mask", 0xf << (4 * row)),
-                    ("s_val", -(lb / 4)),
-                    ("s_cnt", sw),
-                    ("s_en_b", 1),
-                    ("s_y", 1),
-                ]);
-                a.emit(OP_RING_CONSUMER, &f)?;
+            if small {
+                // a zero word after the one-hot words; both go to wide 0x2078
+                let mut f = vec![("tile_mask", ALL_TILES), ("fill_en", 1)];
+                let w = mesh_walk("i", const_narrow + 16, &[(64, 1)]).0;
+                let w: Vec<(&str, i64)> = w.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+                f.extend(w);
+                a.emit(OP_MESH_N, &f)?;
+                sync(&mut a, 0, 0x3ff, false)?;
                 a.emit(
-                    OP_INFEED,
+                    OP_NARROW_TO_WIDE,
                     &[
-                        ("stream", 1),
-                        ("buf_off", per_row * (row * bands + h)),
-                        ("d0_stride", 1),
-                        ("d0_limit", 0x3fff),
-                        ("d1_stride", 0x1fc001),
-                        ("d2_stride", 0x1fc001),
-                        ("k157", 1),
-                        ("k160", 1),
-                        ("av176", 1),
-                        ("count_m1", per_row - 1),
-                        ("k203", 1),
-                        ("count_neg", 0x4000 - per_row),
-                        ("k311", 1),
-                        ("pop_wait", per_row * (row * bands + h) + 1),
-                        ("k336", 1),
-                        ("k352", 1),
-                        ("k392", 1),
-                        ("tiles", 0xf << (4 * row)),
-                        ("k434", 0xf),
-                        ("f438", 3),
+                        ("tile_mask", ALL_TILES),
+                        ("narrow_addr", const_narrow / 4),
+                        ("n_inc0", 1),
+                        ("n_lim0", 0x43),
+                        ("n_inc1", -0x43),
+                        ("n_inc2", -0x43),
+                        ("n_inc3", -0x43),
+                        ("n_inc4", -0x43),
+                        ("n_inc5", -0x43),
+                        ("narrow_lvl_mask", 1),
+                        ("wide_addr", const_wide),
+                        ("w_inc0", 1),
+                        ("w_lim0", 1),
+                        ("w_inc1", -1),
+                        ("w_inc2", -1),
+                        ("w_inc3", -1),
+                        ("wide_lvl_mask", 1),
+                        ("tail_lvl", 1),
+                        ("sync_en0", 0),
+                        ("sync_en1", 0),
+                        ("sync_en2", 0),
+                    ],
+                )?;
+            } else {
+                a.emit(
+                    OP_NARROW_TO_WIDE,
+                    &[
+                        ("tile_mask", ALL_TILES),
+                        ("narrow_addr", const_narrow / 4),
+                        ("n_inc0", 1),
+                        ("n_lim0", 3),
+                        ("n_inc1", -3),
+                        ("n_inc2", -3),
+                        ("n_inc3", -3),
+                        ("n_inc4", -3),
+                        ("n_inc5", -3),
+                        ("narrow_lvl_mask", 1),
+                        ("wide_addr", const_wide),
+                        ("w_inc0", 1),
+                        ("sync_en0", 1),
+                        ("sync_f1", 1),
+                        ("sync_id", 5),
+                        ("sync_wait_lvl", 1),
+                        ("sync_en1", 1),
+                        ("sync_en2", 1),
+                        ("tail_lvl", 1),
                     ],
                 )?;
             }
-            sync(&mut a, 0, 0x3ff, false)?;
-            self.copy(&mut a, &pt, const_wide & 0xff, false, 4 * h)?;
-            sync(&mut a, 0x1ffff, 0x3ff, false)?;
+            a.emit(OP_SYNC, &[("tiles", ALL_TILES), ("units", 0x20)])?;
+            self.copy(&mut a, &pt, const_wide & 0xff, true, 0)?;
+
+            // ── Input: 4 tb bytes per row of 4 tiles through the input buffer,
+            // landing at narrow tp; column c skips Cin * c words.
+            load_input_addr(&mut a, IN_NAME)?;
+            // the whole image is popped once; bands of 4 rows are infed in turn
+            let bands = pt.rows / 4;
+            let size = 16 * tbi * bands;
+            let units8 = size / 8;
+            a.emit(
+                OP_POP,
+                &[
+                    ("stream", 1),
+                    ("d0_stride", 1),
+                    ("d0_limit", 0x3fff),
+                    ("d1_stride", 0xc001),
+                    ("d2_stride", 0xc001),
+                    ("k121", 1),
+                    ("k124", 1),
+                    ("av140", 1),
+                    ("count_m1", units8 - 1),
+                    ("k157", 1),
+                    ("count_neg", 0x4000 - units8),
+                    ("k174", 1),
+                    ("k178", 1),
+                    ("k199", 1),
+                    ("k215", 1),
+                ],
+            )?;
+            descriptor_addr(&mut a)?;
+            descriptor_send(&mut a, size, TAG_INPUT)?;
+            if tbi >= 256 {
+                a.emit(OP_SYNC, &[("tiles", ALL_TILES), ("counters", 0x800)])?;
+            }
+            let (nw, land) = (tbi / 4, tp / 4); // narrow words per tile, landing word
+            for h in 0..bands {
+                // band h: the verified 4-row loader and copy ops, landing in the
+                // same place, copied to rows 4 h.. of the patch
+                if h > 0 {
+                    self.copy(&mut a, &pt, const_wide & 0xff, true, 4 * h)?;
+                }
+                // the buffer's wide-side walk: one slot, 4 words in turn, or `sw`
+                // circular slots, 4 rounds
+                let wide: Vec<(&str, i64)> = if tbi < 256 {
+                    // a row of 4 tiles is one word: one circular slot
+                    vec![
+                        ("wide_addr", buf),
+                        ("w_inc0", 1),
+                        ("wide_circ", 1),
+                        ("wide_rows", 1),
+                        ("sync_wait_lvl", 1),
+                    ]
+                } else if sw == 1 {
+                    vec![("wide_addr", buf), ("w_lim0", 3), ("wide_rows", 1)]
+                } else {
+                    vec![
+                        ("wide_addr", buf),
+                        ("w_inc0", 1),
+                        ("w_lim0", sw - 1),
+                        ("w_inc1", -(sw - 1)),
+                        ("w_lim1", 3),
+                        ("w_inc2", -(sw - 1)),
+                        ("w_inc3", -(sw - 1)),
+                        ("wide_lvl_mask", 1),
+                        ("wide_circ", 1),
+                        ("wide_rows", sw),
+                        ("sync_wait_lvl", 1),
+                    ]
+                };
+                for col in 0..4i64 {
+                    let mut f: Vec<(&str, i64)> = wide.clone();
+                    f.extend([
+                        ("tile_mask", 0x1111 << col),
+                        ("narrow_addr", land),
+                        ("n_inc0", 1),
+                        ("n_lim0", nw - 1),
+                        ("n_lim1", if small { 4 } else { 3 }),
+                        ("narrow_lvl_mask", 1),
+                        ("mode", 1),
+                        ("size64", lb / 64),
+                    ]);
+                    for n in ["n_inc1", "n_inc2", "n_inc3", "n_inc4", "n_inc5"] {
+                        f.push((n, -(nw - 1)));
+                    }
+                    let skip = if small { self.cin as i64 } else { pt.cin } * col;
+                    // head of the first narrow row; for Cin 1 / 3 the compiler's
+                    // values (not derived; tail_words follows from them)
+                    let head = match self.cin {
+                        1 => [43, 46, 45, 44][col as usize],
+                        3 => [15, 12, 9, 6][col as usize],
+                        _ => nw - 1 - skip,
+                    };
+                    if small {
+                        f.extend([
+                            ("head_words_m1", head),
+                            ("head_en", 1),
+                            ("tail_words", nw - (head + 1)),
+                        ]);
+                    }
+                    if col > 0 {
+                        if !small {
+                            f.extend([
+                                ("head_words_m1", head),
+                                ("head_en", 1),
+                                ("tail_words", skip),
+                            ]);
+                        }
+                        f.extend([
+                            ("skip_en0", 1),
+                            ("skip_base", land),
+                            ("skip_m1", skip - 1),
+                            ("skip_end", land + skip - 1),
+                            ("rsv543", 1),
+                        ]);
+                    }
+                    f.extend([
+                        ("sync_en0", 1),
+                        ("sync_id", 0xe),
+                        ("sync_en1", 1),
+                        ("sync_val", 0x8000),
+                        ("sync_en2", 1),
+                        ("sync_dec_lvl", 1),
+                        ("sync_dec", -1),
+                        ("sync_dec_mode", 3),
+                        ("tail_en870", 0),
+                        ("tail_f871", 1),
+                    ]);
+                    a.emit(OP_WIDE_TO_NARROW, &f)?;
+                }
+                let per_row = 4 * tbi / 8; // infeed units of 8 B
+                let consumer: Vec<(&str, i64)> = if tbi < 256 {
+                    vec![
+                        ("addr", buf),
+                        ("inc0", 1),
+                        ("cbuf", 1),
+                        ("slots", 1),
+                        ("mode", 3),
+                        ("s_id", 0x2b),
+                    ]
+                } else if sw == 1 {
+                    vec![
+                        ("addr", buf),
+                        ("cnt0", 3),
+                        ("slots", 1),
+                        ("mode", 1),
+                        ("s_id", 0xb),
+                    ]
+                } else {
+                    vec![
+                        ("addr", buf),
+                        ("inc0", 1),
+                        ("cnt0", sw - 1),
+                        ("inc1", -(sw - 1)),
+                        ("cnt1", 3),
+                        ("inc2", -(sw - 1)),
+                        ("inc3", -(sw - 1)),
+                        ("sdims", 1),
+                        ("cbuf", 1),
+                        ("slots", sw),
+                        ("mode", 3),
+                        ("s_id", 0x2b),
+                    ]
+                };
+                for row in 0..4i64 {
+                    let mut f = consumer.clone();
+                    f.extend([
+                        ("tile_mask", 0xf << (4 * row)),
+                        ("s_val", -(lb / 4)),
+                        ("s_cnt", sw),
+                        ("s_en_b", 1),
+                        ("s_y", 1),
+                    ]);
+                    a.emit(OP_RING_CONSUMER, &f)?;
+                    a.emit(
+                        OP_INFEED,
+                        &[
+                            ("stream", 1),
+                            ("buf_off", per_row * (row * bands + h)),
+                            ("d0_stride", 1),
+                            ("d0_limit", 0x3fff),
+                            ("d1_stride", 0x1fc001),
+                            ("d2_stride", 0x1fc001),
+                            ("k157", 1),
+                            ("k160", 1),
+                            ("av176", 1),
+                            ("count_m1", per_row - 1),
+                            ("k203", 1),
+                            ("count_neg", 0x4000 - per_row),
+                            ("k311", 1),
+                            ("pop_wait", per_row * (row * bands + h) + 1),
+                            ("k336", 1),
+                            ("k352", 1),
+                            ("k392", 1),
+                            ("tiles", 0xf << (4 * row)),
+                            ("k434", 0xf),
+                            ("f438", 3),
+                        ],
+                    )?;
+                }
+                sync(&mut a, 0, 0x3ff, false)?;
+                self.copy(&mut a, &pt, const_wide & 0xff, false, 4 * h)?;
+                sync(&mut a, 0x1ffff, 0x3ff, false)?;
+            }
         }
         if self.k > 1 {
-            halo(&mut a, &pt, self.input.zero_point)?;
+            halo(&mut a, &pt, self.input.zero_point, nb)?;
         }
         sync(&mut a, 0, 0x3ff, true)?;
         wait_tiles(&mut a)?;
@@ -821,8 +865,8 @@ impl Conv {
             )
         };
         f.extend(walk("in", &in_dims, 8));
-        if in_base != 0 {
-            f.push(("in_base".into(), in_base));
+        if in_base + nb != 0 {
+            f.push(("in_base".into(), in_base + nb));
         }
         for (i, l) in loops.iter().enumerate() {
             if *l > 0 {
@@ -842,12 +886,6 @@ impl Conv {
                     0xf
                 },
             ),
-            ("out_base", tp),
-            ("out_inc0", 1),
-            ("out_cnt0", oq - 1),
-            ("out_inc1", 1),
-            ("out_cnt1", npx - 1),
-            ("out_inc2", -(oq * (npx - 1) - 1)),
             ("out_mode7", 3),
             ("out_tflags", 1),
             ("par_base", slots_addr),
@@ -883,8 +921,31 @@ impl Conv {
             ("row_cfg", 1),
         ];
         f.extend(fixed.iter().map(|&(n, v)| (n.to_string(), v)));
-        for j in 3..8 {
-            f.push((format!("out_inc{j}"), -(npx * oq - 1)));
+        match io.output_to {
+            None => {
+                // pixel after pixel at tp
+                f.extend([
+                    ("out_base".into(), tp),
+                    ("out_inc0".into(), 1),
+                    ("out_cnt0".into(), oq - 1),
+                    ("out_inc1".into(), 1),
+                    ("out_cnt1".into(), npx - 1),
+                    ("out_inc2".into(), -(oq * (npx - 1) - 1)),
+                ]);
+                for j in 3..8 {
+                    f.push((format!("out_inc{j}"), -(npx * oq - 1)));
+                }
+            }
+            Some((at, np)) => {
+                // into the next patch's interior: words, x, then y at its
+                // padded row stride
+                f.push(("out_base".into(), at + np.at(0, 0)));
+                f.extend(walk(
+                    "out",
+                    &[(oq, 1), (ox, oq), (oy, np.pw() * np.cq())],
+                    8,
+                ));
+            }
         }
         for j in 2..8 {
             f.push((format!("par_inc{j}"), -(slots - 1)));
@@ -934,6 +995,11 @@ impl Conv {
         )?;
         sync(&mut a, 0, 0x3ff, true)?;
         wait_tiles(&mut a)?;
+        if io.output_to.is_some() {
+            // the output stays on chip: no outfeeds
+            epilogue(&mut a, 0, words)?;
+            return a.finish();
+        }
 
         // ── Output: narrow tp -> wide 0x2078 on every tile, then each tile
         // in turn produces its ob bytes to the outfeed.
@@ -1163,7 +1229,8 @@ struct Move {
 /// Fills each tile's halo: rows to the north and south neighbours, then
 /// columns (over the full padded height, so the corners follow) to the
 /// west and east ones.
-fn halo(a: &mut Asm, pt: &Patch, zp: i32) -> Result<(), IsaError> {
+/// `nb` is the patch's narrow byte address.
+fn halo(a: &mut Asm, pt: &Patch, zp: i32, nb: i64) -> Result<(), IsaError> {
     let (cq, pw) = (pt.cq(), pt.pw());
     let rs = pw * cq;
     let fill = (zp as u8 as i64) * 0x0101_0101;
@@ -1235,8 +1302,8 @@ fn halo(a: &mut Asm, pt: &Patch, zp: i32) -> Result<(), IsaError> {
         if dims[1].0 == 0 || dims[2].0 == 0 {
             continue;
         }
-        let (o, _) = mesh_walk("o", o_addr, &dims);
-        let (i, n) = mesh_walk("i", i_addr, &dims);
+        let (o, _) = mesh_walk("o", nb + o_addr, &dims);
+        let (i, n) = mesh_walk("i", nb + i_addr, &dims);
         // the compiler lists the tile groups in ascending tile order
         let mut order = [(groups[0], 0), (groups[1], 1), (groups[2], 2)];
         order.sort();
