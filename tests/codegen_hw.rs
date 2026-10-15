@@ -477,6 +477,7 @@ async fn generated_programs_on_tpu() {
     residual(&mut dev, &mut seed).await;
     stage_8x8(&mut dev, &mut seed).await;
     loopback(&mut dev).await;
+    fire(&mut dev).await;
 }
 
 /// Two convs in one program with the activation kept on chip: the first
@@ -906,5 +907,67 @@ async fn loopback(dev: &mut Device) {
                 "tile {t} unit {u}"
             );
         }
+    }
+}
+
+/// Two SqueezeNet fire modules as a PyTorch JSON graph at 16x16: squeeze
+/// 1x1 32 -> 16, expand 1x1 and 3x3 16 -> 32 each, their concat (quantized
+/// alike), twice; the first concat feeds the second squeeze, the second
+/// ends the graph.
+fn fire_graph(seed: u64) -> String {
+    let mut s = seed;
+    let mut w = |n: usize| -> Vec<i64> {
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 32) % 61) as i64 - 30
+            })
+            .collect()
+    };
+    let mut conv = |input: i32, out: i32, k: usize, cin: usize, cout: usize, q: (f64, i64)| {
+        serde_json::json!({
+            "op": "conv", "inputs": [input], "output": out, "shape": [16, 16, cout],
+            "scale": q.0, "zero_point": q.1, "relu": true,
+            "kernel": k, "stride": 1, "pad": k / 2,
+            "weights": w(cout * k * k * cin),
+            "weight_scales": vec![0.004; cout], "bias": vec![50; cout],
+        })
+    };
+    let (sq, cat) = ((0.04, -128), (0.06, -128));
+    let ops = vec![
+        conv(0, 1, 1, 32, 16, sq),
+        conv(1, 2, 1, 16, 32, cat),
+        conv(1, 3, 3, 16, 32, cat),
+        serde_json::json!({"op": "concat", "inputs": [2, 3], "output": 4, "shape": [16, 16, 64],
+            "scale": cat.0, "zero_point": cat.1}),
+        conv(4, 5, 1, 64, 16, sq),
+        conv(5, 6, 1, 16, 32, cat),
+        conv(5, 7, 3, 16, 32, cat),
+        serde_json::json!({"op": "concat", "inputs": [6, 7], "output": 8, "shape": [16, 16, 64],
+            "scale": cat.0, "zero_point": cat.1}),
+    ];
+    serde_json::json!({
+        "format": "reef-graph", "version": 1,
+        "input": {"tensor": 0, "shape": [16, 16, 32], "scale": 0.03, "zero_point": -128},
+        "output": 8, "ops": ops,
+    })
+    .to_string()
+}
+
+/// The fire modules in one call ([`fire_graph`]): two concats written by
+/// their convs into one patch each, the second sent to the host from it.
+async fn fire(dev: &mut Device) {
+    use reef_infer::graph::Graph;
+    let g = Graph::from_torch_json(&fire_graph(11)).unwrap();
+    let programs = g.build().unwrap();
+    assert_eq!(programs.calls(), 1);
+    let loaded = g.load(dev, &programs).await.unwrap();
+    let mut seed = 0x51ce_5eed_u64;
+    for i in 0..8 {
+        let x = bytes(&mut seed, g.input_len());
+        let got = g.run(dev, &loaded, &x).await.unwrap();
+        assert!(got == g.reference(&x), "fire modules, input {i}");
     }
 }

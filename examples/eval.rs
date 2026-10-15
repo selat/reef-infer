@@ -161,5 +161,6 @@ fn summary(l: &reef_infer::graph::Layer) -> String {
             a.relu,
             a.weights()
         ),
+        Layer::Concat(c) => format!("CONCAT {:?} at {}x{} (host)", c.cs, c.height, c.width),
     }
 }

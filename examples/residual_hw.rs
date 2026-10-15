@@ -99,6 +99,7 @@ async fn main() {
         let mut acts = HashMap::from([(g.input_tensor, x.clone())]);
         for (s, p) in steps.iter().zip(&loaded.steps) {
             let ins: Vec<&[u8]> = s.inputs.iter().map(|i| &acts[&i.tensor][..]).collect();
+            let p = p.as_ref().expect("a TPU step");
             let y = dev.run_inference(p, s.fit(&ins).concat()).await.unwrap();
             acts.insert(s.output, s.crop(&y));
         }

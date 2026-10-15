@@ -14,7 +14,10 @@
 //! [`add::Io::output_to`]) until the last layer that reads it, so a
 //! shortcut stays on chip across the convs of its block. Only the first
 //! layer's input comes from the host and only the last one's output goes
-//! back. [`convs`] is the plain sequence.
+//! back. A channel concat costs nothing: the convs it reads write their
+//! channels into its patch ([`conv::Io::output_ch`]), and a chain ending
+//! in one sends that patch to the host ([`conv::outfeed_program`]).
+//! [`convs`] is the plain sequence.
 
 use super::add::{self, Add};
 use super::avg_pool::GlobalAvgPool;
@@ -90,14 +93,17 @@ pub fn rename(chunk: &mut ChunkInfo, from: &str, to: &str) {
 pub const NARROW_BYTES: i64 = 192 * 1024;
 
 /// A layer of a chain: a conv or FC with its parameters cached at a wide
-/// base, an add, or a global average pool. A pool's output (on tile 0) is
-/// read only by an FC, and an FC (reading a pool's) comes last.
+/// base, an add, a global average pool, or a channel concat. A pool's
+/// output (on tile 0) is read only by an FC, and an FC (reading a pool's)
+/// comes last. A concat runs no program: its inputs are convs read by it
+/// alone, which write their channels straight into its patch.
 #[derive(Debug, Clone, Copy)]
 pub enum Op<'a> {
     Conv(&'a Conv, i64),
     Add(&'a Add),
     AvgPool(&'a GlobalAvgPool),
     Fc(&'a Fc, i64),
+    Concat,
 }
 
 /// A chain layer and the tensors it reads: 0 is the chain's input, `k + 1`
@@ -111,10 +117,12 @@ pub struct Node<'a> {
 /// Where a chain keeps its tensors: per tensor (indexed as
 /// [`Node::inputs`]) the narrow byte address and patch geometry (`None`
 /// for the chain's input, which the first conv lands itself, and its
-/// output, which goes to the host), and the adds' scratch.
+/// output, which goes to the host), and the adds' scratch. A concat's
+/// inputs are its patch, from channel `ch[t]`.
 #[derive(Debug, Clone)]
 pub struct Plan {
     pub at: Vec<Option<(i64, Patch)>>,
+    pub ch: Vec<Option<i64>>,
     pub scratch: i64,
 }
 
@@ -165,6 +173,7 @@ pub fn plan(nodes: &[Node]) -> Result<Plan, Error> {
             Op::AvgPool(_) => 1,
             Op::Fc(..) if k + 1 == n => 1,
             Op::Fc(..) => return Err("chain: an FC must come last".into()),
+            Op::Concat => node.inputs.len().max(2),
         };
         if node.inputs.len() != want || node.inputs.iter().any(|&t| t > k) {
             return Err(format!("chain: layer {k} reads {:?}", node.inputs).into());
@@ -184,8 +193,45 @@ pub fn plan(nodes: &[Node]) -> Result<Plan, Error> {
     if let Some(t) = (1..n).find(|&t| last_use[t].is_none()) {
         return Err(format!("chain: layer {}'s output is never read", t - 1).into());
     }
-    // patches: every reader's, then an add's two inputs alike
     let mut patch: Vec<Option<Patch>> = vec![None; n + 1];
+    // a concat's inputs: convs' outputs it alone reads, at channel offsets
+    let mut cat_of: Vec<Option<usize>> = vec![None; n + 1];
+    let mut ch: Vec<Option<i64>> = vec![None; n + 1];
+    for (k, node) in nodes.iter().enumerate() {
+        if !matches!(node.op, Op::Concat) {
+            continue;
+        }
+        let mut off = 0;
+        for &t in &node.inputs {
+            let readers = nodes.iter().filter(|m| m.inputs.contains(&t)).count();
+            let (Op::Conv(c, _), 1) = (nodes[t - 1].op, readers) else {
+                return Err(format!(
+                    "chain: concat {k} reads layer {} (a conv read by it alone)",
+                    t - 1
+                )
+                .into());
+            };
+            if cat_of[t].is_some() || node.inputs.iter().filter(|&&u| u == t).count() > 1 {
+                return Err(format!("chain: layer {}'s output concatenated twice", t - 1).into());
+            }
+            (cat_of[t], ch[t]) = (Some(k + 1), Some(off));
+            off += c.cout as i64;
+        }
+        if k + 1 == n {
+            // the chain's output: a plain patch of the convs' output pixels,
+            // sent to the host from there
+            let Op::Conv(c, _) = nodes[node.inputs[0] - 1].op else {
+                unreachable!()
+            };
+            let (rows, cols) = c.opx();
+            patch[n] = Some(Patch {
+                rows,
+                cols,
+                ..Patch::plain(off as usize)
+            });
+        }
+    }
+    // patches: every reader's, then an add's two inputs alike
     for node in &nodes[1..] {
         for &t in &node.inputs {
             let q = match node.op {
@@ -193,6 +239,7 @@ pub fn plan(nodes: &[Node]) -> Result<Plan, Error> {
                 Op::Add(a) => a.patch(),
                 Op::AvgPool(p) => p.input_patch(),
                 Op::Fc(f, _) => f.input_patch(),
+                Op::Concat => continue, // its inputs are its own patch
             };
             patch[t] = Some(union(patch[t], q)?);
         }
@@ -217,7 +264,7 @@ pub fn plan(nodes: &[Node]) -> Result<Plan, Error> {
             Op::Conv(c, _) => Some(c.narrow_end()),
             Op::AvgPool(p) => Some(p.narrow_end()),
             Op::Fc(f, _) => Some(f.narrow_end()),
-            Op::Add(_) => None,
+            Op::Add(_) | Op::Concat => None,
         })
         .max()
         .unwrap_or(0);
@@ -228,39 +275,48 @@ pub fn plan(nodes: &[Node]) -> Result<Plan, Error> {
             .enumerate()
             .filter_map(|(k, l)| match l.op {
                 Op::Add(a) => Some(up(a.scratch_bytes(k + 1 == n))),
-                Op::Conv(..) | Op::AvgPool(_) | Op::Fc(..) => None,
+                Op::Conv(..) | Op::AvgPool(_) | Op::Fc(..) | Op::Concat => None,
             })
             .max()
             .unwrap_or(0);
-    // first fit, in the order the tensors are written
+    // first fit, in the order the tensors are written (a concat's patch
+    // when its first input is: live from that writer to its last reader)
     let mut at: Vec<Option<(i64, Patch)>> = vec![None; n + 1];
+    let mut placed: Vec<(usize, usize, i64, i64)> = Vec::new(); // live, bytes
     for t in 1..n {
-        let (p, live) = (patch[t].unwrap(), (t - 1, last_use[t].unwrap()));
-        let mut taken: Vec<(i64, i64)> = (1..t)
-            .filter(|&u| last_use[u].unwrap() >= live.0)
-            .map(|u| {
-                let (a, q) = at[u].unwrap();
-                (a, a + up(q.tp()))
-            })
-            .collect();
-        taken.sort();
-        let mut addr = floor;
-        for (lo, hi) in taken {
-            if addr + up(p.tp()) <= lo {
-                break;
+        let u = cat_of[t].unwrap_or(t);
+        if at[u].is_none() {
+            let Some(p) = patch[u] else {
+                return Err(format!("chain: tensor {u} has no reader patch").into());
+            };
+            let first = (1..=u).find(|&v| cat_of[v] == Some(u)).unwrap_or(u);
+            let live = (first - 1, last_use[u].unwrap_or(n - 1));
+            let mut taken: Vec<(i64, i64)> = placed
+                .iter()
+                .filter(|&&(s, e, _, _)| s <= live.1 && e >= live.0)
+                .map(|&(_, _, lo, hi)| (lo, hi))
+                .collect();
+            taken.sort();
+            let mut addr = floor;
+            for (lo, hi) in taken {
+                if addr + up(p.tp()) <= lo {
+                    break;
+                }
+                addr = addr.max(hi);
             }
-            addr = addr.max(hi);
+            if addr + p.tp() > NARROW_BYTES {
+                return Err(format!(
+                    "chain: tensor {u} ({} B) does not fit narrow memory above {addr:#x}",
+                    p.tp()
+                )
+                .into());
+            }
+            at[u] = Some((addr, p));
+            placed.push((live.0, live.1, addr, addr + up(p.tp())));
         }
-        if addr + p.tp() > NARROW_BYTES {
-            return Err(format!(
-                "chain: tensor {t} ({} B) does not fit narrow memory above {addr:#x}",
-                p.tp()
-            )
-            .into());
-        }
-        at[t] = Some((addr, p));
+        at[t] = at[u];
     }
-    Ok(Plan { at, scratch })
+    Ok(Plan { at, ch, scratch })
 }
 
 /// One program running `nodes` in order with the activations on chip
@@ -275,11 +331,17 @@ pub fn program(nodes: &[Node]) -> Result<ChunkInfo, Error> {
         .map(|(k, node)| {
             let output_to = (k + 1 < n).then(|| plan.at[k + 1].unwrap());
             match node.op {
+                Op::Concat if k + 1 < n => return Ok(None),
+                Op::Concat => {
+                    let (at, p) = plan.at[n].unwrap();
+                    Ok(conv::outfeed_program(at, p.cin as usize, (p.rows, p.cols))?)
+                }
                 Op::Conv(c, base) => c.chain_program(
                     base,
                     conv::Io {
                         input_at: plan.at[node.inputs[0]],
                         output_to,
+                        output_ch: plan.ch[k + 1],
                     },
                 ),
                 Op::Add(a) => {
@@ -298,9 +360,10 @@ pub fn program(nodes: &[Node]) -> Result<ChunkInfo, Error> {
                 Op::AvgPool(p) => p.chain_program(plan.at[node.inputs[0]].unwrap(), output_to),
                 Op::Fc(f, base) => f.chain_program(base, plan.at[node.inputs[0]].unwrap().0),
             }
+            .map(Some)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    splice(&parts)
+    splice(&parts.into_iter().flatten().collect::<Vec<_>>())
 }
 
 /// [`program`] for convs one after the other, each with its parameters

@@ -12,7 +12,8 @@
 //! PyTorch's semantics where they differ from TFLite's: a conv's
 //! `padding = p` pads p before and what the output size needs after
 //! (`Conv::pad_before`); a global average pool keeps its input's
-//! quantization and rounds the mean half to even.
+//! quantization and rounds the mean half to even; a concat (channels)
+//! needs its inputs quantized as its output (the quantizer shares one).
 
 use std::collections::HashMap;
 
@@ -22,7 +23,9 @@ use crate::codegen::Quant;
 use crate::codegen::avg_pool::GlobalAvgPool;
 use crate::codegen::conv::Conv;
 use crate::codegen::fc::Fc;
-use crate::graph::{Graph, Input, Layer, Shape, Step, add_layer, fit_conv, max_pool_layer};
+use crate::graph::{
+    Graph, Input, Layer, Shape, Step, add_layer, concat_layer, fit_conv, max_pool_layer,
+};
 
 type Error = Box<dyn std::error::Error>;
 
@@ -238,10 +241,19 @@ impl Graph {
                     }
                     Layer::MaxPool(max_pool_layer(s, q).map_err(ctx)?)
                 }
+                "concat" => {
+                    let args = (0..ins.len()).map(arg).collect::<Result<Vec<_>, _>>()?;
+                    if args.iter().any(|&(_, _, q)| q != out_q) {
+                        return Err(ctx("needs the same quantization in and out".into()));
+                    }
+                    let shapes: Vec<Shape> = args.iter().map(|a| a.1).collect();
+                    Layer::Concat(concat_layer(&shapes).map_err(ctx)?)
+                }
                 k => return Err(format!("op {i}: \"{k}\" not supported").into()),
             };
             let inputs = match &layer {
                 Layer::Add(_) => vec![input(0)?, input(1)?],
+                Layer::Concat(_) => (0..ins.len()).map(input).collect::<Result<_, _>>()?,
                 _ => vec![input(0)?],
             };
             steps.push(Step::new(layer, inputs, out, out_shape).map_err(ctx)?);

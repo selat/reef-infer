@@ -6,7 +6,8 @@ TPU computes: activations int8 per tensor (asymmetric), weights int8 per
 output channel (symmetric, -127..127), biases int32 at scale
 `s_in * s_w`; a ReLU after a conv / linear / add is fused (the output is
 quantized after it); pools, flatten and reshapes keep their input's
-quantization.
+quantization; a channel concat and all its inputs share one (the first
+input's), so it only moves bytes.
 """
 
 import torch
@@ -98,6 +99,15 @@ class EdgeTpuQuantizer(Quantizer):
             elif node.target in SHARED:
                 x = node.args[0]
                 _annotate(node, {x: ACT}, SharedQuantizationSpec((x, node)))
+            elif node.target == aten.cat.default:
+                xs = node.args[0]
+                share = SharedQuantizationSpec(xs[0])
+                for x in xs[1:]:
+                    # the other producers quantize their outputs as the first
+                    a = x.meta.get("quantization_annotation")
+                    if a is not None:
+                        a.output_qspec = share
+                _annotate(node, {x: share for x in xs}, share)
         return gm
 
     def validate(self, gm: torch.fx.GraphModule) -> None:
@@ -123,6 +133,8 @@ class EdgeTpuQuantizer(Quantizer):
 # - "global_avg_pool": the mean over the image (same quantization in and
 #   out); "max_pool": kernel, stride.
 # - "reshape": same data and quantization (flatten / view).
+# - "concat": the inputs' channels one after the other (all of them
+#   quantized as the output).
 
 QD = torch.ops.quantized_decomposed
 
@@ -261,6 +273,14 @@ def export_graph(gm: torch.fx.GraphModule) -> dict:
                 )
         elif n.op == "call_function" and n.target == aten.add.Tensor:
             op("add", n, [src(n.args[0]), src(n.args[1])])
+        elif n.op == "call_function" and n.target == aten.cat.default:
+            dim = n.args[1] if len(n.args) > 1 else 0
+            if len(n.meta["val"].shape) != 4 or dim % 4 != 1:
+                raise ValueError(f"{n.name}: only channel concats")
+            ins = [src(x) for x in n.args[0]]
+            t = op("concat", n, ins)
+            if any((i[1], i[2]) != (t[1], t[2]) for i in ins):
+                raise ValueError(f"{n.name}: inputs quantized unlike the output")
         elif n.op == "call_function" and n.target in (
             aten.adaptive_avg_pool2d.default,
             aten.mean.dim,

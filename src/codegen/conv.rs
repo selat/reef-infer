@@ -88,6 +88,10 @@ pub struct Io {
     /// address must lie above this layer's own buffers
     /// ([`Conv::narrow_end`]).
     pub output_to: Option<(i64, Patch)>,
+    /// With `output_to`: write the output as channels `.. + cout` from this
+    /// one of a wider patch (one input of a channel concat), the patch's
+    /// pixels exactly this layer's output pixels.
+    pub output_ch: Option<i64>,
 }
 
 /// Spatial size (y, x) the layout is fixed to.
@@ -261,7 +265,7 @@ impl Conv {
     }
 
     /// Output pixels per tile along y and x.
-    fn opx(&self) -> (i64, i64) {
+    pub(crate) fn opx(&self) -> (i64, i64) {
         let s = self.stride as i64;
         ((self.height / 4) as i64 / s, self.cols() * self.spx() / s)
     }
@@ -538,11 +542,18 @@ impl Conv {
                 && p.bottom >= own.bottom
                 && p.left >= own.left
                 && p.right >= own.right;
-            // a 1x1 stride-1 op walks the pixels as one run
-            let plain = self.k > 1 || self.stride > 1 || p.pw() == p.cols;
-            if !covers || !plain {
+            if !covers {
                 return Err(format!(
                     "chained conv: stored input patch {p:?} does not hold this layer's {own:?}"
+                )
+                .into());
+            }
+        }
+        if let (Some((_, p)), Some(ch)) = (io.output_to, io.output_ch) {
+            let (oy, ox) = self.opx();
+            if p.rows != oy || p.cols != ox || ch % 4 != 0 || ch + self.cout as i64 > p.cin {
+                return Err(format!(
+                    "chained conv: {oy}x{ox} output pixels per tile as channels {ch}.. of {p:?}"
                 )
                 .into());
             }
@@ -550,7 +561,9 @@ impl Conv {
         if let Some((at, p)) = io.output_to {
             let (oy, ox) = self.opx();
             let c = self.cout as i64;
-            if p.cin % c != 0 || p.rows != oy || p.cols * (p.cin / c) != ox {
+            let fills = io.output_ch.is_some()
+                || p.cin % c == 0 && p.rows == oy && p.cols * (p.cin / c) == ox;
+            if !fills {
                 return Err(format!(
                     "chained conv: {oy}x{ox} output pixels per tile do not fill the next patch ({} rows of 4 x {} B)",
                     p.rows, p.cin
@@ -583,14 +596,12 @@ impl Conv {
 
     fn execution_program(&self, base: i64, io: Io) -> Result<ChunkInfo, IsaError> {
         const IN_NAME: &str = "input";
-        const OUT_NAME: &str = "output";
         let pt = self.patch();
         // `cq`: words per real pixel (conv op, weights); the patch, loader
         // and halo work in superpixels of `pt.cq()` words
         let cq = self.cin_pad() as i64 / 4;
         let ((oy, ox), st) = (self.opx(), self.stride as i64);
         let npx = oy * ox; // output pixels per tile
-        let ob = npx * self.cout as i64; // output bytes per tile
         // Input buffer in wide memory: one tile's input is `sw` 256 B words.
         // One word (Cin 16) lands in a single slot at 0x2078, overwritten
         // for each of the row's 4 x 1 words; more use a circular buffer of
@@ -1015,6 +1026,9 @@ impl Conv {
         let (lo, hi) = self.fc().clamp();
         let mut f: Vec<(String, i64)> = Vec::new();
         let rs = ip.pw() * ip.cq(); // padded row stride in words
+        // a 1x1 stride-1 op walks the pixels as one run, unless the stored
+        // patch has a halo along x (read for another layer): row by row
+        let run = st == 1 && ip.pw() == ip.cols;
         // first window's origin: padded row 0 is the top halo; along x the
         // halo is whole superpixels, so start `left m - pad` real pixels in
         let (pad_y, pad_x) = (ip.top - self.pad().0, ip.left * self.spx() - self.pad().0);
@@ -1022,7 +1036,7 @@ impl Conv {
         let k = self.k as i64;
         let (in_dims, loops): (Vec<(i64, i64)>, [i64; 3]) = if k1_split {
             // per pass (4 words): the words, then pixels (x, y)
-            if st == 1 {
+            if run {
                 (
                     vec![(4, 1), (npx, cq), (passes, 4)],
                     [3, npx - 1, passes - 1],
@@ -1035,7 +1049,7 @@ impl Conv {
             }
         } else if self.k == 1 {
             // per pixel: Cin / 4 words against the slots
-            if st == 1 {
+            if run {
                 (vec![(cq, 1), (1, cq), (npx, cq)], [cq - 1, npx - 1, 0])
             } else {
                 (
@@ -1082,7 +1096,7 @@ impl Conv {
             (
                 "in_tflags",
                 if self.k == 1 {
-                    if st == 1 { 1 } else { 3 }
+                    if run { 1 } else { 3 }
                 } else if single {
                     7
                 } else {
@@ -1147,9 +1161,14 @@ impl Conv {
             }
             Some((at, np)) => {
                 // into the next patch's interior: words, x, then y at its
-                // padded row stride
-                f.push(("out_base".into(), at + np.at(0, 0)));
-                let mut dims = vec![(boq.min(oq), 1), (ox, oq), (oy, np.pw() * np.cq())];
+                // padded row stride (a concat input: its channels of every
+                // pixel of the wider patch)
+                let (ch, px) = match io.output_ch {
+                    Some(ch) => (ch, np.cq()),
+                    None => (0, oq),
+                };
+                f.push(("out_base".into(), at + np.at(0, 0) + ch));
+                let mut dims = vec![(boq.min(oq), 1), (ox, px), (oy, np.pw() * np.cq())];
                 if blocks > 1 {
                     dims.push((blocks, boq));
                 }
@@ -1214,78 +1233,118 @@ impl Conv {
             return a.finish();
         }
 
-        // ── Output: narrow tp -> wide 0x2078 on every tile, then each tile
-        // in turn produces its ob bytes to the outfeed.
-        load_output_addr(&mut a, OUT_NAME)?;
-        descriptor_addr(&mut a)?;
-        let mut f = vec![
-            ("tile_mask", ALL_TILES),
-            ("narrow_addr", land_b / 4),
-            ("n_inc0", 1),
-            ("n_lim0", oq - 1),
-            ("n_inc1", 1),
-            ("n_lim1", ox - 1),
-            ("n_inc2", 1),
-            ("n_lim2", oy - 1),
-            ("n_inc3", -(ob / 4 - 1)),
-            ("n_inc4", -(ob / 4 - 1)),
-            ("n_inc5", -(ob / 4 - 1)),
-            ("narrow_lvl_mask", 7),
-            ("wide_addr", 0x2078),
-            ("wide_rows", 1),
-            ("sync_en0", 1),
-            ("sync_id", 0x10),
-            ("sync_en1", 1),
-            ("sync_val", 0xffff),
-            ("sync_en2", 1),
-            ("sync_f45", 1),
-            ("tail_lvl", 3),
-        ];
-        if ob <= 256 {
-            // one wide word per tile: a circular single-row target
-            f.extend([
-                ("w_inc0", 1),
-                ("wide_circ", 1),
-                ("sync_f1", 1),
-                ("sync_wait_lvl", 1),
-            ]);
-        } else {
-            f.push(("w_lim0", (ob + 255) / 256 - 1));
-        }
-        a.emit(OP_NARROW_TO_WIDE, &f)?;
-        descriptor_send(&mut a, 16 * ob, TAG_OUTPUT)?;
-        for t in 0..16i64 {
-            a.emit(
-                OP_OUTFEED,
-                &[("d0_limit", ob / 8 - 1), ("k173", 3), ("f222", 0x7f)],
-            )?;
-            a.emit(
-                OP_RING_PRODUCER,
-                &[
-                    ("tile_mask", 1 << t),
-                    ("addr", 0x2078),
-                    ("inc0", 1),
-                    ("cnt1", ((ob + 255) / 256 - 1).max(0)),
-                    ("sdims", 1),
-                    ("cbuf", 1),
-                    ("slots", 1),
-                    ("mode", 3),
-                    ("pcfg", 0x14),
-                    ("r0_id", 0x51),
-                    ("r0_val", t),
-                    ("r0_en_a", 1),
-                    ("r0_en_b", 1),
-                    ("r1_id", 0x2d),
-                    ("r1_val", 1),
-                    ("r1_en_a", 1),
-                    ("r1_en_b", 1),
-                    ("dest", 0x10000),
-                ],
-            )?;
-        }
-        epilogue(&mut a, 16, words)?;
+        outfeed(&mut a, land_b, oq, (oy, ox), words)?;
         a.finish()
     }
+
+    /// The output layer of a chain that ends in a concat of this conv's
+    /// output with others' (`cout` channels in all, [`outfeed_program`]).
+    pub fn concat_output(&self, cout: usize) -> LayerInfo {
+        let (oh, ow) = (self.height / self.stride, self.width / self.stride);
+        LayerInfo {
+            output_layout: Some(output_layout(
+                cout,
+                self.opx().0 as usize,
+                self.opx().1 as usize,
+            )),
+            ..layer("output", (oh, ow, cout), self.output)
+        }
+    }
+}
+
+/// The output section: every tile's `oy x ox` pixels of `oq` words, one
+/// after the other at narrow byte `land_b` -> wide 0x2078 -> the host as
+/// layer "output", tile after tile; then the epilogue (`thr6`: the words
+/// of a weight multicast, if any).
+fn outfeed(
+    a: &mut Asm,
+    land_b: i64,
+    oq: i64,
+    (oy, ox): (i64, i64),
+    thr6: i64,
+) -> Result<(), IsaError> {
+    const OUT_NAME: &str = "output";
+    let ob = 4 * oq * oy * ox; // output bytes per tile
+    // ── Output: narrow tp -> wide 0x2078 on every tile, then each tile
+    // in turn produces its ob bytes to the outfeed.
+    load_output_addr(a, OUT_NAME)?;
+    descriptor_addr(a)?;
+    let mut f = vec![
+        ("tile_mask", ALL_TILES),
+        ("narrow_addr", land_b / 4),
+        ("n_inc0", 1),
+        ("n_lim0", oq - 1),
+        ("n_inc1", 1),
+        ("n_lim1", ox - 1),
+        ("n_inc2", 1),
+        ("n_lim2", oy - 1),
+        ("n_inc3", -(ob / 4 - 1)),
+        ("n_inc4", -(ob / 4 - 1)),
+        ("n_inc5", -(ob / 4 - 1)),
+        ("narrow_lvl_mask", 7),
+        ("wide_addr", 0x2078),
+        ("wide_rows", 1),
+        ("sync_en0", 1),
+        ("sync_id", 0x10),
+        ("sync_en1", 1),
+        ("sync_val", 0xffff),
+        ("sync_en2", 1),
+        ("sync_f45", 1),
+        ("tail_lvl", 3),
+    ];
+    if ob <= 256 {
+        // one wide word per tile: a circular single-row target
+        f.extend([
+            ("w_inc0", 1),
+            ("wide_circ", 1),
+            ("sync_f1", 1),
+            ("sync_wait_lvl", 1),
+        ]);
+    } else {
+        f.push(("w_lim0", (ob + 255) / 256 - 1));
+    }
+    a.emit(OP_NARROW_TO_WIDE, &f)?;
+    descriptor_send(a, 16 * ob, TAG_OUTPUT)?;
+    for t in 0..16i64 {
+        a.emit(
+            OP_OUTFEED,
+            &[("d0_limit", ob / 8 - 1), ("k173", 3), ("f222", 0x7f)],
+        )?;
+        a.emit(
+            OP_RING_PRODUCER,
+            &[
+                ("tile_mask", 1 << t),
+                ("addr", 0x2078),
+                ("inc0", 1),
+                ("cnt1", ((ob + 255) / 256 - 1).max(0)),
+                ("sdims", 1),
+                ("cbuf", 1),
+                ("slots", 1),
+                ("mode", 3),
+                ("pcfg", 0x14),
+                ("r0_id", 0x51),
+                ("r0_val", t),
+                ("r0_en_a", 1),
+                ("r0_en_b", 1),
+                ("r1_id", 0x2d),
+                ("r1_val", 1),
+                ("r1_en_a", 1),
+                ("r1_en_b", 1),
+                ("dest", 0x10000),
+            ],
+        )?;
+    }
+    epilogue(a, 16, thr6)
+}
+
+/// A program part sending the `c`-channel patch of `oy x ox` pixels (no
+/// halo) at narrow byte `at` on every tile to the host, as a conv's
+/// output: what a chain ending in a concat ends with.
+pub fn outfeed_program(at: i64, c: usize, (oy, ox): (i64, i64)) -> Result<ChunkInfo, IsaError> {
+    let mut a = Asm::new();
+    prologue(&mut a)?;
+    outfeed(&mut a, at, c as i64 / 4, (oy, ox), 0)?;
+    a.finish()
 }
 
 /// Address-generator fields `{p}_inc{j}` / `{p}_cnt{j}` for a loop nest

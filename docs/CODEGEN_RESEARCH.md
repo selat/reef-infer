@@ -1355,3 +1355,36 @@ rounding, the corpus TFLite model through `Graph::from_tflite`, and a
 PyTorch pool-and-FC net, 50 / 50 inputs). Its input layout (a 3x3 grid)
 is not a conv's, so it runs from the host only. 2x2x256 is the same
 family with other sync counts (not derived).
+
+## Channel concat (2026-10-16)
+
+SqueezeNet's fire modules concatenate a 1x1 and a 3x3 expand conv of the
+same squeeze output. A concat moves bytes only if its inputs are
+quantized as its output: TFLite's converter already gives them one scale;
+the PT2E quantizer now shares the first input's observer with the other
+producers' outputs and the concat's (the PyTorch model's numerics follow,
+as on the Edge TPU).
+
+On chip the concat has no program. Its inputs must be convs that only it
+reads; each writes its output into the concat's patch from its channel
+offset: `out_base` + the offset in bytes and the pixel stride the patch's
+words per pixel instead of the conv's own (`conv::Io::output_ch`); the
+rest of the output walk is unchanged. The plan gives the concat's patch
+one live range from its first input's writer to its last reader and maps
+the inputs to it. A chain may end with a concat: the convs fill a plain
+patch, then a part with the conv's output section (narrowToWide, one
+descriptor, 16 outfeeds) sends it, the output layer that of a conv with
+the concat's channels.
+
+The squeeze output is read by a 1x1 and a 3x3 conv, so it is stored
+padded for the 3x3; the 1x1 op walked its pixels as one run and refused
+such a patch. Walking them as x then y at the padded row stride (the
+stride-2 form with stride 1, `in_tflags` 3) works: bit-exact on device.
+
+SqueezeNet-style (PyTorch, 50 / 50 inputs bit-exact): the two 16x16 fire
+modules (8 steps) run in one call, 17 calls -> 10; the 8x8 fire module
+still runs layer by layer (an 8x8 conv takes its input on chip only, and
+the max pools before it do not chain). A fire module from TFLite: one
+call, bit-exact with the host reference and the reference with the TFLite
+CPU interpreter (81920 / 81920 outputs).
+

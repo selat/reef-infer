@@ -14,7 +14,7 @@ the findings.
 | FC (`fc`) | K <= 2048 or 3073-4096 (multiple of 8, input spread over tiles and gathered), N 4-64 or 64 per tile up to 1024 | byte-identical (31 corpus models), on device |
 | MAX_POOL_2D (`pool`) | 2x2 stride 2 valid; H, W 16 / 32; C 32 / 64 / 128 | byte-identical (5 corpus models), on device |
 | ADD (`add`) | two equal-shape inputs, requantized, fused RELU; H, W 16 / 32; image row 512 / 1024 / 2048 B | byte-identical (8 corpus models), on device |
-| Front end (`graph`) | CPU int8 `.tflite` as a DAG: CONV_2D, MAX_POOL_2D, ADD, global AVERAGE_POOL_2D (native at 8x8 C 32 / 64, 16x16 C 16-64, 32x32 C 16, else as an FC), FC, RESHAPE; host pads / crops between layers; every layer's parameters cached once at its own wide address | MNIST MLP (97.35%), CNN (98.66%) and CIFAR-10 ResNet-8 (75.22%) on device, bit-exact with the host reference |
+| Front end (`graph`) | CPU int8 `.tflite` as a DAG: CONV_2D, MAX_POOL_2D, ADD, global AVERAGE_POOL_2D (native at 8x8 C 32 / 64 / 128, 16x16 C 16-64, 32x32 C 16, 3x3 C 256, else as an FC), FC, RESHAPE, CONCATENATION (channels); host pads / crops between layers; every layer's parameters cached once at its own wide address | MNIST MLP (97.35%), CNN (98.66%) and CIFAR-10 ResNet-8 (75.22%) on device, bit-exact with the host reference |
 | CONV_2D (`conv`) | same padding; k 1 / 3; stride 1 / 2; 16x16 with Cin 1-128 (k 3), up to 64x64 with Cin >= 16; Cout 8-32 (k 3); k 1 of any width: Cin a multiple of 16 up to 240 at 16x16, Cout a multiple of 4 up to 64 or of 64 up to 256 (64-channel blocks) | byte-identical at 16x16, on device up to 64x64 |
 | Loopback broadcast | tile -> scalar memory -> all tiles | on device |
 
@@ -95,7 +95,8 @@ top-1 as TFLite CPU. The items it did not need stay open.
 | ReLU6 | V1 / V2 activations | a clamp; already supported by the output stage | S |
 | 224x224 inputs | real resolution | spatial tiling in several passes per layer (patch does not fit), streamed weights (corpus SSDLite has streamed-parameter infeeds) | L |
 | **Keep activations on chip between layers** | performance (host round-trips per layer are slow) | needs a memory planner: layer i's output layout = layer i+1's input layout, no host hop; the scheduler / allocator from section 8 | L |
-| Concat, pad | V2 / Inception-style graphs | corpus `misc_opconcat`, `misc_oppad`; often a DMA re-layout | M |
+| Concat | SqueezeNet / Inception-style graphs | **done along channels (2026-10-16)**: inputs quantized as the output (PT2E shares one observer; TFLite's converter does already); in a chain the convs it reads write into its patch at their channel offsets (no instructions of its own; a chain may end with it), else the host joins them. SqueezeNet-style net bit-exact, its two 16x16 fire modules in one call (17 calls -> 10); a fire module from TFLite bit-exact with the CPU interpreter. Concats of non-convs (adds, pools) and along other axes open | done |
+| Pad | V2-style graphs | corpus `misc_oppad`; often a DMA re-layout | M |
 
 ## Milestone 5: detection and beyond (SSD-MobileNet, EfficientNet-Lite)
 

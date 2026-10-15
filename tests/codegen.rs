@@ -1170,3 +1170,113 @@ fn conv_chain_planning() {
     let (e, f) = (conv(3, 2, 16, 32, 32), conv(3, 1, 16, 32, 32));
     assert!(convs(&[(&e, 0), (&f, 0x400)]).is_err());
 }
+
+/// Two SqueezeNet fire modules as a PyTorch JSON graph at 16x16: squeeze
+/// 1x1 32 -> 16, expand 1x1 and 3x3 16 -> 32 each, their concat (quantized
+/// alike), twice; the first concat feeds the second squeeze, the second
+/// ends the graph.
+fn fire_graph(seed: u64) -> String {
+    let mut s = seed;
+    let mut w = |n: usize| -> Vec<i64> {
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 32) % 61) as i64 - 30
+            })
+            .collect()
+    };
+    let mut conv = |input: i32, out: i32, k: usize, cin: usize, cout: usize, q: (f64, i64)| {
+        serde_json::json!({
+            "op": "conv", "inputs": [input], "output": out, "shape": [16, 16, cout],
+            "scale": q.0, "zero_point": q.1, "relu": true,
+            "kernel": k, "stride": 1, "pad": k / 2,
+            "weights": w(cout * k * k * cin),
+            "weight_scales": vec![0.004; cout], "bias": vec![50; cout],
+        })
+    };
+    let (sq, cat) = ((0.04, -128), (0.06, -128));
+    let ops = vec![
+        conv(0, 1, 1, 32, 16, sq),
+        conv(1, 2, 1, 16, 32, cat),
+        conv(1, 3, 3, 16, 32, cat),
+        serde_json::json!({"op": "concat", "inputs": [2, 3], "output": 4, "shape": [16, 16, 64],
+            "scale": cat.0, "zero_point": cat.1}),
+        conv(4, 5, 1, 64, 16, sq),
+        conv(5, 6, 1, 16, 32, cat),
+        conv(5, 7, 3, 16, 32, cat),
+        serde_json::json!({"op": "concat", "inputs": [6, 7], "output": 8, "shape": [16, 16, 64],
+            "scale": cat.0, "zero_point": cat.1}),
+    ];
+    serde_json::json!({
+        "format": "reef-graph", "version": 1,
+        "input": {"tensor": 0, "shape": [16, 16, 32], "scale": 0.03, "zero_point": -128},
+        "output": 8, "ops": ops,
+    })
+    .to_string()
+}
+
+/// Concat in chains: the fire modules run in one call, each concat's
+/// inputs written into its patch at channel offsets (the shared squeeze
+/// output padded for the 3x3 and read by the 1x1 too), the second concat
+/// sent to the host from its patch; the host joins a concat elsewhere.
+#[test]
+fn concat_chains() {
+    use reef_infer::codegen::chain::{Node, Op, plan};
+    use reef_infer::graph::{Graph, Layer};
+    let g = Graph::from_torch_json(&fire_graph(7)).unwrap();
+    assert_eq!(g.steps.len(), 8);
+    assert!(matches!(&g.steps[3].layer, Layer::Concat(c) if c.cs == [32, 32]));
+    assert_eq!(
+        g.chains().unwrap(),
+        vec![std::ops::Range { start: 0, end: 8 }]
+    );
+    let programs = g.build().unwrap();
+    assert_eq!(programs.calls(), 1);
+    assert!(programs.steps[3].is_none() && programs.steps[2].is_some());
+    // the host reference: each pixel's 32 + 32 channels
+    let x = vec![200u8; 16 * 16 * 32];
+    let (a, b) = (
+        g.steps[1].reference(&[&g.steps[0].reference(&[&x])]),
+        g.steps[2].reference(&[&g.steps[0].reference(&[&x])]),
+    );
+    let cat = g.steps[3].reference(&[&a, &b]);
+    assert_eq!(&cat[..32], &a[..32]);
+    assert_eq!(&cat[32..64], &b[..32]);
+    assert_eq!(&cat[64..96], &a[32..64]);
+    // the plan: the concat's inputs are its patch from channels 0 and 32
+    let conv = |k: usize| -> &Conv {
+        match &g.steps[k].layer {
+            Layer::Conv(c) => c,
+            _ => unreachable!(),
+        }
+    };
+    let nodes: Vec<Node> = [
+        (0, vec![0]),
+        (1, vec![1]),
+        (2, vec![1]),
+        (3, vec![2, 3]),
+        (4, vec![4]),
+    ]
+    .into_iter()
+    .map(|(k, inputs)| Node {
+        op: if k == 3 {
+            Op::Concat
+        } else {
+            Op::Conv(conv(k), 0)
+        },
+        inputs,
+    })
+    .collect();
+    let p = plan(&nodes).unwrap();
+    let (s, c) = (p.at[1].unwrap(), p.at[4].unwrap());
+    assert_eq!((s.1.top, s.1.left), (1, 1)); // padded for the 3x3
+    assert_eq!((p.at[2].unwrap().0, p.at[3].unwrap().0), (c.0, c.0));
+    assert_eq!((p.ch[2], p.ch[3], c.1.cin), (Some(0), Some(32), 64));
+    assert!(c.0 >= s.0 + s.1.tp() || s.0 >= c.0 + c.1.tp());
+    // a concat input read elsewhere too does not chain
+    let mut bad = nodes.clone();
+    bad[4].inputs = vec![2];
+    assert!(plan(&bad).is_err());
+}

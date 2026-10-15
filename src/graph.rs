@@ -14,6 +14,9 @@
 //!   mesh reduction with no parameters), other
 //!   shapes lowered to an FC that sums each channel's pixels; both round
 //!   exactly as TFLite does;
+//! - CONCATENATION along channels of tensors quantized as its output: in
+//!   an on-chip chain its convs write straight into one patch at their
+//!   channel offsets (`chain::Op::Concat`), elsewhere the host joins them;
 //! - RESHAPE (free in NHWC), and AVERAGE_POOL_2D over a 1x1 image (the
 //!   input itself). Ops computing a reshape's int32 shape (SHAPE,
 //!   STRIDED_SLICE, PACK, ...) are skipped.
@@ -68,7 +71,31 @@ fn len((y, x, z): Shape) -> usize {
     y * x * z
 }
 
-/// One layer program.
+/// A channel concatenation of equally sized, equally quantized tensors
+/// (`cs` channels each, in order): no program of its own. In an on-chip
+/// chain its producers write their channels into one patch
+/// ([`chain::Op::Concat`]); elsewhere the host joins them.
+#[derive(Debug, Clone)]
+pub struct Concat {
+    pub height: usize,
+    pub width: usize,
+    pub cs: Vec<usize>,
+}
+
+impl Concat {
+    /// Host reference: each pixel's channels from every input in turn.
+    pub fn reference(&self, x: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.height * self.width * self.cs.iter().sum::<usize>());
+        for p in 0..self.height * self.width {
+            for (x, &c) in x.iter().zip(&self.cs) {
+                out.extend_from_slice(&x[p * c..(p + 1) * c]);
+            }
+        }
+        out
+    }
+}
+
+/// One layer program (or, for a concat, a host step).
 #[derive(Debug, Clone)]
 pub enum Layer {
     Fc(Fc),
@@ -76,6 +103,7 @@ pub enum Layer {
     MaxPool(MaxPool),
     AvgPool(GlobalAvgPool),
     Add(Add),
+    Concat(Concat),
 }
 
 impl Layer {
@@ -84,7 +112,7 @@ impl Layer {
     }
 
     /// The program with its parameters (if any) cached from wide address
-    /// `base` (64 B units).
+    /// `base` (64 B units). A concat has none: an error.
     pub fn build_at(&self, base: i64) -> Result<TfliteModel, Box<dyn std::error::Error>> {
         match self {
             Layer::Fc(f) => f.build_at(base),
@@ -92,7 +120,13 @@ impl Layer {
             Layer::MaxPool(p) => Ok(p.build()?.into_model()),
             Layer::AvgPool(p) => Ok(p.build()?.into_model()),
             Layer::Add(a) => Ok(a.build()?.into_model()),
+            Layer::Concat(_) => Err("a concat has no program of its own".into()),
         }
+    }
+
+    /// Whether the layer runs on the host when not in a chain (a concat).
+    pub fn host_only(&self) -> bool {
+        matches!(self, Layer::Concat(_))
     }
 
     /// Wide memory (64 B units per tile) its cached parameters take.
@@ -100,7 +134,7 @@ impl Layer {
         match self {
             Layer::Fc(f) => f.wide_units(),
             Layer::Conv(c) => c.wide_units(),
-            Layer::MaxPool(_) | Layer::AvgPool(_) | Layer::Add(_) => 0,
+            Layer::MaxPool(_) | Layer::AvgPool(_) | Layer::Add(_) | Layer::Concat(_) => 0,
         }
     }
 
@@ -113,6 +147,7 @@ impl Layer {
             Layer::MaxPool(p) => p.reference(&x[0]),
             Layer::AvgPool(p) => p.reference(&x[0]),
             Layer::Add(a) => a.reference(&x[0], &x[1]),
+            Layer::Concat(c) => c.reference(x),
         }
     }
 
@@ -156,6 +191,10 @@ impl Layer {
                 let sh = (a.height, a.width, a.c);
                 (vec![sh, sh], sh)
             }
+            Layer::Concat(c) => (
+                c.cs.iter().map(|&z| (c.height, c.width, z)).collect(),
+                (c.height, c.width, c.cs.iter().sum()),
+            ),
         }
     }
 }
@@ -394,10 +433,32 @@ impl Graph {
                         relu(o.fused_activation_function())?,
                     )?)
                 }
+                BuiltinOperator::CONCATENATION => {
+                    let o = op
+                        .builtin_options_as_concatenation_options()
+                        .ok_or("CONCATENATION without options")?;
+                    let q = tq(outs[0])?;
+                    let shapes = ins
+                        .iter()
+                        .map(|&i| shape(i))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let quants = ins.iter().map(|&i| tq(i)).collect::<Result<Vec<_>, _>>()?;
+                    if ![3, -1].contains(&o.axis())
+                        || relu(o.fused_activation_function())?
+                        || quants.iter().any(|&qi| qi != q)
+                    {
+                        return Err(
+                            "CONCATENATION: only along channels, no activation, the same quantization"
+                                .into(),
+                        );
+                    }
+                    Layer::Concat(concat_layer(&shapes)?)
+                }
                 c => return Err(format!("op {c:?} not supported").into()),
             };
             let inputs: Vec<Input> = match &layer {
                 Layer::Add(_) => vec![input(ins[0])?, input(ins[1])?],
+                Layer::Concat(_) => ins.iter().map(|&i| input(i)).collect::<Result<_, _>>()?,
                 _ => vec![input(ins[0])?],
             };
             steps.push(Step::new(layer, inputs, outs[0], output)?);
@@ -467,7 +528,12 @@ impl Graph {
             .steps
             .iter()
             .zip(self.wide_bases()?)
-            .map(|(s, base)| Ok(Arc::new(s.layer.build_at(base)?)))
+            .map(|(s, base)| {
+                Ok(match s.layer.host_only() {
+                    true => None,
+                    false => Some(Arc::new(s.layer.build_at(base)?)),
+                })
+            })
             .collect::<Result<_, Error>>()?;
         let chains = self
             .chains()?
@@ -543,6 +609,7 @@ impl Graph {
                 Layer::Add(a) => Op::Add(a),
                 Layer::AvgPool(p) => Op::AvgPool(p),
                 Layer::Fc(f) => Op::Fc(f, bases[k]),
+                Layer::Concat(_) => Op::Concat,
                 _ => return None,
             };
             nodes.push(Node { op, inputs });
@@ -569,14 +636,26 @@ impl Graph {
                 .find(|e| e.exec_type != ExecutableType::PARAMETER_CACHING)
                 .ok_or("no execution program")?)
         };
-        let (first, last) = (exec(steps.start)?, exec(steps.end - 1)?);
+        let first = exec(steps.start)?;
+        let output_layers = match &self.steps[steps.end - 1].layer {
+            // a final concat: its patch as its first input's conv would send it
+            Layer::Concat(c) => {
+                let t = self.steps[steps.end - 1].inputs[0].tensor;
+                let k = steps.clone().find(|&k| self.steps[k].output == t).unwrap();
+                let Op::Conv(conv, _) = nodes[k - steps.start].op else {
+                    return Err("a concat of a non-conv".into());
+                };
+                vec![conv.concat_output(c.cs.iter().sum())]
+            }
+            _ => exec(steps.end - 1)?.output_layers,
+        };
         Ok(TfliteModel {
             executables: vec![ExecInfo {
                 exec_type: ExecutableType::EXECUTION_ONLY,
                 parameters: Vec::new(),
                 instruction_chunks: vec![chunk],
                 input_layers: first.input_layers,
-                output_layers: last.output_layers,
+                output_layers,
                 scratch_size_bytes: 0,
             }],
         })
@@ -588,7 +667,10 @@ impl Graph {
     pub async fn load(&self, dev: &mut Device, programs: &Programs) -> Result<Loaded, DeviceError> {
         let mut steps = Vec::with_capacity(programs.steps.len());
         for p in &programs.steps {
-            steps.push(dev.load_params(Arc::clone(p)).await?);
+            steps.push(match p {
+                Some(p) => Some(dev.load_params(Arc::clone(p)).await?),
+                None => None,
+            });
         }
         let mut chains = Vec::with_capacity(programs.chains.len());
         for (r, p) in &programs.chains {
@@ -598,7 +680,8 @@ impl Graph {
     }
 
     /// Runs the graph loaded by [`Graph::load`] on the TPU, a chain in one
-    /// call and every other layer in its own, uint8 in and out.
+    /// call and every other layer in its own (a concat outside a chain on
+    /// the host), uint8 in and out.
     pub async fn run(
         &self,
         dev: &mut Device,
@@ -609,12 +692,15 @@ impl Graph {
         let mut k = 0;
         while k < self.steps.len() {
             let (end, p) = match loaded.chains.iter().find(|(r, _)| r.start == k) {
-                Some((r, p)) => (r.end, p),
-                None => (k + 1, &loaded.steps[k]),
+                Some((r, p)) => (r.end, Some(p)),
+                None => (k + 1, loaded.steps[k].as_ref()),
             };
             let (first, last) = (&self.steps[k], &self.steps[end - 1]);
             let ins: Vec<&[u8]> = first.inputs.iter().map(|i| &acts[&i.tensor][..]).collect();
-            let y = dev.run_inference(p, first.fit(&ins).concat()).await?;
+            let y = match p {
+                Some(p) => dev.run_inference(p, first.fit(&ins).concat()).await?,
+                None => first.layer.reference(&first.fit(&ins)),
+            };
             acts.insert(last.output, last.crop(&y));
             k = end;
         }
@@ -623,22 +709,31 @@ impl Graph {
 }
 
 /// A graph's programs ([`Graph::build`]): every layer's own (they also
-/// cache its parameters), and the chains that replace runs of them.
+/// cache its parameters; `None` for a host step, a concat), and the chains
+/// that replace runs of them.
 pub struct Programs {
-    pub steps: Vec<Arc<TfliteModel>>,
+    pub steps: Vec<Option<Arc<TfliteModel>>>,
     pub chains: Vec<(Range<usize>, Arc<TfliteModel>)>,
 }
 
 impl Programs {
-    /// Calls per inference.
+    /// TPU calls per inference.
     pub fn calls(&self) -> usize {
-        self.steps.len() - self.chains.iter().map(|(r, _)| r.len() - 1).sum::<usize>()
+        let mut k = 0;
+        let mut n = 0;
+        while k < self.steps.len() {
+            match self.chains.iter().find(|(r, _)| r.start == k) {
+                Some((r, _)) => (k, n) = (r.end, n + 1),
+                None => (k, n) = (k + 1, n + self.steps[k].is_some() as usize),
+            }
+        }
+        n
     }
 }
 
 /// A graph on the TPU ([`Graph::load`]).
 pub struct Loaded {
-    pub steps: Vec<LoadedParams>,
+    pub steps: Vec<Option<LoadedParams>>,
     pub chains: Vec<(Range<usize>, LoadedParams)>,
 }
 
@@ -908,6 +1003,19 @@ pub(crate) fn add_layer(
     };
     add.check()?;
     Ok(add)
+}
+
+/// A channel concat of tensors of `shapes` (the same height and width).
+pub(crate) fn concat_layer(shapes: &[Shape]) -> Result<Concat, Error> {
+    let (h, w, _) = shapes[0];
+    if shapes.len() < 2 || shapes.iter().any(|&(y, x, _)| (y, x) != (h, w)) {
+        return Err(format!("concat of {shapes:?}: need two or more tensors of one size").into());
+    }
+    Ok(Concat {
+        height: h,
+        width: w,
+        cs: shapes.iter().map(|s| s.2).collect(),
+    })
 }
 
 impl Step {

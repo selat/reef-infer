@@ -316,6 +316,7 @@ async fn main() {
     let io = |i: usize| Io {
         input_at: (i > 0).then(|| (BUF[(i + 1) % 2], layers[i].input_patch())),
         output_to: (i < 2).then(|| (BUF[i % 2], layers[i + 1].input_patch())),
+        output_ch: None,
     };
     let mut parts = Vec::new();
     for (i, (c, &base)) in layers.iter().zip(&bases).enumerate() {

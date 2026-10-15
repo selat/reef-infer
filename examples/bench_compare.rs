@@ -151,6 +151,12 @@ async fn main() {
     let (mut sum_load, mut sum_infer) = (0.0, 0.0);
     for (st, p) in graph.steps.iter().zip(&programs.steps) {
         let ins: Vec<&[u8]> = st.inputs.iter().map(|i| &acts[&i.tensor][..]).collect();
+        let Some(p) = p else {
+            // a host step
+            let y = st.reference(&ins);
+            acts.insert(st.output, y);
+            continue;
+        };
         let x = st.fit(&ins).concat();
         let mut loads = Vec::new();
         let mut loaded = None;

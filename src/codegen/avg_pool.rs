@@ -5,7 +5,7 @@
 //! Follows `edgetpu_compiler` 16.0's programs (`pool_C*_H*_W*_opavg_padvalid
 //! _size*` in the ISA corpus), byte-identical for 8x8 (C 32 / 64 / 128),
 //! 16x16 (C 16 / 32 / 64), 32x32 (C 16) and 3x3x256 (its own program,
-//! [`GlobalAvgPool::grid3_program`]). Described for 8x8x64; every narrow
+//! `GlobalAvgPool::grid3_program`). Described for 8x8x64; every narrow
 //! address scales with the tile patch `b` ([`GlobalAvgPool::layout`]) and
 //! the wide ones with the image:
 //!
