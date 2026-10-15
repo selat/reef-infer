@@ -1084,3 +1084,21 @@ synthetic stage 3 (16x16 -> stride 2 -> 8x8 conv, 1x1 stride-2 shortcut,
 8x8 add, pool); a mutation putting the halo's east column back at x = 4
 fails it.
 
+**One call** (same day). With N <= 64 the FC computes on tile 0 alone,
+and the pool already leaves its `c` bytes on tile 0. Chained, the pool's
+op writes them to a planned narrow address instead of its own buffer and
+skips the outfeed (`epilogue(0, 0)`); the FC (`Fc::chain_program`) skips
+its infeed and ring gather and points its TensorOp's `in_base` there.
+Everything else in the FC program (scaling memory, op, outfeed) is
+unchanged, minus the gather's ring producers in the epilogue's count. In
+the planner a pool's output is a 1x1 patch of `c` bytes that only an FC
+may read, and the FC comes last.
+
+ResNet-8 is now **one call per image**: all 10000 test images bit-exact
+with the host reference, **1.94 ms per image** (`bench_compare`: 1.93 ms
+against `edgetpu_compiler`'s 1.00 ms, 1.9x). Per call that sends 32.6 KB
+of instructions and 16 KB of input (the 32x32x3 image padded to 16
+channels on the host) and gets 16 B back; the compiled model sends 25.5
+KB and 3 KB. The synthetic stage-3 hardware test now also ends in an FC
+(a mutation shifting the FC's input by one word fails it).
+

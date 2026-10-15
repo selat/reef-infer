@@ -814,12 +814,12 @@ fn resnet8_graph_matches_tflite() {
             assert!(earliest.is_some_and(|p| p + 1 < k), "step {k}");
         }
     }
-    // everything up to the pool (9 convs, 3 adds, stage 3 at 8x8 natively)
-    // runs on chip in one call, the FC in a second
+    // the whole graph (9 convs, 3 adds, stage 3 at 8x8 natively, the pool
+    // and the FC on its output) runs on chip in one call
     let p = g.build().unwrap();
     assert_eq!(p.steps.len(), 14);
-    assert_eq!(g.chains().unwrap(), [0..13, 13..14]);
-    assert_eq!(p.calls(), 2);
+    assert_eq!(g.chains().unwrap(), vec![0..14]);
+    assert_eq!(p.calls(), 1);
     let native = |k: usize| g.steps[k].on_chip.is_some();
     assert!((0..14).filter(|&k| native(k)).eq([9, 11]));
     // every layer's parameters at its own wide range, back to back

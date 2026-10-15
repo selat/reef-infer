@@ -111,12 +111,14 @@ top-1 as TFLite CPU. The items it did not need stay open.
 ## Speed today (2026-10-15)
 
 ResNet-8 on CIFAR-10, same `.tflite` and TPU (`examples/bench_compare.rs`):
-`edgetpu_compiler` 0.98 ms per image, ours 2.2 ms: 2 calls, the first
-running everything up to the pool on chip (nine convs, three residual
-adds, stage 3 natively at 8x8, the global average pool), the second the
-FC; every layer's parameters cached once at its own wide address (6.9 ms
-with 7 calls, 14.8 ms with 14, 25.6 ms when every layer reloaded its
-parameters). Item 4 below (on-chip chaining) brought most of that.
+`edgetpu_compiler` 1.00 ms per image, ours 1.93 ms in one call: every
+layer on chip (nine convs, three residual adds, stage 3 natively at 8x8,
+the global average pool and the FC), every layer's parameters cached
+once at its own wide address (2.2 ms with 2 calls, 6.9 ms with 7, 14.8
+ms with 14, 25.6 ms when every layer reloaded its parameters). Per call
+we still send 32.6 KB of instructions and a 16 KB input (Cin 3 padded to
+16 on the host) against the compiled model's 25.5 KB and 3 KB. Item 4
+below (on-chip chaining) brought most of the speedup.
 
 ## Cross-cutting, in order of when they start to matter
 
@@ -138,9 +140,10 @@ parameters). Item 4 below (on-chip chaining) brought most of that.
    16x16, bit-exact (ResNet-8's five stage 1-2 convs: 1.41 ms in one call,
    5.58 ms as five). Residual adds chain too, the shortcuts kept in narrow
    memory (`chain::plan`), and `Graph::run` makes one call per chain.
-   With native 8x8 layers and the pool reading from narrow memory,
-   ResNet-8 runs in 2 calls (all but the FC, then the FC). Next: pool ->
-   FC on chip (one call).
+   With native 8x8 layers, the pool reading from narrow memory and the FC
+   reading the pool's output on tile 0, ResNet-8 runs in one call. Next:
+   the Cin 3 input unpadded (16 KB -> 3 KB per call) and shorter
+   instruction streams.
 
 ## Not planned
 

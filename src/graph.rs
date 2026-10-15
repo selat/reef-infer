@@ -558,6 +558,7 @@ impl Graph {
                 Layer::Conv(c) => Op::Conv(c, bases[k]),
                 Layer::Add(a) => Op::Add(a),
                 Layer::AvgPool(p) => Op::AvgPool(p),
+                Layer::Fc(f) => Op::Fc(f, bases[k]),
                 _ => return None,
             };
             nodes.push(Node { op, inputs });

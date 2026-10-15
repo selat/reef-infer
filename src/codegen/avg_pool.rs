@@ -114,7 +114,7 @@ impl GlobalAvgPool {
 
     pub fn build(&self) -> Result<Program, Box<dyn std::error::Error>> {
         self.check()?;
-        Ok(self.program(None)?)
+        Ok(self.program(None, None)?)
     }
 
     /// The tile patch a chained pool reads: the plain 2x2 pixels.
@@ -133,29 +133,45 @@ impl GlobalAvgPool {
         0x1600
     }
 
-    /// The program with its input already on every tile at narrow `.0`
-    /// (geometry `.1`, [`GlobalAvgPool::input_patch`]) instead of from the
-    /// host; the output goes to the host ("output").
+    /// The output on tile 0 as a chained layer reads it: `c` bytes.
+    pub fn output_patch(&self) -> Patch {
+        Patch {
+            rows: 1,
+            cols: 1,
+            ..Patch::plain(self.c)
+        }
+    }
+
+    /// The program with its input already on every tile at narrow `.0` of
+    /// `input_at` (geometry `.1`, [`GlobalAvgPool::input_patch`]) instead
+    /// of from the host, and the output left on tile 0 at narrow
+    /// `output_to.0` ([`GlobalAvgPool::output_patch`]), or (`None`) sent
+    /// to the host ("output").
     pub fn chain_program(
         &self,
         input_at: (i64, Patch),
+        output_to: Option<(i64, Patch)>,
     ) -> Result<ChunkInfo, Box<dyn std::error::Error>> {
         self.check()?;
+        let above = |at: i64| at >= self.narrow_end() && at % 4 == 0;
         let (at, p) = input_at;
-        if p != self.input_patch() || at < self.narrow_end() || at % 4 != 0 {
+        let out_ok = output_to.is_none_or(|(o, q)| q == self.output_patch() && above(o));
+        if p != self.input_patch() || !above(at) || !out_ok {
             return Err(format!(
-                "chained average pool: input {p:?} at {at:#x}, need {:?} above {:#x}",
+                "chained average pool: input {p:?} at {at:#x}, output {output_to:?}; need {:?} / {:?} above {:#x}",
                 self.input_patch(),
+                self.output_patch(),
                 self.narrow_end()
             )
             .into());
         }
-        Ok(self.program(Some(at))?.chunk)
+        Ok(self.program(Some(at), output_to.map(|o| o.0))?.chunk)
     }
 
     /// `input_at`: the patch's narrow address when chained (`None`: from
-    /// the host).
-    fn program(&self, input_at: Option<i64>) -> Result<Program, IsaError> {
+    /// the host); `output_at`: where tile 0 keeps the result (`None`: sent
+    /// to the host).
+    fn program(&self, input_at: Option<i64>, output_at: Option<i64>) -> Result<Program, IsaError> {
         const IN_NAME: &str = "input";
         const OUT_NAME: &str = "output";
         let g = Grid::new(self.height, self.width, self.c);
@@ -408,7 +424,7 @@ impl GlobalAvgPool {
             ("in_inc2", 1),
             ("in_inc3", 1),
             ("in_tflags", 3),
-            ("out_base", patch),
+            ("out_base", output_at.unwrap_or(patch)),
             ("out_inc0", 1),
             ("out_cnt0", cw - 1),
             ("out_inc1", 1),
@@ -457,6 +473,18 @@ impl GlobalAvgPool {
         sync(&mut a, 0x1ffff, 0x3ff, false)?;
         sync(&mut a, 0, 0x3ff, true)?;
         wait_tiles(&mut a)?;
+        let input = layer(IN_NAME, (self.height, self.width, self.c), self.quant);
+        if output_at.is_some() {
+            // the output stays on chip
+            epilogue(&mut a, 0, 0)?;
+            return Ok(Program {
+                chunk: a.finish()?,
+                parameters: Vec::new(),
+                extra_inputs: Vec::new(),
+                input,
+                output: layer(OUT_NAME, (1, 1, self.c), self.quant),
+            });
+        }
 
         // ── Output: tile 0's `c` bytes -> wide 0x2078 -> host.
         load_output_addr(&mut a, OUT_NAME)?;
@@ -517,7 +545,7 @@ impl GlobalAvgPool {
             chunk: a.finish()?,
             parameters: Vec::new(),
             extra_inputs: Vec::new(),
-            input: layer(IN_NAME, (self.height, self.width, self.c), self.quant),
+            input,
             output: LayerInfo {
                 output_layout: Some(OutputLayoutInfo {
                     y_coordinate_to_linear_tile_id_map: vec![0],

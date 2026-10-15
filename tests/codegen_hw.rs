@@ -723,31 +723,53 @@ async fn stage_8x8(dev: &mut Device, seed: &mut u64) {
         node(Op::Add(&sum), &[4, 3]),
         node(Op::AvgPool(&pool), &[5]),
     ];
-    let mut first = pre.build().unwrap();
-    let model = TfliteModel {
-        executables: vec![ExecInfo {
-            exec_type: ExecutableType::EXECUTION_ONLY,
-            parameters: vec![],
-            instruction_chunks: vec![program(&nodes).unwrap()],
-            input_layers: first.executables.remove(0).input_layers,
-            output_layers: pool
-                .build()
-                .unwrap()
-                .into_model()
-                .executables
-                .remove(0)
-                .output_layers,
-            scratch_size_bytes: 0,
-        }],
+    // then an FC (64 -> 10) on the pool's output, left on tile 0
+    let fc = Fc {
+        k: 64,
+        n: 10,
+        weights: bytes(seed, 640).iter().map(|&b| b as i8).collect(),
+        w_scale: vec![0.004; 10],
+        bias: (0..10).map(|i| 500 * i - 2000).collect(),
+        input: q4,
+        output: q(0.1, 128),
+        relu: false,
     };
-    let loaded = dev.load_params(Arc::new(model)).await.unwrap();
-    for _ in 0..3 {
-        let x = bytes(seed, 16 * 16 * 32);
-        let x1 = pre.reference(&x);
-        let want =
-            pool.reference(&sum.reference(&c.reference(&x1), &b.reference(&a.reference(&x1))));
-        let got = dev.run_inference(&loaded, x).await.unwrap();
-        assert!(got == want, "stage 3 at 8x8 on chip");
+    next += pre.wide_units();
+    dev.load_params(Arc::new(fc.build_at(next).unwrap()))
+        .await
+        .unwrap();
+    let mut with_fc = nodes.to_vec();
+    with_fc.push(node(Op::Fc(&fc, next), &[6]));
+    let out_layers = |m: TfliteModel| m.executables.into_iter().next().unwrap().output_layers;
+    let cases = [
+        (&nodes[..], out_layers(pool.build().unwrap().into_model())),
+        (&with_fc[..], out_layers(fc.build_at(next).unwrap())),
+    ];
+    for (k, (nodes, output_layers)) in cases.into_iter().enumerate() {
+        let model = TfliteModel {
+            executables: vec![ExecInfo {
+                exec_type: ExecutableType::EXECUTION_ONLY,
+                parameters: vec![],
+                instruction_chunks: vec![program(nodes).unwrap()],
+                input_layers: pre.build().unwrap().executables.remove(0).input_layers,
+                output_layers,
+                scratch_size_bytes: 0,
+            }],
+        };
+        let loaded = dev.load_params(Arc::new(model)).await.unwrap();
+        for _ in 0..3 {
+            let x = bytes(seed, 16 * 16 * 32);
+            let x1 = pre.reference(&x);
+            let pooled =
+                pool.reference(&sum.reference(&c.reference(&x1), &b.reference(&a.reference(&x1))));
+            let want = if k == 0 {
+                pooled
+            } else {
+                fc.reference(&pooled)
+            };
+            let got = dev.run_inference(&loaded, x).await.unwrap();
+            assert!(got == want, "stage 3 at 8x8 on chip (FC: {})", k == 1);
+        }
     }
 }
 

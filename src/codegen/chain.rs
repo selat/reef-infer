@@ -8,7 +8,7 @@
 //!
 //! [`program`] chains layers with the activations kept on chip: convs
 //! and residual adds as a small graph ([`Node`]), possibly ending in a
-//! global average pool. Every intermediate
+//! global average pool and an FC on its output. Every intermediate
 //! tensor is stored once, in a padded patch in narrow memory ([`plan`]),
 //! from the layer that writes it ([`conv::Io::output_to`],
 //! [`add::Io::output_to`]) until the last layer that reads it, so a
@@ -19,6 +19,7 @@
 use super::add::{self, Add};
 use super::avg_pool::GlobalAvgPool;
 use super::conv::{self, Conv};
+use super::fc::Fc;
 use super::*;
 use crate::isa;
 
@@ -88,14 +89,15 @@ pub fn rename(chunk: &mut ChunkInfo, from: &str, to: &str) {
 /// Narrow memory per tile (bytes).
 pub const NARROW_BYTES: i64 = 192 * 1024;
 
-/// A layer of a chain: a conv with its parameters cached at a wide base,
-/// an add, or a global average pool (last only: its output goes to the
-/// host).
+/// A layer of a chain: a conv or FC with its parameters cached at a wide
+/// base, an add, or a global average pool. A pool's output (on tile 0) is
+/// read only by an FC, and an FC (reading a pool's) comes last.
 #[derive(Debug, Clone, Copy)]
 pub enum Op<'a> {
     Conv(&'a Conv, i64),
     Add(&'a Add),
     AvgPool(&'a GlobalAvgPool),
+    Fc(&'a Fc, i64),
 }
 
 /// A chain layer and the tensors it reads: 0 is the chain's input, `k + 1`
@@ -153,8 +155,9 @@ pub fn plan(nodes: &[Node]) -> Result<Plan, Error> {
         let want = match node.op {
             Op::Conv(..) => 1,
             Op::Add(_) => 2,
-            Op::AvgPool(_) if k + 1 == n => 1,
-            Op::AvgPool(_) => return Err("chain: an average pool must come last".into()),
+            Op::AvgPool(_) => 1,
+            Op::Fc(..) if k + 1 == n => 1,
+            Op::Fc(..) => return Err("chain: an FC must come last".into()),
         };
         if node.inputs.len() != want || node.inputs.iter().any(|&t| t > k) {
             return Err(format!("chain: layer {k} reads {:?}", node.inputs).into());
@@ -164,6 +167,11 @@ pub fn plan(nodes: &[Node]) -> Result<Plan, Error> {
         }
         for &t in &node.inputs {
             last_use[t] = Some(k);
+            // a pool's output (tile 0 only) feeds an FC and nothing else
+            let pooled = t > 0 && matches!(nodes[t - 1].op, Op::AvgPool(_));
+            if pooled != matches!(node.op, Op::Fc(..)) {
+                return Err(format!("chain: layer {k} reads layer {}'s output", t - 1).into());
+            }
         }
     }
     if let Some(t) = (1..n).find(|&t| last_use[t].is_none()) {
@@ -177,6 +185,7 @@ pub fn plan(nodes: &[Node]) -> Result<Plan, Error> {
                 Op::Conv(c, _) => c.input_patch(),
                 Op::Add(a) => a.patch(),
                 Op::AvgPool(p) => p.input_patch(),
+                Op::Fc(f, _) => f.input_patch(),
             };
             patch[t] = Some(union(patch[t], q)?);
         }
@@ -200,6 +209,7 @@ pub fn plan(nodes: &[Node]) -> Result<Plan, Error> {
         .filter_map(|l| match l.op {
             Op::Conv(c, _) => Some(c.narrow_end()),
             Op::AvgPool(p) => Some(p.narrow_end()),
+            Op::Fc(f, _) => Some(f.narrow_end()),
             Op::Add(_) => None,
         })
         .max()
@@ -211,7 +221,7 @@ pub fn plan(nodes: &[Node]) -> Result<Plan, Error> {
             .enumerate()
             .filter_map(|(k, l)| match l.op {
                 Op::Add(a) => Some(up(a.scratch_bytes(k + 1 == n))),
-                Op::Conv(..) | Op::AvgPool(_) => None,
+                Op::Conv(..) | Op::AvgPool(_) | Op::Fc(..) => None,
             })
             .max()
             .unwrap_or(0);
@@ -278,7 +288,8 @@ pub fn program(nodes: &[Node]) -> Result<ChunkInfo, Error> {
                         scratch: plan.scratch,
                     })
                 }
-                Op::AvgPool(p) => p.chain_program(plan.at[node.inputs[0]].unwrap()),
+                Op::AvgPool(p) => p.chain_program(plan.at[node.inputs[0]].unwrap(), output_to),
+                Op::Fc(f, base) => f.chain_program(base, plan.at[node.inputs[0]].unwrap().0),
             }
         })
         .collect::<Result<Vec<_>, _>>()?;

@@ -229,7 +229,7 @@ impl Fc {
         let exec = ExecInfo {
             exec_type: ExecutableType::EXECUTION_ONLY,
             parameters: vec![],
-            instruction_chunks: vec![self.execution_program(base)?],
+            instruction_chunks: vec![self.execution_program(base, None)?],
             input_layers: vec![layer("input", (1, 1, self.k), self.input)],
             output_layers: vec![output],
             scratch_size_bytes: 0,
@@ -274,32 +274,88 @@ impl Fc {
         a.finish()
     }
 
-    fn execution_program(&self, base: i64) -> Result<ChunkInfo, IsaError> {
+    /// The tile patch a chained FC reads: its K input bytes, on tile 0.
+    pub fn input_patch(&self) -> Patch {
+        Patch {
+            rows: 1,
+            cols: 1,
+            ..Patch::plain(self.k)
+        }
+    }
+
+    /// End (bytes) of the narrow memory the program uses itself (input,
+    /// output and the input staging above them).
+    pub fn narrow_end(&self) -> i64 {
         let k = self.k as i64;
-        let kq = k / 4;
-        let nq = self.tile_n().div_ceil(4) as i64;
-        let ctiles = self.out_tiles() as i64;
-        let cmask = (1i64 << ctiles) - 1; // compute tiles
-        // Input tiles take `ch` bytes each: 64 up to K = 1024, then 128 / 256
-        // so that 16 tiles hold up to 4096 (K 2049..=3072 not derived).
-        let ch = 64 * self.k.div_ceil(1024).next_power_of_two() as i64;
-        let itiles = (k + ch - 1) / ch;
-        let in_bytes = |t: i64| (k - ch * t).min(ch);
+        ((k + 255) / 256 * 256 + 512) + 256 * ((k + 255) / 256)
+    }
+
+    /// The execution program with parameters at wide `base` and the input
+    /// already on tile 0 at narrow byte `input_at` (one compute tile, N <=
+    /// 64); the output goes to the host ("output").
+    pub fn chain_program(
+        &self,
+        base: i64,
+        input_at: i64,
+    ) -> Result<ChunkInfo, Box<dyn std::error::Error>> {
+        self.check()?;
+        check_base(base)?;
+        if self.out_tiles() != 1 || input_at % 4 != 0 || input_at < self.narrow_end() {
+            return Err(format!(
+                "chained FC: needs N <= 64 and its input at a word above {:#x} (N {}, input at {input_at:#x})",
+                self.narrow_end(),
+                self.n
+            )
+            .into());
+        }
+        Ok(self.execution_program(base, Some(input_at))?)
+    }
+
+    /// `input_at`: the input's narrow address on tile 0 when chained
+    /// (`None`: from the host, spread over the input tiles and gathered).
+    fn execution_program(&self, base: i64, input_at: Option<i64>) -> Result<ChunkInfo, IsaError> {
+        let k = self.k as i64;
         // narrow memory placement (bytes); the compiler moves the input up
         // when it does not fill the first 64 B
         let (in_base, out_base) = if k < 64 { (64, 0) } else { (0, k) };
+        let in_base = input_at.unwrap_or(in_base);
         // Staging: `slots` wide words (256 B) hold the whole input, below
         // 0x2080; it lands in narrow memory above the input and output.
-        let rows = (itiles + 3) / 4;
         let slots = (k + 255) / 256;
         let stage_w = 0x2080 - 8 * slots;
         let stage_n = ((k + 255) / 256 * 256 + 512) / 4;
         let mut a = Asm::new();
         prologue(&mut a)?;
         a.emit(OP_SYNC, &[("tiles", ALL_TILES), ("units", 0x20)])?;
+        if input_at.is_none() {
+            self.host_input(&mut a, in_base, stage_w, stage_n)?;
+        }
+        sync(&mut a, 0x1ffff, 0x3ff, false)?;
+        a.emit(OP_SCSYNC, &[("sunits", 0xc)])?;
+        sync(&mut a, 0x1ffff, 0x3ff, false)?;
+        self.compute(&mut a, base, in_base, out_base, input_at.is_none())?;
+        a.finish()
+    }
 
-        // ── Input: K bytes from the host, 64 B per input tile.
-        load_input_addr(&mut a, "input")?;
+    /// The input: K bytes from the host, 64 B per input tile, gathered
+    /// over the ring into every compute tile at narrow `in_base`.
+    fn host_input(
+        &self,
+        a: &mut Asm,
+        in_base: i64,
+        stage_w: i64,
+        stage_n: i64,
+    ) -> Result<(), IsaError> {
+        let k = self.k as i64;
+        // Input tiles take `ch` bytes each: 64 up to K = 1024, then 128 / 256
+        // so that 16 tiles hold up to 4096 (K 2049..=3072 not derived).
+        let ch = 64 * self.k.div_ceil(1024).next_power_of_two() as i64;
+        let itiles = (k + ch - 1) / ch;
+        let in_bytes = |t: i64| (k - ch * t).min(ch);
+        let cmask = (1i64 << self.out_tiles()) - 1;
+        let rows = (itiles + 3) / 4;
+        let slots = (k + 255) / 256;
+        load_input_addr(a, "input")?;
         let units8 = k / 8;
         // A one-unit transfer is encoded with the loop fields cleared
         // (count_m1 = 0, no d0 limit / strides, k157 / k203 = 0); a hang
@@ -331,8 +387,8 @@ impl Fc {
         )
         .collect();
         a.emit(OP_POP, &pop)?;
-        descriptor_addr(&mut a)?;
-        descriptor_send(&mut a, k, TAG_INPUT)?;
+        descriptor_addr(a)?;
+        descriptor_send(a, k, TAG_INPUT)?;
         // Each tile of a row receives the row's bytes and keeps its own `ch`:
         // column c reads wide word `c ch / 256` of the row, skipping the
         // words before its bytes. Full tiles go by column, a partial last
@@ -445,10 +501,10 @@ impl Fc {
             .collect();
             a.emit(OP_INFEED, &infeed)?;
         }
-        sync(&mut a, 0, 0x3ff, false)?;
-        sync(&mut a, 0x1ffff, 0x3ff, false)?;
-        sync(&mut a, 0, 0x3ff, true)?;
-        wait_tiles(&mut a)?;
+        sync(a, 0, 0x3ff, false)?;
+        sync(a, 0x1ffff, 0x3ff, false)?;
+        sync(a, 0, 0x3ff, true)?;
+        wait_tiles(a)?;
 
         // ── Gather: input tile t sends its 64 B over the ring to every
         // compute tile, landing at narrow `in_base + 64 t`.
@@ -469,18 +525,36 @@ impl Fc {
             ];
             f.extend(walk(in_bytes(t) / 4 - 1));
             a.emit(OP_WIDE_TO_NARROW, &f)?;
-            ring_consumer(&mut a, cmask, -64 + ch / 4 * t)?;
-            ring_producer(&mut a, 1 << t, 0x2068, t, cmask)?;
+            ring_consumer(a, cmask, -64 + ch / 4 * t)?;
+            ring_producer(a, 1 << t, 0x2068, t, cmask)?;
             let mut f = vec![("tile_mask", 1 << t), ("narrow_addr", stage_n)];
             f.extend(walk(in_bytes(t) / 4 - 1));
             f.extend(n2w_tail(0x2068));
             a.emit(OP_NARROW_TO_WIDE, &f)?;
         }
-        sync(&mut a, 0, 0x3ff, true)?;
-        wait_tiles(&mut a)?;
-        sync(&mut a, 0x1ffff, 0x3ff, false)?;
-        a.emit(OP_SCSYNC, &[("sunits", 0xc)])?;
-        sync(&mut a, 0x1ffff, 0x3ff, false)?;
+        sync(a, 0, 0x3ff, true)?;
+        wait_tiles(a)?;
+        Ok(())
+    }
+
+    /// Scaling memory, the FC TensorOp and the output to the host; `gathered`:
+    /// the input went through the ring (its producers count towards the
+    /// epilogue's wait).
+    fn compute(
+        &self,
+        a: &mut Asm,
+        base: i64,
+        in_base: i64,
+        out_base: i64,
+        gathered: bool,
+    ) -> Result<(), IsaError> {
+        let k = self.k as i64;
+        let kq = k / 4;
+        let nq = self.tile_n().div_ceil(4) as i64;
+        let ctiles = self.out_tiles() as i64;
+        let cmask = (1i64 << ctiles) - 1;
+        let ch = 64 * self.k.div_ceil(1024).next_power_of_two() as i64;
+        let itiles = if gathered { (k + ch - 1) / ch } else { 0 };
 
         // ── Per-channel multipliers / biases: wide `base` -> scaling memory
         // (mode 2).
@@ -586,21 +660,21 @@ impl Fc {
             ));
         }
         a.emit(OP_TENSOR, &f)?;
-        sync(&mut a, 0x1ffff, 0x3ff, false)?;
-        sync(&mut a, 0x1ffff, 0x3ff, true)?;
-        wait_tiles(&mut a)?;
-        sync(&mut a, 0, 0x3ff, true)?;
-        wait_tiles(&mut a)?;
+        sync(a, 0x1ffff, 0x3ff, false)?;
+        sync(a, 0x1ffff, 0x3ff, true)?;
+        wait_tiles(a)?;
+        sync(a, 0, 0x3ff, true)?;
+        wait_tiles(a)?;
 
         // ── Output: narrow `out_base` -> wide row 0x2078 -> ring -> host,
         // one outfeed per compute tile.
-        load_output_addr(&mut a, "output")?;
-        descriptor_addr(&mut a)?;
+        load_output_addr(a, "output")?;
+        descriptor_addr(a)?;
         let mut f = vec![("tile_mask", cmask), ("narrow_addr", out_base / 4)];
         f.extend(walk(nq - 1));
         f.extend(n2w_tail(0x2078));
         a.emit(OP_NARROW_TO_WIDE, &f)?;
-        descriptor_send(&mut a, self.out_bytes() as i64, TAG_OUTPUT)?;
+        descriptor_send(a, self.out_bytes() as i64, TAG_OUTPUT)?;
         // a one-unit outfeed clears the loop (as the one-unit input pop)
         let ou = (self.tile_ob() / 8) as i64;
         for t in 0..ctiles {
@@ -613,10 +687,10 @@ impl Fc {
                     ("f222", 0x7f),
                 ],
             )?;
-            ring_producer(&mut a, 1 << t, 0x2078, itiles + t, 0x10000)?;
+            ring_producer(a, 1 << t, 0x2078, itiles + t, 0x10000)?;
         }
-        epilogue(&mut a, itiles + ctiles, 0)?;
-        a.finish()
+        epilogue(a, itiles + ctiles, 0)?;
+        Ok(())
     }
 }
 
