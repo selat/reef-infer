@@ -1232,3 +1232,61 @@ bit-exact with the host reference; ResNet-8 unchanged (79.54%, 1.60 ms).
 In the survey's layer census the 1x1 shapes that build went from 8 / 39
 to 34 / 39 (all conv shapes 20 / 90 -> 46 / 90); left: Cout 2, Cout 96,
 Cin 24, Cin 256 from the host.
+
+## Global average pools of other shapes (2026-10-16)
+
+The native pool took 8x8x64 only; the survey's heads pool 8x8x128,
+16x16x16 / 32, 3x3x256, 1x1x256 and 25x5x64. Two dead ends first:
+
+- **The FC lowering** (the TFLite path's fallback) needs K = H W C <= 2048
+  or 3073-4096: 8x8x128, 16x16x32 and 25x5x64 are 8 K, 3x3x256 is 2304.
+- **Substituting sizes into the 8x8x64 program** (narrow addresses
+  guessed from the image size): 8x8x64 kept working, 8x8x32 / 16x16x32 /
+  8x8x128 hung, and 16x16x16 summed only tiles 8 and 12, each twice (a
+  counting probe: centre 0, mult 1, one tile's pixels at 1).
+
+The 16.0 compiler (`~/projects/tpu/edgetpu_compiler.sh`) compiled 16
+global pools (Keras `AveragePooling2D` with the window the image,
+`tools/isa_corpus/gen.py`'s `job`), all mapped to the TPU. By instruction
+mix they fall into families: every C <= 64 pool on a multiple of 4 (4x4,
+8x8, 16x16, 32x32) is the 8x8x64 program with other values; C 128 adds 7
+mesh moves and a second outfeed; C 256, sizes 3 / 6 / 7 / 25x5 and 1x1
+(a copy, no op) are their own.
+
+The C <= 64 family, field by field against the compiler
+(`examples/pool_check.rs --unchecked`):
+
+- Narrow addresses scale with the tile patch b = (H / 4)(W / 4) C: the
+  image gathered on tile 0 is 16 b at 0, the patch at 16 b, column blocks
+  at +b, the forward slots at +5 b (+16, +32 for the row forward slot and
+  the constant 1); the copy constants at 8 (W / 4) C (after two 4-row
+  staging bands).
+- Wide: the regrouped image at 0x2080 - 4 wg (wg wide words of 4 pixels),
+  the constants 4 below, the gather row 8 below that; a wide address below
+  0x2000 is given in full (`par_base`, `par_sel` 0), not as its low byte in
+  the top page.
+- Band loader: an image row of one 256 B slot is staged linearly in `th`
+  slots (`w_lim0` = th - 1; ringConsumer mode 1, id 0xb, `cnt0` th - 1),
+  the conv loader's one-slot form; the sync before the loader's moves
+  comes with th > 2 as well as above 256 B per tile.
+- Column gather: above 256 B per tile the patch crosses the gather row in
+  whole words (`n_lim0` 63, `n_lim1` / `w_lim0` words - 1) with the row
+  gather's sync record.
+- Row gather: tile 0 lands each column block's rows grouped by the wide
+  word they arrive in, r = 64 / col_words rows (levels (1, col_words),
+  (row_words, r), (r row_words, H / r)); one row a word is a two-level
+  walk with the column gather's flags (`sync_f1`, `tail_en870`).
+- Regroup: the undecoded sync-like record (rsv554-749, `sync_val`) is
+  there only when a pixel fills a wide word (C 64).
+- Reduction: `par_inc2` = -(wg - W / 4).
+
+Byte-identical on all six compiled shapes (8x8 C 32 / 64, 16x16 C 16 /
+32 / 64, 32x32 C 16), the max pools and adds unchanged; bit-exact on the
+TPU in the compiler's form and with TFLite's rounding, and chained: two
+PyTorch nets pooling 16x16x32 and 32x32x16 straight from a conv run in one
+call, 50 / 50 inputs bit-exact. 8x8x16 needs the band loader below 256 B
+per image row (not derived).
+
+C 128 (8x8, 4x4) splits the channels: tiles 0 and 1 each gather the whole
+image for 64 channels (a strided row gather: 16 of every 32 words per
+pixel), both run the reduction (`tile_mask` 3) and both outfeed. Next.

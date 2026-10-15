@@ -670,40 +670,43 @@ fn pool_matches_compiler() {
     }
 }
 
-/// The corpus global average pool (ResNet-8's head, 8x8x64) in the
-/// compiler's form (centre = zero point, mult 1 / 64): instructions and
-/// output layout.
+/// The corpus global average pools `codegen::avg_pool` supports (8x8 C 32
+/// / 64, 16x16 C 16 / 32 / 64, 32x32 C 16) in the compiler's form (centre
+/// = zero point, mult 1 / n): instructions and output layout.
 #[test]
 fn avg_pool_matches_compiler() {
-    let name = "pool/pool_C64_H8_W8_opavg_padvalid_size8_stride8";
-    let Some(path) = corpus(name) else {
-        eprintln!("ISA corpus model {name} not found; skipping");
-        return;
-    };
-    let compiled = load_tflite_model(&path).unwrap();
-    let e = &compiled.executables[0];
-    let q = quant(&e.input_layers[0]);
-    let ours = GlobalAvgPool {
-        height: 8,
-        width: 8,
-        c: 64,
-        center: q.zero_point,
-        mult: 1.0 / 64.0,
-        quant: q,
+    for (hw, c) in [(8, 64), (8, 32), (16, 16), (16, 32), (16, 64), (32, 16)] {
+        let name = format!("pool/pool_C{c}_H{hw}_W{hw}_opavg_padvalid_size{hw}_stride{hw}");
+        let Some(path) = corpus(&name) else {
+            eprintln!("ISA corpus model {name} not found; skipping");
+            continue;
+        };
+        let compiled = load_tflite_model(&path).unwrap();
+        let e = &compiled.executables[0];
+        let q = quant(&e.input_layers[0]);
+        let ours = GlobalAvgPool {
+            height: hw,
+            width: hw,
+            c,
+            center: q.zero_point,
+            mult: 1.0 / (hw * hw) as f32,
+            quant: q,
+        }
+        .build()
+        .unwrap()
+        .into_model();
+        let o = &ours.executables[0];
+        assert!(
+            o.instruction_chunks[0].bitstream == e.instruction_chunks[0].bitstream,
+            "{name}"
+        );
+        assert!(o.parameters.is_empty() && e.parameters.is_empty());
+        assert_eq!(
+            format!("{:?}", o.output_layers[0].output_layout),
+            format!("{:?}", e.output_layers[0].output_layout),
+            "{name}"
+        );
     }
-    .build()
-    .unwrap()
-    .into_model();
-    let o = &ours.executables[0];
-    assert_eq!(
-        o.instruction_chunks[0].bitstream,
-        e.instruction_chunks[0].bitstream
-    );
-    assert!(o.parameters.is_empty() && e.parameters.is_empty());
-    assert_eq!(
-        format!("{:?}", o.output_layers[0].output_layout),
-        format!("{:?}", e.output_layers[0].output_layout)
-    );
 }
 
 /// `GlobalAvgPool::tflite` rounds every channel sum as TFLite's integer

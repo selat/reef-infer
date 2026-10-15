@@ -317,7 +317,7 @@ impl Add {
             (0x2080 - 8 * s, 0x2080 - 8 * s - 4)
         };
         let const_n = b + 8 * tw * self.c as i64;
-        let par = const_w & 0xff;
+        let par = const_w;
 
         let mut a = Asm::new();
         prologue(&mut a)?;

@@ -165,16 +165,21 @@ pub(crate) fn load(
     )?;
     descriptor_addr(a)?;
     descriptor_send(a, 16 * b, TAG_INPUT)?;
-    if b > 256 {
-        // not at 256 B per tile (the compiled 8x8x64 average pool)
+    if b > 256 || th > 2 {
+        // not with one band of 2 rows of up to 256 B per tile (the compiled
+        // 8x8 average pools)
         a.emit(OP_SYNC, &[("tiles", ALL_TILES), ("counters", 0x800)])?;
     }
     // Ring -> narrow per tile column: column `col` skips its left
     // neighbours' `tw * cw` words of each image row.
     let row_words = s * 64; // words per image row
-    for col in 0..4i64 {
-        let mut f: Vec<(&str, i64)> = vec![
-            ("tile_mask", 0x1111 << col),
+    // an image row in one slot: the rows of a band one after the other in
+    // `th` slots (the compiler's form; elsewhere a circular buffer of `s`)
+    let linear = s == 1;
+    let wide: Vec<(&str, i64)> = if linear {
+        vec![("wide_addr", stage_w), ("w_lim0", th - 1), ("wide_rows", s)]
+    } else {
+        vec![
             ("wide_addr", stage_w),
             ("w_inc0", 1),
             ("w_lim0", s - 1),
@@ -185,6 +190,13 @@ pub(crate) fn load(
             ("wide_lvl_mask", 1),
             ("wide_circ", 1),
             ("wide_rows", s),
+            ("sync_wait_lvl", 1),
+        ]
+    };
+    for col in 0..4i64 {
+        let mut f: Vec<(&str, i64)> = vec![("tile_mask", 0x1111 << col)];
+        f.extend(wide.iter().copied());
+        f.extend([
             ("narrow_addr", stage / 4),
             ("n_inc0", 1),
             ("n_lim0", row_words - 1),
@@ -194,7 +206,6 @@ pub(crate) fn load(
             ("size64", 4 * s),
             ("sync_en0", 1),
             ("sync_id", 0xe),
-            ("sync_wait_lvl", 1),
             ("sync_en1", 1),
             ("sync_val", 0x8000),
             ("sync_en2", 1),
@@ -203,7 +214,7 @@ pub(crate) fn load(
             ("sync_dec_mode", 3),
             ("tail_en870", 0),
             ("tail_f871", 1),
-        ];
+        ]);
         for n in ["n_inc1", "n_inc2", "n_inc3", "n_inc4", "n_inc5"] {
             f.push((n, -(row_words - 1)));
         }
@@ -224,11 +235,10 @@ pub(crate) fn load(
     }
     let per_row = b / 2; // 4 tiles x b bytes, 8 B units
     for row in 0..4i64 {
-        a.emit(
-            OP_RING_CONSUMER,
-            &[
-                ("tile_mask", 0xf << (4 * row)),
-                ("addr", stage_w),
+        let mut f: Vec<(&str, i64)> = if linear {
+            vec![("cnt0", th - 1), ("slots", 1), ("mode", 1), ("s_id", 0xb)]
+        } else {
+            vec![
                 ("inc0", 1),
                 ("cnt0", s - 1),
                 ("inc1", -(s - 1)),
@@ -240,12 +250,17 @@ pub(crate) fn load(
                 ("slots", s),
                 ("mode", 3),
                 ("s_id", 0x2b),
-                ("s_val", -64 * s),
-                ("s_cnt", s),
-                ("s_en_b", 1),
-                ("s_y", 1),
-            ],
-        )?;
+            ]
+        };
+        f.extend([
+            ("tile_mask", 0xf << (4 * row)),
+            ("addr", stage_w),
+            ("s_val", -64 * s),
+            ("s_cnt", s),
+            ("s_en_b", 1),
+            ("s_y", 1),
+        ]);
+        a.emit(OP_RING_CONSUMER, &f)?;
         a.emit(
             OP_INFEED,
             &[
@@ -279,7 +294,7 @@ pub(crate) fn load(
 pub(crate) fn copy_op(
     a: &mut Asm,
     g: &Grid,
-    par_base: i64,
+    const_w: i64,
     first: bool,
     stage: i64,
     dest: i64,
@@ -305,8 +320,17 @@ pub(crate) fn copy_op(
         ),
         ("out_mode7", 3),
         ("out_tflags", 3),
-        ("par_base", par_base),
-        ("par_sel", 1),
+        // the constants' wide address: its low byte in the top page
+        // (`par_sel`), else in full (the compiler's)
+        (
+            "par_base",
+            if const_w >= 0x2000 {
+                const_w & 0xff
+            } else {
+                const_w
+            },
+        ),
+        ("par_sel", (const_w >= 0x2000) as i64),
         ("par_cnt0", cw - 1),
         ("par_cnt2", tw - 1),
         ("psum_cnt0", cw - 1),

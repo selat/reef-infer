@@ -2,7 +2,10 @@
 //! supports, and `codegen::avg_pool` for the global average pool, and diffs
 //! them against the compiler's, field by field.
 //!
-//!     cargo run --example pool_check -- [filter] [--all-diffs]
+//!     cargo run --example pool_check -- [filter] [--all-diffs] [--unchecked]
+//!
+//! `--unchecked` also builds the global pools `GlobalAvgPool::check` does
+//! not take (to derive new shapes against the compiler).
 //!
 //! Corpus directory: `target/isa_corpus` or `REEF_ISA_CORPUS`.
 
@@ -78,6 +81,7 @@ fn main() {
         .find(|a| !a.starts_with("--"))
         .cloned()
         .unwrap_or_default();
+    let unchecked = args.iter().any(|a| a == "--unchecked");
     let max_diffs = if args.iter().any(|a| a == "--all-diffs") {
         usize::MAX
     } else {
@@ -99,7 +103,8 @@ fn main() {
             &std::fs::read_to_string(dir.join(name).join("params.json")).unwrap(),
         )
         .unwrap();
-        let get = |k: &str| p[k].as_u64().unwrap() as usize;
+        // (a non-square window is a list: not compared)
+        let get = |k: &str| p[k].as_u64().unwrap_or(0) as usize;
         let global = p["op"] == "avg" && get("size") == get("H") && get("size") == get("W");
         let max = p["op"] == "max" && p["pad"] == "valid" && get("size") == 2 && get("stride") == 2;
         if !(global || max) {
@@ -124,10 +129,16 @@ fn main() {
                 mult: 1.0 / (get("H") * get("W")) as f32,
                 quant: q,
             };
-            if pool.check().is_err() {
+            if pool.check().is_err() && !unchecked {
                 continue;
             }
-            pool.build().unwrap().into_model()
+            match pool.build_unchecked() {
+                Ok(p) => p.into_model(),
+                Err(e) => {
+                    println!("{name}: build: {e}");
+                    continue;
+                }
+            }
         } else {
             let pool = MaxPool {
                 height: get("H"),

@@ -212,9 +212,10 @@ async fn generated_programs_on_tpu() {
         }
     }
 
-    // Global 8x8x64 average pool: the compiler's form (centre = zero point,
-    // mult 1 / 64) and TFLite's exact rounding (int8 and uint8), on random
-    // images, the extremes, and images whose every channel sum is a tie.
+    // Global average pools: the compiler's form (centre = zero point, mult
+    // 1 / n) and TFLite's exact rounding (int8 and uint8), on random images,
+    // the extremes, and images whose every channel sum is a tie (8x8x64);
+    // the other shapes the compiler's form and TFLite's int8 rounding.
     let q = Quant {
         scale: 0.03,
         zero_point: 127,
@@ -222,7 +223,7 @@ async fn generated_programs_on_tpu() {
     let ties: Vec<u8> = (0..64 * 64)
         .map(|i| (4 * (i % 64) + (i / 64) % 2) as u8)
         .collect();
-    for pool in [
+    let mut pools = vec![
         GlobalAvgPool {
             height: 8,
             width: 8,
@@ -233,16 +234,36 @@ async fn generated_programs_on_tpu() {
         },
         GlobalAvgPool::tflite(8, 8, 64, q, true).unwrap(),
         GlobalAvgPool::tflite(8, 8, 64, q, false).unwrap(),
-    ] {
+    ];
+    for (hw, c) in [(8, 32), (16, 16), (16, 32), (16, 64), (32, 16)] {
+        let n = (hw * hw) as f32;
+        pools.push(GlobalAvgPool {
+            height: hw,
+            width: hw,
+            c,
+            center: 127,
+            mult: 1.0 / n,
+            quant: q,
+        });
+        pools.push(GlobalAvgPool::tflite(hw, hw, c, q, true).unwrap());
+    }
+    for pool in pools {
         let model = Arc::new(pool.build().unwrap().into_model());
         let loaded = dev.load_params(model).await.unwrap();
-        let mut inputs = vec![vec![0u8; 4096], vec![255u8; 4096], ties.clone()];
-        inputs.extend((0..3).map(|_| bytes(&mut seed, 4096)));
+        let len = pool.height * pool.width * pool.c;
+        let mut inputs = vec![vec![0u8; len], vec![255u8; len]];
+        if len == 4096 {
+            inputs.push(ties.clone());
+        }
+        inputs.extend((0..3).map(|_| bytes(&mut seed, len)));
         for x in inputs {
             let got = dev.run_inference(&loaded, x.clone()).await.unwrap();
             assert!(
                 got == pool.reference(&x),
-                "average pool centre {} mult {}",
+                "average pool {}x{}x{} centre {} mult {}",
+                pool.height,
+                pool.width,
+                pool.c,
                 pool.center,
                 pool.mult
             );

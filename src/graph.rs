@@ -9,8 +9,9 @@
 //!   bundled schema and assumed 1);
 //! - MAX_POOL_2D 2x2, stride 2;
 //! - ADD of two equal-shape tensors (fused NONE / RELU);
-//! - AVERAGE_POOL_2D over the whole image (global): 8x8x64 natively
-//!   (`codegen::avg_pool`, a mesh reduction with no parameters), other
+//! - AVERAGE_POOL_2D over the whole image (global): natively at 8x8 (C 32 /
+//!   64), 16x16 (C 16 / 32 / 64) and 32x32 (C 16) (`codegen::avg_pool`, a
+//!   mesh reduction with no parameters), other
 //!   shapes lowered to an FC that sums each channel's pixels; both round
 //!   exactly as TFLite does;
 //! - RESHAPE (free in NHWC). Ops computing a reshape's int32 shape (SHAPE,

@@ -1,8 +1,11 @@
-//! Global AVERAGE_POOL_2D over an 8x8x64 uint8 tensor (ResNet-8's head),
-//! with no parameters: a mesh reduction into tile 0.
+//! Global AVERAGE_POOL_2D over an `H x W x C` uint8 tensor (classifier
+//! heads), with no parameters: a mesh reduction into tile 0.
 //!
-//! Follows `edgetpu_compiler` 16.0's program (`pool_C64_H8_W8_opavg_padvalid
-//! _size8_stride8` in the ISA corpus):
+//! Follows `edgetpu_compiler` 16.0's programs (`pool_C*_H*_W*_opavg_padvalid
+//! _size*` in the ISA corpus), byte-identical for 8x8 (C 32 / 64), 16x16
+//! (C 16 / 32 / 64) and 32x32 (C 16). Described for 8x8x64; every narrow
+//! address scales with the tile patch `b` ([`GlobalAvgPool::layout`]) and
+//! the wide ones with the image:
 //!
 //! 1. The band loader ([`super::band`]) gives every tile its 2x2 patch
 //!    (256 B) at narrow 0x1000, staged at narrow 0.
@@ -22,6 +25,16 @@
 //!    `out = sat_u8(round_half_even(clamp(sum (x - w_zp) mult, lo, hi)) + out_zp)`.
 //! 5. Tile 0 outfeeds its 64 bytes.
 //!
+//! What changes with the shape (each form as compiled): the band loader
+//! stages an image row of one 256 B slot linearly (`th` slots, else a
+//! circular buffer); a tile patch above 256 B crosses the gather row in
+//! whole words; tile 0 lands the column blocks' rows grouped by the wide
+//! word they arrive in (`64 / col_words` rows); the regroup's undecoded
+//! sync record is there only when a pixel fills a wide word (C 64); and a
+//! wide address below 0x2000 is given in full instead of its low byte in
+//! the top page (`par_sel`). C 128 and above split the channels over tiles
+//! 0 and 1 (corpus), not derived yet.
+//!
 //! The compiler uses `w_zp = out_zp` = the zero point and `mult = 1 / 64`,
 //! which rounds ties to even. [`GlobalAvgPool::tflite`] instead centres on
 //! 128 (an int8 model's raw values) and takes the smallest f32 multiplier
@@ -33,6 +46,19 @@ use super::*;
 
 /// Mesh move west (data goes to the tile to the west).
 const MESH_W: u8 = OP_MESH_W;
+
+/// Instruction fields.
+type Fields = Vec<(&'static str, i64)>;
+
+/// [`GlobalAvgPool::layout`]: narrow byte addresses.
+struct Layout {
+    const_n: i64,
+    patch: i64,
+    col: i64,
+    fwd_n: i64,
+    fwd_w: i64,
+    one: i64,
+}
 
 #[derive(Debug, Clone)]
 pub struct GlobalAvgPool {
@@ -78,9 +104,18 @@ impl GlobalAvgPool {
     }
 
     pub fn check(&self) -> Result<(), String> {
-        if (self.height, self.width, self.c) != (8, 8, 64) {
+        // byte-identical to the compiler (corpus) and bit-exact on the TPU:
+        // square 8 / 16 / 32, C 16 / 32 / 64 with an image row of at least
+        // 64 words per 4 tiles (the band loader) and at most 1 KiB per tile
+        let g = Grid::new(self.height, self.width, self.c);
+        let ok = self.height == self.width
+            && [8, 16, 32].contains(&self.height)
+            && [16, 32, 64].contains(&self.c)
+            && g.slots() >= 1
+            && g.b() <= 1024;
+        if !ok {
             return Err(format!(
-                "global average pool {}x{}x{}: only 8x8x64",
+                "global average pool {}x{}x{}: need square 8 / 16 / 32, C 16 / 32 / 64, 256 B per image row and at most 1 KiB per tile",
                 self.height, self.width, self.c
             ));
         }
@@ -117,6 +152,13 @@ impl GlobalAvgPool {
         Ok(self.program(None, None)?)
     }
 
+    /// [`GlobalAvgPool::build`] without [`GlobalAvgPool::check`], for
+    /// comparisons with the compiler and hardware experiments.
+    #[doc(hidden)]
+    pub fn build_unchecked(&self) -> Result<Program, Box<dyn std::error::Error>> {
+        Ok(self.program(None, None)?)
+    }
+
     /// The tile patch a chained pool reads: the plain 2x2 pixels.
     pub fn input_patch(&self) -> Patch {
         Patch {
@@ -130,7 +172,26 @@ impl GlobalAvgPool {
     /// image gathered on tile 0, the column blocks, forward slots and the
     /// constant).
     pub fn narrow_end(&self) -> i64 {
-        0x1600
+        (self.layout().one + 4 + 0xff) & !0xff
+    }
+
+    /// Narrow byte addresses, scaling with the tile patch `b` as the
+    /// compiler's: two 4-row staging bands at 0 and the constants after
+    /// them, the whole image
+    /// gathered at 0 later (16 b), then the patch, the four column blocks,
+    /// the forward slots and the constant 1.
+    fn layout(&self) -> Layout {
+        let g = Grid::new(self.height, self.width, self.c);
+        let b = g.b();
+        let patch = 16 * b;
+        Layout {
+            const_n: 8 * g.tw * g.c,
+            patch,
+            col: patch + b,
+            fwd_n: patch + 5 * b,
+            fwd_w: patch + 5 * b + 16,
+            one: patch + 5 * b + 32,
+        }
     }
 
     /// The output on tile 0 as a chained layer reads it: `c` bytes.
@@ -180,9 +241,14 @@ impl GlobalAvgPool {
         // Narrow (bytes): staging at 0, the patch at `patch`, then the
         // column blocks, forward slots and the constant 1. Wide: the
         // gather row, constants, staging and regrouped image near the top.
-        let (patch, col, fwd_n, fwd_w, one) = (0x1000, 0x1100, 0x1500, 0x1510, 0x1520);
-        let (const_n, const_w, stage_w, gather_w, image_w) =
-            (0x400, 0x203c, 0x2070, 0x2034, 0x2040);
+        let l = self.layout();
+        let (patch, col, fwd_n, fwd_w, one) = (l.patch, l.col, l.fwd_n, l.fwd_w, l.one);
+        let stage_w = 0x2080 - 8 * g.slots();
+        // wide, top down: the regrouped image, the constants, the gather
+        // row (staging overlaps the image: it is done before the regroup)
+        let image_w = 0x2080 - 4 * (self.width * self.height) as i64 / 4;
+        let (const_n, const_w) = (l.const_n, image_w - 4);
+        let gather_w = const_w - 8;
         let row_words = self.width as i64 * g.cw(); // one image row
         let col_words = g.tw * g.cw(); // one tile column's pixels in a row
 
@@ -193,42 +259,61 @@ impl GlobalAvgPool {
         prologue(&mut a)?;
         if input_at.is_none() {
             band::constants(&mut a, const_n, const_w)?;
-            band::copy_op(&mut a, &g, const_w & 0xff, true, 0, patch)?;
+            band::copy_op(&mut a, &g, const_w, true, 0, patch)?;
             band::load(&mut a, &g, IN_NAME, 0, stage_w)?;
-            band::copy_op(&mut a, &g, const_w & 0xff, false, 0, patch)?;
+            band::copy_op(&mut a, &g, const_w, false, 0, patch)?;
             sync(&mut a, 0x1ffff, 0x3ff, false)?;
         }
         sync(&mut a, 0x1ffff, 0x3ff, false)?;
 
         // ── Column gather into row 0: own patch -> `col`, row r's -> `col + r b`.
+        // (through the gather row: one wide word circularly, or above 256 B
+        // whole words)
+        let words = b / 256;
+        let multi = b > 256;
+        let (n_side, w_side): (Fields, Fields) = if multi {
+            (
+                words_walk(words),
+                vec![("w_lim0", words - 1), ("wide_rows", 1)],
+            )
+        } else {
+            (walk1(bw - 1), vec![("w_inc0", 1), ("wide_lvl_mask", 1)])
+        };
+        // whole words wait on the sync record the row gather uses
+        let (n2w_sync, w2n_sync): (Fields, Fields) = if multi {
+            (
+                vec![
+                    ("sync_id", 0xb),
+                    ("sync_en1", 1),
+                    ("sync_val", 0xffff),
+                    ("sync_en2", 1),
+                    ("sync_f45", 1),
+                ],
+                vec![("sync_f1", 1)],
+            )
+        } else {
+            (vec![("sync_en1", 0), ("sync_en2", 0)], vec![])
+        };
         a.emit(
             OP_NARROW_TO_WIDE,
             &[
                 &[("tile_mask", 0xf), ("narrow_addr", src / 4)][..],
-                &walk1(bw - 1),
-                &[
-                    ("wide_addr", gather_w),
-                    ("w_inc0", 1),
-                    ("wide_lvl_mask", 1),
-                    ("sync_en0", 1),
-                    ("sync_en1", 0),
-                    ("sync_en2", 0),
-                    ("tail_lvl", 1),
-                ],
+                &n_side,
+                &[("wide_addr", gather_w)],
+                &w_side,
+                &[("sync_en0", 1), ("tail_lvl", 1)],
+                &n2w_sync,
             ]
             .concat(),
         )?;
         a.emit(
             OP_WIDE_TO_NARROW,
             &[
-                &[
-                    ("tile_mask", 0xf),
-                    ("wide_addr", gather_w),
-                    ("w_inc0", 1),
-                    ("wide_lvl_mask", 1),
-                    ("narrow_addr", col / 4),
-                ][..],
-                &walk1(bw - 1),
+                &[("tile_mask", 0xf), ("wide_addr", gather_w)][..],
+                &w_side,
+                &[("narrow_addr", col / 4)],
+                &n_side,
+                &w2n_sync,
                 &[
                     ("sync_en0", 1),
                     ("sync_id", 0xd),
@@ -262,16 +347,33 @@ impl GlobalAvgPool {
         let block = 4 * b; // a column block: 8 rows x 2 pixels
         let rows = |n_base: i64| -> Vec<(&'static str, i64)> {
             // a column block's rows (`col_words` each) at image-row stride
-            let mut f = vec![("narrow_addr", n_base), ("narrow_lvl_mask", 7)];
             let n = ["n_inc0", "n_inc1", "n_inc2", "n_inc3", "n_inc4", "n_inc5"];
             let lims = ["n_lim0", "n_lim1", "n_lim2"];
-            let levels = [(1, col_words), (row_words, g.th), (g.th * row_words, 4)];
+            // rows grouped by the wide word they arrive in (r rows each;
+            // one row a word: just the rows)
+            let r = (64 / col_words).max(1);
+            let mut levels = vec![(1, col_words), (row_words, r)];
+            if r > 1 {
+                levels.push((r * row_words, self.height as i64 / r));
+            } else {
+                levels[1].1 = self.height as i64;
+            }
+            let mut f = vec![
+                ("narrow_addr", n_base),
+                ("narrow_lvl_mask", (1 << levels.len()) - 1),
+            ];
             for (k, (inc, lim)) in band::walk(&levels, 6).into_iter().enumerate() {
                 f.push((n[k], inc));
-                if k < 3 {
+                if k < levels.len() {
                     f.push((lims[k], lim));
                 }
             }
+            // (the flags of a two-level walk are the column gather's)
+            f.extend(if r > 1 {
+                [("sync_f2", 1), ("tail_en870", 0), ("tail_f871", 1)]
+            } else {
+                [("sync_f1", 1), ("tail_en870", 1), ("tail_f871", 0)]
+            });
             f
         };
         a.emit(
@@ -280,16 +382,16 @@ impl GlobalAvgPool {
                 ("tile_mask", 1),
                 ("narrow_addr", col / 4),
                 ("n_inc0", 1),
-                ("n_lim0", bw - 1),
+                ("n_lim0", 63),
                 ("n_inc1", 1),
-                ("n_lim1", 3),
+                ("n_lim1", block / 256 - 1),
                 ("n_inc2", -(block / 4 - 1)),
                 ("n_inc3", -(block / 4 - 1)),
                 ("n_inc4", -(block / 4 - 1)),
                 ("n_inc5", -(block / 4 - 1)),
                 ("narrow_lvl_mask", 3),
                 ("wide_addr", gather_w),
-                ("w_lim0", 3),
+                ("w_lim0", block / 256 - 1),
                 ("wide_rows", 1),
                 ("sync_en0", 1),
                 ("sync_id", 0xb),
@@ -306,19 +408,16 @@ impl GlobalAvgPool {
                 &[
                     ("tile_mask", 1),
                     ("wide_addr", gather_w),
-                    ("w_lim0", 3),
+                    ("w_lim0", block / 256 - 1),
                     ("wide_rows", 1),
                 ][..],
                 &rows(0),
                 &[
                     ("sync_en0", 1),
-                    ("sync_f2", 1),
                     ("sync_id", 0xd),
                     ("sync_en1", 1),
                     ("sync_val", 0x8000),
                     ("sync_en2", 1),
-                    ("tail_en870", 0),
-                    ("tail_f871", 1),
                 ],
             ]
             .concat(),
@@ -400,6 +499,11 @@ impl GlobalAvgPool {
             ("rsv717", 0x400020),
             ("rsv749", 0x40),
         ];
+        if cw < 16 {
+            // the record only when a pixel fills a wide word (as compiled)
+            f.retain(|&(n, _)| !n.starts_with("rsv") && n != "sync_val");
+            f.push(("sync_en2", 0));
+        }
         let n = ["n_inc0", "n_inc1", "n_inc2", "n_inc3", "n_inc4", "n_inc5"];
         let lims = ["n_lim0", "n_lim1", "n_lim2", "n_lim3"];
         for (k, (inc, lim)) in band::walk(&levels, 6).into_iter().enumerate() {
@@ -436,14 +540,22 @@ impl GlobalAvgPool {
             ("out_inc7", -(cw - 1)),
             ("out_mode7", 3),
             ("out_tflags", 7),
-            ("par_base", image_w & 0xff),
-            ("par_sel", 1),
+            // (the image's wide address as the copy op's constants)
+            (
+                "par_base",
+                if image_w >= 0x2000 {
+                    image_w & 0xff
+                } else {
+                    image_w
+                },
+            ),
+            ("par_sel", (image_w >= 0x2000) as i64),
             ("par_hmode", 1),
             ("par_cnt0", wx),
             ("par_mode0", 1),
             ("par_cnt1", wy),
             ("par_mode1", 1),
-            ("par_inc2", -(wg - 2)),
+            ("par_inc2", -(wg - px / 4)),
             ("par_mode2", 1),
             ("par_mode3", 1),
             ("par_mode4", 1),
@@ -596,6 +708,19 @@ pub fn exact_multiplier(
         m = f32::from_bits(m.to_bits() + 1);
     }
     None
+}
+
+/// Narrow-side fields of a walk over `words` whole wide words (256 B).
+fn words_walk(words: i64) -> Vec<(&'static str, i64)> {
+    let mut f = vec![
+        ("n_inc0", 1),
+        ("n_lim0", 63),
+        ("n_inc1", 1),
+        ("n_lim1", words - 1),
+        ("narrow_lvl_mask", 3),
+    ];
+    f.extend(["n_inc2", "n_inc3", "n_inc4", "n_inc5"].map(|n| (n, -(64 * words - 1))));
+    f
 }
 
 /// Narrow-side fields of a one-level walk of `lim + 1` words.

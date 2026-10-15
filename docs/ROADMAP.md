@@ -14,7 +14,7 @@ the findings.
 | FC (`fc`) | K <= 2048 or 3073-4096 (multiple of 8, input spread over tiles and gathered), N 4-64 or 64 per tile up to 1024 | byte-identical (31 corpus models), on device |
 | MAX_POOL_2D (`pool`) | 2x2 stride 2 valid; H, W 16 / 32; C 32 / 64 / 128 | byte-identical (5 corpus models), on device |
 | ADD (`add`) | two equal-shape inputs, requantized, fused RELU; H, W 16 / 32; image row 512 / 1024 / 2048 B | byte-identical (8 corpus models), on device |
-| Front end (`graph`) | CPU int8 `.tflite` as a DAG: CONV_2D, MAX_POOL_2D, ADD, global AVERAGE_POOL_2D (8x8x64 native, else as an FC), FC, RESHAPE; host pads / crops between layers; every layer's parameters cached once at its own wide address | MNIST MLP (97.35%), CNN (98.66%) and CIFAR-10 ResNet-8 (75.22%) on device, bit-exact with the host reference |
+| Front end (`graph`) | CPU int8 `.tflite` as a DAG: CONV_2D, MAX_POOL_2D, ADD, global AVERAGE_POOL_2D (native at 8x8 C 32 / 64, 16x16 C 16-64, 32x32 C 16, else as an FC), FC, RESHAPE; host pads / crops between layers; every layer's parameters cached once at its own wide address | MNIST MLP (97.35%), CNN (98.66%) and CIFAR-10 ResNet-8 (75.22%) on device, bit-exact with the host reference |
 | CONV_2D (`conv`) | same padding; k 1 / 3; stride 1 / 2; 16x16 with Cin 1-128 (k 3), up to 64x64 with Cin >= 16; Cout 8-32 (k 3); k 1 of any width: Cin a multiple of 16 up to 240 at 16x16, Cout a multiple of 4 up to 64 or of 64 up to 256 (64-channel blocks) | byte-identical at 16x16, on device up to 64x64 |
 | Loopback broadcast | tile -> scalar memory -> all tiles | on device |
 
@@ -82,7 +82,7 @@ top-1 as TFLite CPU. The items it did not need stay open.
 | Conv Cout 64-256 | wider layers | Cout 64 done (Cin >= 32, 16x16); 1x1 done up to 256 with the compiler's `loop3` 64-channel blocks (2026-10-16); the same blocks run k 3 Cout 128 bit-exact on the TPU but are not enabled yet; a partial last block (Cout 96) open | M |
 | Conv Cin 8 | odd widths in small nets | the 18-weight-row scheme seen in the corpus; open | S-M |
 | Valid padding | many Keras models | corpus models use 12-38 TensorOps (edge tiles special-cased); our own: no halo fill, smaller output; open | M |
-| Global average pool / MEAN | classifier heads | **done for 8x8x64** (`codegen::avg_pool`): the compiler's mesh reduction into tile 0, byte-identical, no parameters, with TFLite's rounding; other shapes still lowered to an FC (sum per channel, bit-exact) | M |
+| Global average pool / MEAN | classifier heads | **done for 8x8 C 32 / 64, 16x16 C 16 / 32 / 64, 32x32 C 16** (`codegen::avg_pool`, 2026-10-16): the compiler's mesh reduction into tile 0, byte-identical on 6 corpus shapes, no parameters, TFLite's or PyTorch's rounding, chained; C 128 / 256 (the compiler splits the channels over tiles 0 and 1), C 16 at 8x8 and sizes not a multiple of 4 (3x3, 7x7, 25x5) compiled into the corpus, not derived; TFLite: other shapes lowered to an FC (sum per channel, bit-exact) | M |
 | Output > 2 KiB per tile | larger feature maps | wide staging above 0x207f untested; or produce in chunks | S-M |
 | Images > 64x64 (32x32 done) | 96-128 px inputs | patch memory per tile grows; needs a capacity model (experiment: largest patch that runs) | M |
 

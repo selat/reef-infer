@@ -105,9 +105,9 @@ impl MaxPool {
         let mut a = Asm::new();
         prologue(&mut a)?;
         band::constants(&mut a, const_n, const_w)?;
-        band::copy_op(&mut a, &grid, const_w & 0xff, true, b, 0)?;
+        band::copy_op(&mut a, &grid, const_w, true, b, 0)?;
         band::load(&mut a, &grid, IN_NAME, b, stage_w)?;
-        band::copy_op(&mut a, &grid, const_w & 0xff, false, b, 0)?;
+        band::copy_op(&mut a, &grid, const_w, false, b, 0)?;
         sync(&mut a, 0x1ffff, 0x3ff, false)?;
         sync(&mut a, 0, 0x3ff, false)?;
 
