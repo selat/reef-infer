@@ -252,6 +252,61 @@ fn fc_matches_compiler() {
     }
 }
 
+/// The 1x1 shapes `Conv::check` takes (verified on the TPU): Cin a
+/// multiple of 16 up to 15 wide words per tile, Cout a multiple of 4 up to
+/// 64 or of 64 above (one 64-channel parameter block after another).
+#[test]
+fn conv_1x1_shapes() {
+    let conv = |cin: usize, cout: usize, hw: usize, stride: usize| Conv {
+        cin,
+        cout,
+        k: 1,
+        stride,
+        width: hw,
+        height: hw,
+        weights: vec![1; cout * cin],
+        w_scale: vec![0.01; cout],
+        bias: vec![0; cout],
+        input: Quant {
+            scale: 0.05,
+            zero_point: 128,
+        },
+        output: Quant {
+            scale: 0.1,
+            zero_point: 128,
+        },
+        relu: false,
+        pad_before: None,
+    };
+    for (cin, cout, hw, s) in [
+        (16, 4, 16, 1),
+        (48, 24, 16, 1),
+        (112, 20, 16, 1),
+        (240, 64, 16, 1),
+        (64, 128, 16, 1),
+        (16, 192, 16, 1),
+        (240, 256, 16, 2),
+        (32, 40, 32, 1),
+        (32, 128, 64, 1),
+    ] {
+        let c = conv(cin, cout, hw, s);
+        assert!(c.check().is_ok(), "{cin} -> {cout} at {hw}x{hw} s{s}");
+        c.build().unwrap();
+    }
+    for (cin, cout, why) in [
+        (24, 16, "Cin not a multiple of 16"),
+        (256, 16, "16 wide words of input per tile"),
+        (16, 6, "Cout not a multiple of 4"),
+        (16, 96, "a partial last block"),
+    ] {
+        assert!(conv(cin, cout, 16, 1).check().is_err(), "{why}");
+    }
+    // Cout 128: two blocks of 3 header + Cin / 4 weight rows of 256 B
+    let c = conv(64, 128, 16, 1);
+    assert_eq!(c.parameters().len(), 2 * (3 + 16) * 256);
+    assert_eq!(c.wide_units(), 4 * 2 * (3 + 16));
+}
+
 /// Every corpus CONV_2D model `codegen::conv` supports: instructions,
 /// relocations and output layout, and the parameter blob when the weights
 /// are exported (`tools/isa_corpus/conv_ref.py`).

@@ -299,6 +299,17 @@ async fn generated_programs_on_tpu() {
         (3, 2, 16, 16, 32, 64, true, 0, 0),
         (1, 2, 16, 16, 32, 64, false, 0, 54),
         (1, 1, 16, 16, 32, 64, false, 128, 128),
+        // 1x1 of any width: Cin multiples of 16, Cout multiples of 4 (24:
+        // 384 B per tile, staged in whole words), blocks of 64 above 64
+        (1, 1, 16, 16, 48, 24, true, 128, 0),
+        (1, 1, 16, 16, 112, 20, false, 120, 130),
+        (1, 1, 16, 16, 240, 64, false, 128, 128),
+        (1, 1, 16, 16, 64, 128, true, 100, 0),
+        (1, 1, 16, 16, 16, 192, false, 128, 120),
+        (1, 2, 16, 16, 240, 256, false, 128, 128),
+        (1, 1, 32, 32, 32, 40, true, 0, 0),
+        (1, 2, 32, 32, 64, 128, false, 128, 110),
+        (1, 1, 64, 64, 32, 128, false, 128, 128),
     ]
     .into_iter()
     .map(|c| (c, None))

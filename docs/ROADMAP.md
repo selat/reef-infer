@@ -15,7 +15,7 @@ the findings.
 | MAX_POOL_2D (`pool`) | 2x2 stride 2 valid; H, W 16 / 32; C 32 / 64 / 128 | byte-identical (5 corpus models), on device |
 | ADD (`add`) | two equal-shape inputs, requantized, fused RELU; H, W 16 / 32; image row 512 / 1024 / 2048 B | byte-identical (8 corpus models), on device |
 | Front end (`graph`) | CPU int8 `.tflite` as a DAG: CONV_2D, MAX_POOL_2D, ADD, global AVERAGE_POOL_2D (8x8x64 native, else as an FC), FC, RESHAPE; host pads / crops between layers; every layer's parameters cached once at its own wide address | MNIST MLP (97.35%), CNN (98.66%) and CIFAR-10 ResNet-8 (75.22%) on device, bit-exact with the host reference |
-| CONV_2D (`conv`) | same padding; k 1 / 3; stride 1 / 2; 16x16 with Cin 1-128 (k 3), up to 64x64 with Cin >= 16; Cout 8-32 | byte-identical at 16x16, on device up to 64x64 |
+| CONV_2D (`conv`) | same padding; k 1 / 3; stride 1 / 2; 16x16 with Cin 1-128 (k 3), up to 64x64 with Cin >= 16; Cout 8-32 (k 3); k 1 of any width: Cin a multiple of 16 up to 240 at 16x16, Cout a multiple of 4 up to 64 or of 64 up to 256 (64-channel blocks) | byte-identical at 16x16, on device up to 64x64 |
 | Loopback broadcast | tile -> scalar memory -> all tiles | on device |
 
 What carries over to every new op: the instruction encoder, the walk rule
@@ -79,7 +79,7 @@ top-1 as TFLite CPU. The items it did not need stay open.
 | Item | Need | Known / unknown | Size |
 |---|---|---|---|
 | **Element-wise add (two inputs)** | residual connections | **done** (`codegen::add`): byte-identical on 8 corpus models; the runner serves several input layers; the front end runs a DAG | M |
-| Conv Cout 64-256 | wider layers | Cout 64 done (Cin >= 32, 16x16; 1x1 Cin 32 in two passes); 128-256: compiler uses `loop3` 64-channel blocks | M |
+| Conv Cout 64-256 | wider layers | Cout 64 done (Cin >= 32, 16x16); 1x1 done up to 256 with the compiler's `loop3` 64-channel blocks (2026-10-16); the same blocks run k 3 Cout 128 bit-exact on the TPU but are not enabled yet; a partial last block (Cout 96) open | M |
 | Conv Cin 8 | odd widths in small nets | the 18-weight-row scheme seen in the corpus; open | S-M |
 | Valid padding | many Keras models | corpus models use 12-38 TensorOps (edge tiles special-cased); our own: no halo fill, smaller output; open | M |
 | Global average pool / MEAN | classifier heads | **done for 8x8x64** (`codegen::avg_pool`): the compiler's mesh reduction into tile 0, byte-identical, no parameters, with TFLite's rounding; other shapes still lowered to an FC (sum per channel, bit-exact) | M |
@@ -91,7 +91,7 @@ top-1 as TFLite CPU. The items it did not need stay open.
 | Item | Need | Known / unknown | Size |
 |---|---|---|---|
 | **Depthwise conv 3x3, stride 1 / 2** | every block | weights through the on-chip loopback (decoded and reproduced), consumer aux / slot layout known; TensorOp mode new; corpus has 20 dwconv models | L |
-| 1x1 conv, any Cin / Cout | pointwise layers | generalize the k 1 scheme beyond Cin 16 / Cout 32 | M |
+| 1x1 conv, any Cin / Cout | pointwise layers | **done (2026-10-16)**: Cin a multiple of 16 (up to 15 wide words per tile), Cout a multiple of 4 up to 64 or of 64 above, up to 64 KiB of output per tile; open: Cin 24 / 40 (MobileNet V2's narrow tensors), Cout 96 / 144, Cin 256 from the host | M |
 | ReLU6 | V1 / V2 activations | a clamp; already supported by the output stage | S |
 | 224x224 inputs | real resolution | spatial tiling in several passes per layer (patch does not fit), streamed weights (corpus SSDLite has streamed-parameter infeeds) | L |
 | **Keep activations on chip between layers** | performance (host round-trips per layer are slow) | needs a memory planner: layer i's output layout = layer i+1's input layout, no host hop; the scheduler / allocator from section 8 | L |

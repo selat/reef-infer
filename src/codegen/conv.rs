@@ -54,6 +54,20 @@
 //! all taps in one TensorOp pass, Cin >= 16 one pass per 4 input channels.
 //! Not yet: Cin 8 (another scheme), Cout >= 64 (a tile's output is 1 KiB
 //! and the compiler arranges narrow memory differently).
+//!
+//! **1x1 convs of any width** (derived, bit-exact on the TPU): Cin any
+//! multiple of 16 whose tile input fits 15 wide words of the input buffer
+//! (240 at 16x16; at 16 words the constants below it land on the weights'
+//! aux row 0x1ffc), Cout any multiple of 4 up to 64 or of 64 above, up to
+//! 64 KiB of output per tile. A parameter row holds at most 64 channels
+//! (the infeed's `f438`, 2 bits, counts 16-channel groups), so above 64 the
+//! blob is one 64-channel block after another and, as the compiler does
+//! for Cout 128 (corpus, k = 3), the TensorOp gets one more loop level over
+//! the blocks: the input and weight slots are read again, the output moves
+//! 16 words on, the consumer takes the next block's rows and the header
+//! rows are reloaded into scaling memory. A partial last block (Cout 96)
+//! is not derived. The output path sends whole 256 B words, so a tile's
+//! output (16 pixels x Cout 24 = 384 B) is staged in rounded-up words.
 
 use super::fc::Fc;
 use super::*;
@@ -133,12 +147,24 @@ impl Conv {
             _ => false,
         };
         let ob = (self.opx().0 * self.opx().1) as usize * self.cout;
+        // k = 1 verified on the TPU up to 64 KiB of output per tile (64x64,
+        // Cout 256: 72 KiB of narrow memory); k = 3 up to 2 KiB
+        let fits = ob <= 2048 || (self.k == 1 && self.narrow_end() <= 0x12000);
         let ok = [1, 2].contains(&self.stride)
             && wide_ok
             && tall_ok
-            && ob <= 2048
+            && fits
             && match self.k {
-                1 => [(16, 32), (32, 64)].contains(&(self.cin, self.cout)),
+                // the input in whole 16-channel words, at most 15 wide words
+                // per tile (16 move the constants onto the weights' aux
+                // row); Cout in blocks of up to 64 (a partial last block
+                // is not derived)
+                1 => {
+                    self.cin % 16 == 0
+                        && self.patch().lb() <= 15 * 256
+                        && self.cout % 4 == 0
+                        && (self.cout <= 64 || self.cout % 64 == 0)
+                }
                 3 => {
                     [1, 3, 4, 16, 32, 64, 128].contains(&self.cin)
                         && ([8, 16, 32].contains(&self.cout)
@@ -150,7 +176,7 @@ impl Conv {
             };
         if !ok {
             return Err(format!(
-                "Cin={} Cout={} k={} width={}: supported are k 1 (Cin 16, Cout 32) and k 3 (Cin 1, 3, 4, 16, 32, 64, 128; Cout 8, 16 or 32, or 64 for Cin >= 32 at width 8 / 16), width 16, 32 / 64 with Cin x width / 16 in 32..=128, or 8x8 stride 1 with Cin >= 16 (chained only), and at most 2 KiB of output per tile",
+                "Cin={} Cout={} k={} width={}: supported are k 1 (Cin a multiple of 16 up to 240 at 16x16; Cout a multiple of 4 up to 64, or of 64) and k 3 (Cin 1, 3, 4, 16, 32, 64, 128; Cout 8, 16 or 32, or 64 for Cin >= 32 at width 8 / 16), width 16, 32 / 64 with Cin x width / 16 in 32..=128, or 8x8 stride 1 with Cin >= 16 (chained only), and at most 2 KiB of output per tile (k 1: 72 KiB of narrow memory)",
                 self.cin, self.cout, self.k, self.width
             ));
         }
@@ -324,17 +350,29 @@ impl Conv {
         self.cin.max(4)
     }
 
-    /// Output channels as stored: at least 16 (the compiler pads with
-    /// zero multiplier, bias, zero point and weight bytes).
+    /// Output channels as stored per block: a multiple of 16 (the compiler
+    /// pads with zero multiplier, bias, zero point and weight bytes), 64
+    /// above 64 channels.
     fn cout_pad(&self) -> usize {
-        self.cout.max(16)
+        self.cout.next_multiple_of(16).min(64)
     }
 
+    /// Output channels per block: a parameter row is at most one 256 B wide
+    /// word (64 channels x 4 bytes), so above 64 channels the blob holds
+    /// one block of 64 after another and the TensorOp loops over them.
+    fn blocks(&self) -> Vec<std::ops::Range<usize>> {
+        (0..self.cout)
+            .step_by(64)
+            .map(|c| c..(c + 64).min(self.cout))
+            .collect()
+    }
+
+    /// One blob per block of output channels, each padded to `cout_pad`.
     pub fn parameters(&self) -> Vec<u8> {
-        let p = self.fc().blob(0..self.cout, self.cout);
-        let (row, pad) = (4 * self.cout, 4 * self.cout_pad());
-        p.chunks(row)
-            .flat_map(|r| r.iter().copied().chain(std::iter::repeat_n(0, pad - row)))
+        let fc = self.fc();
+        self.blocks()
+            .into_iter()
+            .flat_map(|b| fc.blob(b, self.cout_pad()))
             .collect()
     }
 
@@ -434,9 +472,15 @@ impl Conv {
         })
     }
 
-    /// Parameter rows of `Cout x 4` bytes: 3 header rows + `K / 4` weight rows.
-    fn param_words(&self) -> i64 {
+    /// Parameter rows of one block (`cout_pad x 4` bytes): 3 header rows +
+    /// `K / 4` weight rows.
+    fn block_words(&self) -> i64 {
         3 + (self.k * self.k * self.cin_pad() / 4) as i64
+    }
+
+    /// Parameter rows of every block.
+    fn param_words(&self) -> i64 {
+        self.blocks().len() as i64 * self.block_words()
     }
 
     /// Streams the blob into tile 0's wide memory from `base` (the
@@ -890,6 +934,11 @@ impl Conv {
             (taps, cq)
         };
         let slots_addr = 0x1fe8 - 8 * slots;
+        // blocks of 64 output channels: one more loop level in the TensorOp
+        // and every walk (the input and weight slots read again, the output
+        // 16 words further), the header rows reloaded per block
+        let blocks = self.blocks().len() as i64;
+        let boq = (self.cout_pad() / 4) as i64; // output words per block
         let mut f: Vec<(&str, i64)> = vec![
             ("tile_mask", ALL_TILES),
             ("addr", slots_addr),
@@ -916,6 +965,9 @@ impl Conv {
         ];
         if passes > 1 {
             f.push(("cnt1", passes - 1));
+        }
+        if blocks > 1 {
+            f.push(("cnt3", blocks - 1));
         }
         a.emit(OP_RING_CONSUMER2, &f)?;
         // header rows -> scaling memory (mode 2), as in fc
@@ -953,6 +1005,9 @@ impl Conv {
         ];
         for n in ["n_inc2", "n_inc3", "n_inc4", "n_inc5"] {
             f.push((n, -(half - 1 + 64)));
+        }
+        if blocks > 1 {
+            f.extend([("w_lim1", blocks - 1), ("n_lim2", blocks - 1)]);
         }
         a.emit(OP_WIDE_TO_NARROW, &f)?;
 
@@ -1008,11 +1063,15 @@ impl Conv {
                 [taps - 1, npx - 1, cq - 1],
             )
         };
+        let mut in_dims = in_dims;
+        if blocks > 1 {
+            in_dims.push((blocks, 0));
+        }
         f.extend(walk("in", &in_dims, 8));
         if in_base + nb != 0 {
             f.push(("in_base".into(), in_base + nb));
         }
-        for (i, l) in loops.iter().enumerate() {
+        for (i, l) in loops.iter().chain(&[blocks - 1]).enumerate() {
             if *l > 0 {
                 f.push((format!("loop{i}"), *l));
             }
@@ -1055,8 +1114,9 @@ impl Conv {
             ("row_c", 0x7fc),
             ("dp_mode", if single { 2 } else { 3 }),
             ("reduce_mask", if single { 1 } else { 5 }),
-            ("out_ch_last", self.cout as i64 - 1),
-            ("out_ch", self.cout as i64 - 1),
+            // (per block; the last block's channels, as the compiler)
+            ("out_ch_last", self.cout as i64 - 64 * (blocks - 1) - 1),
+            ("out_ch", (self.cout as i64).min(64) - 1),
             ("mult_bits", 1.0f32.to_bits() as i64),
             ("clamp_max_bits", hi.to_bits() as i64),
             ("clamp_min_bits", lo.to_bits() as i64),
@@ -1066,6 +1126,11 @@ impl Conv {
         ];
         f.extend(fixed.iter().map(|&(n, v)| (n.to_string(), v)));
         match io.output_to {
+            None if blocks > 1 => {
+                // a block's words of each pixel, then the next block
+                f.push(("out_base".into(), land_b));
+                f.extend(walk("out", &[(boq, 1), (npx, oq), (blocks, boq)], 8));
+            }
             None => {
                 // pixel after pixel at the landing
                 f.extend([
@@ -1084,15 +1149,19 @@ impl Conv {
                 // into the next patch's interior: words, x, then y at its
                 // padded row stride
                 f.push(("out_base".into(), at + np.at(0, 0)));
-                f.extend(walk(
-                    "out",
-                    &[(oq, 1), (ox, oq), (oy, np.pw() * np.cq())],
-                    8,
-                ));
+                let mut dims = vec![(boq.min(oq), 1), (ox, oq), (oy, np.pw() * np.cq())];
+                if blocks > 1 {
+                    dims.push((blocks, boq));
+                }
+                f.extend(walk("out", &dims, 8));
             }
         }
         for j in 2..8 {
             f.push((format!("par_inc{j}"), -(slots - 1)));
+        }
+        if blocks > 1 {
+            f.push(("par_cnt3".into(), blocks - 1));
+            f.push(("psum_cnt3".into(), blocks - 1));
         }
         if single {
             f.extend([
@@ -1181,7 +1250,7 @@ impl Conv {
                 ("sync_wait_lvl", 1),
             ]);
         } else {
-            f.push(("w_lim0", ob / 256 - 1));
+            f.push(("w_lim0", (ob + 255) / 256 - 1));
         }
         a.emit(OP_NARROW_TO_WIDE, &f)?;
         descriptor_send(&mut a, 16 * ob, TAG_OUTPUT)?;
@@ -1196,7 +1265,7 @@ impl Conv {
                     ("tile_mask", 1 << t),
                     ("addr", 0x2078),
                     ("inc0", 1),
-                    ("cnt1", (ob / 256 - 1).max(0)),
+                    ("cnt1", ((ob + 255) / 256 - 1).max(0)),
                     ("sdims", 1),
                     ("cbuf", 1),
                     ("slots", 1),

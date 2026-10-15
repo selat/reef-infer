@@ -1183,3 +1183,52 @@ int8 model (its q / dq graph, which computes each conv in float between
 quantize steps) the logits differ by at most 1 on 2.2% of them and
 top-1 agrees on 9994 of 10000 (the TFLite model: 0.3% and 9998).
 
+
+## 1x1 convs of any width (2026-10-16)
+
+A survey of 14 small models (ResNet-20, VGG, LeNet, MobileNet V1 / V2 /
+V3-style, DS-CNN, SqueezeNet-style, ...) through the PyTorch front end
+found the 1x1 conv the most common blocker (8 of the 11 models that did
+not build). The k = 1 program was already parametric; a sweep with
+`build_unchecked` on the TPU (`examples/conv_wide_hw.rs`, `CASES=`)
+showed what held it back:
+
+- **Cin**: any multiple of 16 is bit-exact (16-240 at 16x16, 32x32 and
+  64x64 within the superpixel rule). Cin 256 is wrong: one tile's input is
+  16 wide words, the circular input buffer reaches down to 0x2000 and the
+  one-hot constants just below it (`buf - 4` = 0x1ffc) land on the
+  weight consumer's aux row (`aux_addr1` = 0x1ffc). Limit: 15 words.
+  Cin 8 is wrong and Cin 24 hangs (not whole 16-channel words); below 16 the front
+  end pads with zero weights.
+- **Cout between multiples of 16** (24, 40, 56) hung. Two causes: the
+  stored channel count was `max(Cout, 16)` instead of the next multiple of
+  16, and the output path sent `ob / 256` wide words (384 B per tile at
+  Cout 24 -> 1 word). With the parameters padded to a multiple of 16 and
+  the output staged in rounded-up words they are bit-exact. Cout not a
+  multiple of 4 (2, 6) stays out: the output moves 4-channel words.
+- **Cout above 64**: `infeed.f438` (2 bits) is the parameter row width in
+  16-channel groups minus 1, so a row holds at most 64 channels (one 256 B
+  word). Running the weights / TensorOp / multicast sequence once per
+  64-channel block gave the first block right and the others wrong (not
+  stale weights, not stale headers). The compiler's Cout 128 program
+  (corpus, k = 3) does it in one TensorOp with **one more loop level**:
+  `loop3` = blocks - 1, the input walk reads the same window again
+  (stride 0), the output walk moves 16 words on (`out_inc2` = 16 - span),
+  the weight slots and partial sums get `cnt3`, the ringConsumer `cnt3`,
+  the header wideToNarrow `w_lim1` / `n_lim2` (the scaling rows reloaded
+  per block, same narrow rows), one producer for every block's rows
+  (`thr6` = all of them), `out_ch` 63. That is bit-exact for Cout 128,
+  192 and 256, and for k = 3 Cout 128 as well (not enabled yet). A
+  partial last block (Cout 80, 96) hangs or is wrong.
+- **Output per tile**: the 2 KiB limit does not bind the 1x1 program:
+  64x64 Cin 32 Cout 256 (64 KiB per tile, 72 KiB of narrow memory, wide
+  staging well above 0x207f) is bit-exact. `check` takes k = 1 up to that
+  narrow-memory size.
+
+Whole graphs: a PyTorch net of mostly new 1x1 shapes (32x32 Cin 32 ->
+64, stride 2 to Cout 128, 128 -> 48 -> 128 with a residual add, 32 -> 64
+stride 2 to 8x8, pool, FC) runs in one call, 50 / 50 random inputs
+bit-exact with the host reference; ResNet-8 unchanged (79.54%, 1.60 ms).
+In the survey's layer census the 1x1 shapes that build went from 8 / 39
+to 34 / 39 (all conv shapes 20 / 90 -> 46 / 90); left: Cout 2, Cout 96,
+Cin 24, Cin 256 from the host.

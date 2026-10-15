@@ -361,6 +361,7 @@ The model-by-model plan (which ops in which order) is in `ROADMAP.md`.
 | TFLite front end (`graph::Graph`): a DAG of CONV_2D, MAX_POOL_2D, ADD, global AVERAGE_POOL_2D (8x8x64 native, else lowered to an FC), FC, RESHAPE, int8 I/O; layers run through the host, which pads to the generators' sizes and crops; parameters cached once per layer at its own wide address | Done: MNIST MLP (97.35%), CNN (98.66%) and CIFAR-10 ResNet-8 (75.22%) on the TPU over 10000 images each, bit-exact with the host reference, same top-1 as TFLite CPU |
 | Element-wise ADD (`codegen::add`): two input layers, requantized (integer weights from the scale ratio), fused RELU | Done; byte-identical to 16.0 on 8 corpus models, bit-exact on device (arbitrary scale ratios too) |
 | Conv 1x1 Cin 32 -> Cout 64 (two passes of 16 channels), stride-2 Cout 64 | Done; byte-identical to 16.0 (parameters included), bit-exact on device |
+| Conv 1x1 of any width: Cin a multiple of 16 (up to 15 wide words per tile), Cout a multiple of 4 up to 64 or of 64 above (64-channel parameter blocks, one more TensorOp loop level), up to 64 KiB of output per tile | Done; derived, bit-exact on device (stride 1 / 2, 16x16 to 64x64, chained), 20 corpus convs still byte-identical |
 | MAX_POOL_2D 2x2 stride 2 (`codegen::pool`): H, W 16 / 32, C 32 / 64 / 128 | Done; byte-identical to 16.0 on 5 corpus models, bit-exact on device |
 | Global AVERAGE_POOL_2D 8x8x64 (`codegen::avg_pool`): mesh reduction into tile 0, no parameters, TFLite's rounding | Done; byte-identical to 16.0 (compiler form), bit-exact on device |
 | Parameter placement (`build_at`, `Graph::build`): each layer's cached parameters at their own wide address | Done; coexistence verified on device (`examples/param_cache_hw.rs`) |
@@ -370,7 +371,7 @@ The model-by-model plan (which ops in which order) is in `ROADMAP.md`.
 | CONV_2D (`codegen::conv`): same padding, stride 1 or 2, 16x16; k 1 (Cin 16, Cout 32) and k 3 (Cin 1, 3, 4, 16-128; Cout 8 / 16 / 32) | Done; byte-identical to 16.0 on 16 corpus models (parameters included), bit-exact on device |
 | Conv width and height 16 / 32 / 64, Cin >= 16: superpixel columns, 4-row bands, derived without the compiler | Done; bit-exact on device up to 64x64 (not compared with 16.0) |
 | Conv 32x32 Cin 1 / 3 (an image's first layer, Cout 16 / 32): the compiler's layout, 8x8 one-word pixels per tile | Done; byte-identical to 16.0 on 5 corpus models, bit-exact on device |
-| Conv: Cout 64 for Cin 16, Cout 128+, Cin 4-15 at larger sizes (stopgap: zero-weight channels), Cin 8, other k, valid padding, sizes not a multiple of 16 (stopgap: host padding) | Next |
+| Conv: Cout 64 for Cin 16, Cout 128+ for k 3 (the 1x1 blocks run it bit-exact; not enabled), Cin 4-15 at larger sizes (stopgap: zero-weight channels), Cin 8, other k, valid padding, sizes not a multiple of 16 (stopgap: host padding) | Next |
 | Scheduler/allocator for multi-layer graphs | Weeks to months |
 | PyTorch front end (`torch.export`, PT2E int8 with our quantizer, `tools/torch`, `Graph::from_torch`) | Done; PyTorch ResNet-8 bit-exact on device in one call |
 
