@@ -209,9 +209,15 @@ impl Graph {
                     Layer::Add(add_layer(sa, qa, qb, out_q, relu()?).map_err(ctx)?)
                 }
                 "global_avg_pool" => {
-                    let (_, (y, x, c), q) = arg(0)?;
+                    let (t, (y, x, c), q) = arg(0)?;
                     if q != out_q {
                         return Err(ctx("needs the same quantization in and out".into()));
+                    }
+                    if (y, x) == (1, 1) {
+                        // the mean of one pixel: the input itself
+                        alias.insert(out, resolve(&alias, t));
+                        tensors.insert(out, (out_shape, out_q));
+                        continue;
                     }
                     // round_half_even(mean) in the input's quantization
                     let p = GlobalAvgPool {

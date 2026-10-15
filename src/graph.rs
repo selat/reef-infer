@@ -10,11 +10,12 @@
 //! - MAX_POOL_2D 2x2, stride 2;
 //! - ADD of two equal-shape tensors (fused NONE / RELU);
 //! - AVERAGE_POOL_2D over the whole image (global): natively at 8x8 (C 32 /
-//!   64 / 128), 16x16 (C 16 / 32 / 64) and 32x32 (C 16) (`codegen::avg_pool`, a
+//!   64 / 128), 16x16 (C 16 / 32 / 64), 32x32 (C 16) and 3x3 (C 256) (`codegen::avg_pool`, a
 //!   mesh reduction with no parameters), other
 //!   shapes lowered to an FC that sums each channel's pixels; both round
 //!   exactly as TFLite does;
-//! - RESHAPE (free in NHWC). Ops computing a reshape's int32 shape (SHAPE,
+//! - RESHAPE (free in NHWC), and AVERAGE_POOL_2D over a 1x1 image (the
+//!   input itself). Ops computing a reshape's int32 shape (SHAPE,
 //!   STRIDED_SLICE, PACK, ...) are skipped.
 //!
 //! Activations are uint8 on the TPU: TFLite's int8 tensors map to uint8 by
@@ -365,6 +366,11 @@ impl Graph {
                         || tq(ins[0])? != tq(outs[0])?
                     {
                         return Err("AVERAGE_POOL_2D: only global pools, same quantization".into());
+                    }
+                    if (y, x) == (1, 1) {
+                        // the mean of one pixel: the input itself
+                        alias.insert(outs[0], resolve(&alias, ins[0]));
+                        continue;
                     }
                     let int8 = tensors.get(ins[0] as usize).type_() == INT8;
                     match GlobalAvgPool::tflite(y, x, c, tq(ins[0])?, int8) {

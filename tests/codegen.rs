@@ -683,6 +683,7 @@ fn avg_pool_matches_compiler() {
         (16, 32),
         (16, 64),
         (32, 16),
+        (3, 256),
     ] {
         let name = format!("pool/pool_C{c}_H{hw}_W{hw}_opavg_padvalid_size{hw}_stride{hw}");
         let Some(path) = corpus(&name) else {

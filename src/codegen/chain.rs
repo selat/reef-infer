@@ -159,6 +159,9 @@ pub fn plan(nodes: &[Node]) -> Result<Plan, Error> {
             Op::AvgPool(p) if p.halves() > 1 && k + 1 < n => {
                 return Err(format!("chain: a {}-channel pool must come last", p.c).into());
             }
+            Op::AvgPool(p) if p.height == 3 => {
+                return Err("chain: a 3x3 pool runs on its own".into());
+            }
             Op::AvgPool(_) => 1,
             Op::Fc(..) if k + 1 == n => 1,
             Op::Fc(..) => return Err("chain: an FC must come last".into()),

@@ -1318,3 +1318,40 @@ rounding). A PyTorch net (conv to 8x8x32, 1x1 to 128, pool, FC) runs in
 two calls, 50 / 50 inputs bit-exact: the pool ends the first, as tile 1's
 half cannot feed the FC on tile 0. 4x4x128 needs the band loader below
 256 B per image row, like 8x8x16.
+
+### 3x3x256 and 1x1x256
+
+The survey's two MobileNet V1 heads. 1x1x256 is compiled to a copy (each
+of tiles 0-3 takes 64 channels and outfeeds them, no op); TFLite's and
+PyTorch's mean of one pixel in the input's quantization is the input
+itself, so both front ends alias it to its input as a reshape (no call).
+
+3x3x256 is its own program, not the 4x4-grid family:
+
+- The image sits on a 3x3 tile grid, one pixel (256 B) a tile: tiles
+  0-2, 4-6, 8-10 (`tile_mask` 0x777). Each image row (3 slots of 256 B) is
+  infed to its tile row; tile column x keeps the row from its own pixel on
+  (`n_lim0` = 192 - 64 x - 1, `size64` the same over 16, a skip of 64 x
+  words, no head), so its pixel lands at narrow 0. Only the second band
+  copy runs (one row a tile), with `in_twait` / `sync1` from the image row
+  (192 words: 12, 0x4030) - which equal the 4x4 grid's tile-row values
+  there.
+- Column gather as in the 4x4 family, with three tile rows (tiles 0-2 hold
+  their column's 3 pixels at 0x280, 256 B apart).
+- Four reducing tiles 0-3 (tile 3 holds no pixel), each a 3x3x64 image at
+  narrow 0: tile t < 3 keeps quarter t of its own block, the other nine
+  quarters go over the mesh as strided sends (16 of every 64 words) -
+  eastward to tiles right of the sender, westward otherwise - several as
+  one move that sends one quarter and receives another. Forward sync
+  counts as compiled ((16, 8), (28, 8), (208, 212), (220, 200) east,
+  (4, 8) west): they do not follow the 4x4 family's bytes-per-hop rule.
+- Regroup: one image row (3 pixels, padded to 4) a wide word, 3 words;
+  other undecoded record values, `sync_wait_lvl` 3, `sync_val` 0xfffe.
+- Reduction: a 3x3 window, `par_mode` 2 on levels 0 and 2-6, `psum_cnt0`
+  8, out at 0x280; output as the C 128 pool's, four tiles of 64 bytes.
+
+Byte-identical; bit-exact on the TPU (compiler form, TFLite int8
+rounding, the corpus TFLite model through `Graph::from_tflite`, and a
+PyTorch pool-and-FC net, 50 / 50 inputs). Its input layout (a 3x3 grid)
+is not a conv's, so it runs from the host only. 2x2x256 is the same
+family with other sync counts (not derived).
