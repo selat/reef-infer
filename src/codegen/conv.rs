@@ -68,7 +68,9 @@ pub struct Io {
     /// not): no host input.
     pub input_at: Option<i64>,
     /// Write the output into the next layer's padded patch at narrow byte
-    /// address `.0` (geometry `.1`) instead of sending it to the host.
+    /// address `.0` (geometry `.1`) instead of sending it to the host. The
+    /// address must lie above this layer's own buffers
+    /// ([`Conv::narrow_end`]).
     pub output_to: Option<(i64, Patch)>,
 }
 
@@ -392,7 +394,9 @@ impl Conv {
     }
 
     /// The execution program with parameters at wide `base` and the input
-    /// / output as `io` says (16x16, stride 1 only when chained).
+    /// / output as `io` says. Chaining needs the producer's output pixels
+    /// per tile to fill the next patch's interior exactly (the same 4x4
+    /// tile grid: 32x32 -> 32x32, 32x32 stride 2 -> 16x16, 16x16 -> 16x16).
     pub fn chain_program(
         &self,
         base: i64,
@@ -400,16 +404,38 @@ impl Conv {
     ) -> Result<ChunkInfo, Box<dyn std::error::Error>> {
         self.check()?;
         check_base(base)?;
-        let chained = io.input_at.is_some() || io.output_to.is_some();
-        if chained && (self.width, self.height, self.stride) != (16, 16, 1) {
-            return Err("chained conv: only 16x16, stride 1".into());
+        if io.input_at.is_some() && self.cin < 4 {
+            return Err("chained conv: Cin 1 / 3 widen the host input; not chained".into());
         }
-        if let Some((_, p)) = io.output_to {
-            if p.cin != self.cout as i64 || p.rows != 4 {
-                return Err("chained conv: the next patch must take Cout channels, 4 rows".into());
+        if let Some((at, p)) = io.output_to {
+            let (oy, ox) = self.opx();
+            let c = self.cout as i64;
+            if p.cin % c != 0 || p.rows != oy || 4 * (p.cin / c) != ox {
+                return Err(format!(
+                    "chained conv: {oy}x{ox} output pixels per tile do not fill the next patch ({} rows of 4 x {} B)",
+                    p.rows, p.cin
+                )
+                .into());
+            }
+            if at < self.narrow_end() {
+                return Err(format!(
+                    "chained conv: next patch at {at:#x} overlaps this layer's narrow memory (to {:#x})",
+                    self.narrow_end()
+                )
+                .into());
             }
         }
         Ok(self.execution_program(base, io)?)
+    }
+
+    /// End (bytes) of the narrow memory this layer's program uses with its
+    /// patch at 0 and a host input: the padded patch, the input landing
+    /// (two `lb` buffers), the constants and the output at `tp`.
+    pub fn narrow_end(&self) -> i64 {
+        let pt = self.patch();
+        let (oy, ox) = self.opx();
+        let consts = 16 + if self.cin < 4 { 256 } else { 0 };
+        (pt.tp() + 2 * pt.lb() + consts).max(pt.tp() + oy * ox * self.cout as i64)
     }
 
     fn execution_program(&self, base: i64, io: Io) -> Result<ChunkInfo, IsaError> {

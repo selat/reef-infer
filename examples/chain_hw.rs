@@ -10,6 +10,8 @@
 //! 3. Three convs 16 -> 32 -> 32 -> 16 (ReLU in the middle) on chip, the
 //!    patches alternating between two narrow buffers, timed against three
 //!    separate calls.
+//! 4. `codegen::chain::convs` at 32x32 and across stride 2 (32x32 ->
+//!    16x16), 3x3 and 1x1: ResNet-8's first two stages' conv shapes.
 
 use std::sync::Arc;
 
@@ -54,6 +56,111 @@ fn conv(cin: usize, cout: usize, seed: u64, in_zp: i32, out_zp: i32) -> Conv {
         },
         relu: false,
     }
+}
+
+/// A conv of any supported shape (same quantization rules as `conv`).
+#[allow(clippy::too_many_arguments)]
+fn conv_at(
+    k: usize,
+    stride: usize,
+    hw: usize,
+    cin: usize,
+    cout: usize,
+    seed: u64,
+    zp: (i32, i32),
+    relu: bool,
+) -> Conv {
+    let mut next = rng(seed);
+    Conv {
+        k,
+        stride,
+        width: hw,
+        height: hw,
+        weights: (0..cout * k * k * cin).map(|_| next() as i8).collect(),
+        relu,
+        ..conv(cin, cout, seed, zp.0, zp.1)
+    }
+}
+
+/// Loads `layers` at consecutive wide bases, runs them as one chained
+/// call on 10 inputs against the host references, and times it against
+/// one call per layer.
+async fn chain_case(dev: &mut Device, title: &str, layers: &[Conv]) {
+    let mut bases = Vec::new();
+    let mut next = 0;
+    let mut separate = Vec::new();
+    for c in layers {
+        bases.push(next);
+        separate.push(
+            dev.load_params(Arc::new(c.build_at(next).unwrap()))
+                .await
+                .unwrap(),
+        );
+        next += c.wide_units();
+    }
+    let pairs: Vec<(&Conv, i64)> = layers.iter().zip(bases.iter().copied()).collect();
+    let chunk = match reef_infer::codegen::chain::convs(&pairs) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("{title}: {e}");
+            return;
+        }
+    };
+    let first = exec(layers[0].build().unwrap(), "x");
+    let last = exec(layers[layers.len() - 1].build().unwrap(), "y");
+    let mut model = TfliteModel {
+        executables: vec![ExecInfo {
+            exec_type: ExecutableType::EXECUTION_ONLY,
+            parameters: vec![],
+            instruction_chunks: vec![chunk],
+            input_layers: first.input_layers,
+            output_layers: last.output_layers,
+            scratch_size_bytes: 0,
+        }],
+    };
+    let e = &mut model.executables[0];
+    e.input_layers[0].name = "input".into();
+    e.output_layers[0].name = "output".into();
+    let chained = dev.load_params(Arc::new(model)).await.unwrap();
+    let reference = |x: &[u8]| layers.iter().fold(x.to_vec(), |y, c| c.reference(&y));
+    let n_in = layers[0].width * layers[0].height * layers[0].cin;
+    let mut bad = 0;
+    for seed in 40..50 {
+        let x = input(n_in, seed);
+        match dev.run_inference(&chained, x.clone()).await {
+            Ok(y) => bad += (y != reference(&x)) as usize,
+            Err(e) => {
+                println!("{title}: {e}");
+                return;
+            }
+        }
+    }
+    let x = input(n_in, 99);
+    let want = reference(&x);
+    let reps = 100;
+    let t = std::time::Instant::now();
+    for _ in 0..reps {
+        let mut y = x.clone();
+        for l in &separate {
+            y = dev.run_inference(l, y).await.unwrap();
+        }
+        assert_eq!(y, want);
+    }
+    let sep = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
+    let t = std::time::Instant::now();
+    for _ in 0..reps {
+        dev.run_inference(&chained, x.clone()).await.unwrap();
+    }
+    let one = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
+    println!(
+        "{title}: {}; {} separate calls {sep:.3} ms, one chained call {one:.3} ms",
+        if bad == 0 {
+            "10/10 exact".to_string()
+        } else {
+            format!("{bad}/10 WRONG")
+        },
+        layers.len()
+    );
 }
 
 fn input(n: usize, seed: u64) -> Vec<u8> {
@@ -259,4 +366,56 @@ async fn main() {
     }
     let one = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
     println!("   three separate calls {sep:.3} ms, one chained call {one:.3} ms");
+
+    // ── 4. 32x32 and stride 2.
+    chain_case(
+        &mut dev,
+        "4a. 32x32 3x3 16->16 -> 16->16",
+        &[
+            conv_at(3, 1, 32, 16, 16, 31, (100, 0), true),
+            conv_at(3, 1, 32, 16, 16, 32, (0, 120), false),
+        ],
+    )
+    .await;
+    chain_case(
+        &mut dev,
+        "4b. 32x32 16->32 stride 2 -> 16x16 32->32",
+        &[
+            conv_at(3, 2, 32, 16, 32, 33, (128, 0), true),
+            conv_at(3, 1, 16, 32, 32, 34, (0, 125), false),
+        ],
+    )
+    .await;
+    chain_case(
+        &mut dev,
+        "4c. 32x32 1x1 16->32 stride 2 -> 16x16 32->32",
+        &[
+            conv_at(1, 2, 32, 16, 32, 35, (128, 110), false),
+            conv_at(3, 1, 16, 32, 32, 36, (110, 125), false),
+        ],
+    )
+    .await;
+    chain_case(
+        &mut dev,
+        "4d. ResNet-8 stages 1-2 convs: 32x32 x3 -> stride 2 -> 16x16",
+        &[
+            conv_at(3, 1, 32, 16, 16, 37, (128, 0), true),
+            conv_at(3, 1, 32, 16, 16, 38, (0, 0), true),
+            conv_at(3, 1, 32, 16, 16, 39, (0, 0), true),
+            conv_at(3, 2, 32, 16, 32, 40, (0, 0), true),
+            conv_at(3, 1, 16, 32, 32, 41, (0, 125), false),
+        ],
+    )
+    .await;
+    chain_case(
+        &mut dev,
+        "4e. 32x32 16->32 -> 32->32 -> stride 2 32->32 -> 16x16",
+        &[
+            conv_at(3, 1, 32, 16, 32, 42, (128, 0), true),
+            conv_at(3, 1, 32, 32, 32, 43, (0, 0), true),
+            conv_at(3, 2, 32, 32, 32, 44, (0, 0), true),
+            conv_at(3, 1, 16, 32, 16, 45, (0, 125), false),
+        ],
+    )
+    .await;
 }

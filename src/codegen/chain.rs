@@ -5,7 +5,14 @@
 //! epilogue, the inner `halt` / `end` framing is dropped, the tile
 //! instructions' sequence numbers continue from one part to the next, and
 //! relocations move with their part.
+//!
+//! [`convs`] chains convolutions with the activations kept on chip: each
+//! conv writes its output into the next one's padded patch in narrow
+//! memory ([`conv::Io`]), two patch buffers in turn above every layer's
+//! own buffers. Only the first layer's input comes from the host and only
+//! the last one's output goes back.
 
+use super::conv::{self, Conv};
 use super::*;
 use crate::isa;
 
@@ -70,4 +77,50 @@ pub fn rename(chunk: &mut ChunkInfo, from: &str, to: &str) {
             r.name = to.to_string();
         }
     }
+}
+
+/// Narrow memory per tile (bytes).
+pub const NARROW_BYTES: i64 = 192 * 1024;
+
+/// The two narrow byte addresses the patches of a conv chain alternate
+/// between: above every layer's own buffers, each big enough for the
+/// largest patch.
+pub fn conv_buffers(layers: &[&Conv]) -> Result<[i64; 2], Error> {
+    let up = |n: i64| (n + 255) / 256 * 256;
+    let end = layers.iter().map(|c| c.narrow_end()).max().unwrap_or(0);
+    let patch = layers
+        .iter()
+        .skip(1)
+        .map(|c| c.input_patch().tp())
+        .max()
+        .unwrap_or(0);
+    let bufs = [up(end), up(end) + up(patch)];
+    if bufs[1] + patch > NARROW_BYTES {
+        return Err(format!(
+            "conv chain: patches at {bufs:#x?} of {patch} B do not fit narrow memory"
+        )
+        .into());
+    }
+    Ok(bufs)
+}
+
+/// One program running `layers` (each with its parameters cached at its
+/// wide base) in order, the activations staying on chip. Its input layer is
+/// the first conv's (`input`), its output the last one's (`output`).
+pub fn convs(layers: &[(&Conv, i64)]) -> Result<ChunkInfo, Error> {
+    let convs: Vec<&Conv> = layers.iter().map(|l| l.0).collect();
+    let buf = conv_buffers(&convs)?;
+    let n = layers.len();
+    let parts = layers
+        .iter()
+        .enumerate()
+        .map(|(i, &(c, base))| {
+            let io = conv::Io {
+                input_at: (i > 0).then(|| buf[(i + 1) % 2]),
+                output_to: (i + 1 < n).then(|| (buf[i % 2], convs[i + 1].input_patch())),
+            };
+            c.chain_program(base, io)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    splice(&parts)
 }

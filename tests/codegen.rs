@@ -911,3 +911,50 @@ fn splice_keeps_programs_well_formed() {
     assert_eq!(count(D::BASE_ADDRESS_INPUT_ACTIVATION), 2);
     assert_eq!(count(D::BASE_ADDRESS_OUTPUT_ACTIVATION), 2);
 }
+
+/// `chain::convs` places the patch buffers above every layer's own narrow
+/// memory, and refuses chains whose output does not fill the next patch
+/// (16x16 stride 2 -> an 8x8 image the generators do not lay out).
+#[test]
+fn conv_chain_planning() {
+    use reef_infer::codegen::chain::{conv_buffers, convs};
+    let conv = |k: usize, stride: usize, hw: usize, cin: usize, cout: usize| Conv {
+        cin,
+        cout,
+        k,
+        stride,
+        width: hw,
+        height: hw,
+        weights: vec![1; cout * k * k * cin],
+        w_scale: vec![0.001; cout],
+        bias: vec![0; cout],
+        input: Quant {
+            scale: 0.03,
+            zero_point: 128,
+        },
+        output: Quant {
+            scale: 0.2,
+            zero_point: 128,
+        },
+        relu: false,
+    };
+    let (a, b, c) = (
+        conv(3, 1, 32, 16, 32),
+        conv(3, 1, 32, 32, 32),
+        conv(3, 2, 32, 32, 32),
+    );
+    let bufs = conv_buffers(&[&a, &b, &c]).unwrap();
+    for l in [&a, &b, &c] {
+        assert!(bufs[0] >= l.narrow_end());
+    }
+    // 32x32 Cin 32: the layer's own buffers end past 0x1000
+    assert!(b.narrow_end() > 0x1000);
+    assert!(bufs[1] >= bufs[0] + b.input_patch().tp().max(c.input_patch().tp()));
+    assert!(convs(&[(&a, 0), (&b, 0x400), (&c, 0x800)]).is_ok());
+    // 32x32 stride 1 -> 16x16: 8x8 pixels per tile do not fill a 4x4 patch
+    let d = conv(3, 1, 16, 32, 32);
+    assert!(convs(&[(&b, 0), (&d, 0x400)]).is_err());
+    // 16x16 stride 2 -> 8x8: not laid out on the 4x4 grid
+    let (e, f) = (conv(3, 2, 16, 32, 32), conv(3, 1, 16, 32, 32));
+    assert!(convs(&[(&e, 0), (&f, 0x400)]).is_err());
+}

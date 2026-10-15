@@ -973,9 +973,34 @@ TPU:
 3. **Speed:** those three convs take 0.81 ms as one chained call against
    2.22 ms as three calls.
 
-Limits so far: 16x16, stride 1, conv only (`chain_program` refuses
-others). Next for ResNet-8: chaining at 32x32 (superpixel patches,
-4-row bands) and stride 2, add (two patches, the shortcut kept alive in
-narrow memory), native 8x8 layers instead of host padding, and pool -> FC
-from tile 0.
+**32x32 and stride 2** (same day). At 32x32 a tile's patch is 4 x 8
+superpixels of 2 pixels, and a real pixel's bytes are still contiguous
+along a row, so the same words / x / y write walk fills it (row stride
+the padded superpixel row). A 32x32 stride-2 conv leaves 4x4 pixels per
+tile, exactly a 16x16 patch. `chain_program` now accepts any producer
+whose output pixels per tile fill the next patch's interior (rows = its
+rows, columns = 4 superpixels), and a consumer of any supported size
+(not Cin 1 / 3, which widen the host input). The consumer needed no
+change: the 4-row band loader and its copies are skipped together.
+
+Narrow placement: a layer's own buffers (padded patch, two input landing
+buffers, constants, host output at `tp`) end at `Conv::narrow_end`; at
+32x32 Cin 32 that is past 0x1000, so fixed buffers no longer do.
+`chain::convs` puts the two patch buffers above the largest
+`narrow_end` of the chain and splices the parts.
+
+On the TPU (`examples/chain_hw.rs`, 10 inputs each, all bit-exact):
+
+| chain | separate calls | one call |
+|---|---|---|
+| 32x32 3x3 16 -> 16 -> 16 | 2.45 ms | 1.32 ms |
+| 32x32 3x3 16 -> 32 stride 2, 16x16 32 -> 32 | 1.86 ms | 1.14 ms |
+| 32x32 1x1 16 -> 32 stride 2, 16x16 32 -> 32 | 1.85 ms | 1.12 ms |
+| ResNet-8's convs through stages 1-2 (3 at 32x32, stride 2, 16x16) | 5.58 ms | 1.41 ms |
+| 32x32 16 -> 32 -> 32, stride 2 32 -> 32, 16x16 32 -> 16 | 5.76 ms | 1.20 ms |
+
+Not chained: 16x16 stride 2 -> 8x8 (2x2 pixels per tile; the generators
+have no 8x8 layout, the graph pads 8x8 to 16x16 on the host). Next for
+ResNet-8: add (two patches, the shortcut kept alive in narrow memory),
+native 8x8 layers, and pool -> FC from tile 0.
 

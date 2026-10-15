@@ -132,9 +132,10 @@ item 4 below matters most.
    generators become emitters for a plan.
 4. **On-chip chaining** (milestone 4): the biggest performance step;
    depends on 2 and 3. Started (2026-10-15): programs splice into one
-   call (`codegen::chain`), and 16x16 stride-1 convs hand their output to
-   the next conv's patch in narrow memory, bit-exact (three convs: 0.81 ms
-   in one call, 2.22 ms as three).
+   call (`codegen::chain`), and convs hand their output to the next conv's
+   patch in narrow memory at 16x16, 32x32 and across 32x32 stride 2 ->
+   16x16, bit-exact (ResNet-8's five stage 1-2 convs: 1.41 ms in one call,
+   5.58 ms as five). Next: add with a kept shortcut, native 8x8, pool -> FC.
 
 ## Not planned
 

@@ -488,6 +488,52 @@ async fn chained(dev: &mut Device, seed: &mut u64) {
         let got = dev.run_inference(&loaded, x.clone()).await.unwrap();
         assert!(got == b.reference(&a.reference(&x)), "chained conv -> conv");
     }
+
+    // 32x32 -> 32x32 -> stride 2 -> 16x16, 1x1 and 3x3, through
+    // `chain::convs`
+    let sized = |seed: &mut u64, k, stride, hw, cin, cout, zp, relu| Conv {
+        k,
+        stride,
+        width: hw,
+        height: hw,
+        weights: bytes(seed, cout * k * k * cin)
+            .iter()
+            .map(|&b| b as i8)
+            .collect(),
+        ..conv(seed, cin, cout, zp, relu)
+    };
+    let layers = [
+        sized(seed, 3, 1, 32, 16, 32, (128, 0), true),
+        sized(seed, 1, 2, 32, 32, 64, (0, 0), true),
+        sized(seed, 3, 1, 16, 64, 32, (0, 120), false),
+    ];
+    let mut next = 0;
+    let mut pairs = Vec::new();
+    for c in &layers {
+        dev.load_params(Arc::new(c.build_at(next).unwrap()))
+            .await
+            .unwrap();
+        pairs.push((c, next));
+        next += c.wide_units();
+    }
+    let (mut first, mut last) = (layers[0].build().unwrap(), layers[2].build().unwrap());
+    let model = TfliteModel {
+        executables: vec![ExecInfo {
+            exec_type: ExecutableType::EXECUTION_ONLY,
+            parameters: vec![],
+            instruction_chunks: vec![reef_infer::codegen::chain::convs(&pairs).unwrap()],
+            input_layers: first.executables[0].input_layers.drain(..).collect(),
+            output_layers: last.executables[0].output_layers.drain(..).collect(),
+            scratch_size_bytes: 0,
+        }],
+    };
+    let loaded = dev.load_params(Arc::new(model)).await.unwrap();
+    for _ in 0..3 {
+        let x = bytes(seed, 32 * 32 * 16);
+        let want = layers.iter().fold(x.clone(), |y, c| c.reference(&y));
+        let got = dev.run_inference(&loaded, x).await.unwrap();
+        assert!(got == want, "chained 32x32 -> stride 2 -> 16x16");
+    }
 }
 
 /// Generated loopback: tile `SRC` -> scalar memory -> all 16 tiles. The
