@@ -282,8 +282,15 @@ async fn generated_programs_on_tpu() {
         (3, 1, 32, 16, 16, 32, false, 128, 128),
         (3, 2, 64, 32, 16, 32, false, 120, 130),
         (3, 1, 64, 64, 16, 8, true, 128, 0),
-        // the MNIST CNN's first conv (28x28 padded to 32, Cin 1 as 16)
+        // the MNIST CNN's first conv (28x28 padded to 32), Cin 1 padded to
+        // 16 and natively
         (3, 1, 32, 32, 16, 32, true, 0, 0),
+        // first layers on an image at 32x32: Cin 1 / 3 in the compiler's
+        // layout (8x8 pixels per tile, one word each)
+        (3, 1, 32, 32, 1, 32, true, 0, 0),
+        (3, 1, 32, 32, 3, 16, true, 128, 0),
+        (3, 1, 32, 32, 3, 32, false, 100, 120),
+        (3, 1, 32, 32, 1, 16, false, 30, 128),
         // ResNet-8: 32x32 stage, stride-2 downsampling with 1x1 shortcuts
         (3, 1, 32, 32, 16, 16, true, 0, 0),
         (3, 1, 32, 32, 16, 16, false, 0, 122),

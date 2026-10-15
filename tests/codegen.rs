@@ -551,7 +551,7 @@ fn mnist_cnn_graph_matches_tflite() {
     assert_eq!(
         kinds,
         [
-            "conv32x32:16",
+            "conv32x32:1",
             "pool32x32",
             "conv16x16:32",
             "pool16x16",
@@ -825,7 +825,9 @@ fn resnet8_graph_matches_tflite() {
     // every layer's parameters at its own wide range, back to back
     let bases = g.wide_bases().unwrap();
     let end = bases[13] + g.steps[13].layer.wide_units();
-    assert_eq!(end, 0x7a8);
+    assert_eq!(end, 0x73c);
+    // the first conv takes the RGB image as is (3 channels, 3 KB)
+    assert!(matches!(&g.steps[0].layer, Layer::Conv(c) if c.cin == 3));
     let px = g.input_len();
     for i in 0..100 {
         let y = u8_to_i8(&g.reference(&images[px * i..px * (i + 1)]));

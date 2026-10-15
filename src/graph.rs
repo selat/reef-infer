@@ -35,7 +35,8 @@
 //! For a same-padding conv with stride 1 the zero-point rows are exactly
 //! TensorFlow's padding, and a 2x2 pool never reads them for the outputs
 //! kept, so the result is exact. Channels a conv generator does not take
-//! (Cin 1 at 32x32) are padded to 16 with zero weights.
+//! are padded to 16 with zero weights (Cin 1 / 3 it takes at 16x16 and
+//! 32x32, so an image goes to the TPU unpadded).
 
 use std::collections::HashMap;
 use std::ops::Range;

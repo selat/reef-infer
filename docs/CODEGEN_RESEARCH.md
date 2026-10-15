@@ -1102,3 +1102,38 @@ channels on the host) and gets 16 B back; the compiled model sends 25.5
 KB and 3 KB. The synthetic stage-3 hardware test now also ends in an FC
 (a mutation shifting the FC's input by one word fails it).
 
+**The image unpadded** (same day). The graph padded a 32x32 RGB (or
+MNIST's 1-channel) image to 16 channels because the conv generator took
+Cin 1 / 3 only at 16x16. The corpus now has Cin 1 / 3 convs at 32x32
+(`tools/isa_corpus/gen.py`: Cout 16 / 32, compiled with the local
+`edgetpu_compiler` 16.0). The compiler's program there keeps no
+superpixels: each tile holds its 8x8 pixels one word each (Cin padded to
+4 by the copy op), in a 10x10-word padded patch, loaded as one 8-row band
+(three wide words per row of 4 tiles). Against the 16x16 program:
+
+- Narrow placement moves: input landing at 0 (second buffer 0x100),
+  constants at 0x200, the host output at 0 and the patch right above it
+  (0x400 for Cout 16, 0x800 for Cout 32).
+- The loader follows the big-Cin formulas, not the 16x16 Cin 1 / 3 ones:
+  a linear 3-word buffer (`w_lim0`, consumer `cnt0` 2, mode 1), head =
+  row words - 1 - skip, tail = skip, no head on column 0, and the
+  `counters 0x800` sync. Generally: row words = columns x host bytes per
+  column, skip = column x row words / 4.
+- The widening copy ops scale with the row (8 pixels, 8 rows: `loop1`,
+  `loop3`, the input walk by `u` = columns / 4, the output walk from the
+  padded row). The last row's copy has `cfg1` 0x26b and `sync0` 14 / 43
+  (Cin 1 / 3), transcribed, not derived.
+
+The conv generator now uses that layout for Cin 1 / 3 at 32x32 (`spx` 1,
+8 columns; the op, halo and output already work from the patch). All 7
+corpus Cin 1 / 3 convs (16x16 and 32x32) are byte-identical, and 4 shapes
+are bit-exact on the TPU. Since a chained conv writes into the next
+layer's patch with its own output walk, the first layer's layout does not
+have to match the next one's superpixels.
+
+ResNet-8 sends 3072 B per call (16384 before; the compiled model 3072),
+31.1 KB of instructions: all 10000 images bit-exact, **1.60 ms per
+image** (`bench_compare`: 1.59 ms against the compiler's 0.97 ms, 1.6x).
+The MNIST CNN's first conv also takes its image unpadded: 5.02 ms per
+image (5.41).
+

@@ -111,14 +111,15 @@ top-1 as TFLite CPU. The items it did not need stay open.
 ## Speed today (2026-10-15)
 
 ResNet-8 on CIFAR-10, same `.tflite` and TPU (`examples/bench_compare.rs`):
-`edgetpu_compiler` 1.00 ms per image, ours 1.93 ms in one call: every
+`edgetpu_compiler` 0.97 ms per image, ours 1.59 ms in one call: every
 layer on chip (nine convs, three residual adds, stage 3 natively at 8x8,
 the global average pool and the FC), every layer's parameters cached
-once at its own wide address (2.2 ms with 2 calls, 6.9 ms with 7, 14.8
-ms with 14, 25.6 ms when every layer reloaded its parameters). Per call
-we still send 32.6 KB of instructions and a 16 KB input (Cin 3 padded to
-16 on the host) against the compiled model's 25.5 KB and 3 KB. Item 4
-below (on-chip chaining) brought most of the speedup.
+once at its own wide address, the image sent unpadded (1.93 ms with it
+padded to 16 channels, 2.2 ms with 2 calls, 6.9 ms with 7, 14.8 ms with
+14, 25.6 ms when every layer reloaded its parameters). Per call we send
+31.1 KB of instructions and 3 KB of input against the compiled model's
+25.5 KB and 3 KB. Item 4 below (on-chip chaining) brought most of the
+speedup.
 
 ## Cross-cutting, in order of when they start to matter
 
@@ -141,9 +142,9 @@ below (on-chip chaining) brought most of the speedup.
    5.58 ms as five). Residual adds chain too, the shortcuts kept in narrow
    memory (`chain::plan`), and `Graph::run` makes one call per chain.
    With native 8x8 layers, the pool reading from narrow memory and the FC
-   reading the pool's output on tile 0, ResNet-8 runs in one call. Next:
-   the Cin 3 input unpadded (16 KB -> 3 KB per call) and shorter
-   instruction streams.
+   reading the pool's output on tile 0, ResNet-8 runs in one call, its
+   image sent unpadded (Cin 1 / 3 at 32x32 in the compiler's layout).
+   Next: shorter instruction streams.
 
 ## Not planned
 

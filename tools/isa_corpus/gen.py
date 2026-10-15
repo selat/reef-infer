@@ -81,6 +81,12 @@ def configs():
         (32, 16, 16, 3, 1, "none"),
         (8, 64, 64, 3, 1, "none"),
         (16, 64, 64, 3, 1, "none"),
+        # first layers on an image (CIFAR-10 RGB, MNIST padded to 32x32)
+        (32, 3, 16, 3, 1, "relu"),
+        (32, 3, 16, 3, 1, "none"),
+        (32, 3, 32, 3, 1, "none"),
+        (32, 1, 16, 3, 1, "none"),
+        (32, 1, 32, 3, 1, "relu"),
     ]:
         c.append(
             (
