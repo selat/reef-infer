@@ -165,9 +165,8 @@ pub(crate) fn load(
     )?;
     descriptor_addr(a)?;
     descriptor_send(a, 16 * b, TAG_INPUT)?;
-    if b > 256 || th > 2 {
-        // not with one band of 2 rows of up to 256 B per tile (the compiled
-        // 8x8 average pools)
+    if th > 2 {
+        // not with one band of 2 rows (the compiled 8x8 average pools)
         a.emit(OP_SYNC, &[("tiles", ALL_TILES), ("counters", 0x800)])?;
     }
     // Ring -> narrow per tile column: column `col` skips its left

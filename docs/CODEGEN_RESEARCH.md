@@ -1268,7 +1268,7 @@ The C <= 64 family, field by field against the compiler
 - Band loader: an image row of one 256 B slot is staged linearly in `th`
   slots (`w_lim0` = th - 1; ringConsumer mode 1, id 0xb, `cnt0` th - 1),
   the conv loader's one-slot form; the sync before the loader's moves
-  comes with th > 2 as well as above 256 B per tile.
+  comes with th > 2 (with 2 rows a band never, 8x8x128 below).
 - Column gather: above 256 B per tile the patch crosses the gather row in
   whole words (`n_lim0` 63, `n_lim1` / `w_lim0` words - 1) with the row
   gather's sync record.
@@ -1288,5 +1288,33 @@ call, 50 / 50 inputs bit-exact. 8x8x16 needs the band loader below 256 B
 per image row (not derived).
 
 C 128 (8x8, 4x4) splits the channels: tiles 0 and 1 each gather the whole
-image for 64 channels (a strided row gather: 16 of every 32 words per
-pixel), both run the reduction (`tile_mask` 3) and both outfeed. Next.
+image for 64 channels, both run the reduction (`tile_mask` 3) and both
+outfeed. 8x8x128 against the compiler:
+
+- Narrow: the image on each reducing tile is H W 64 bytes, so the patch
+  sits at H W min(C, 64) (16 b only up to C 64); the rest follows it as
+  before (column blocks at +b, forward slots at +5 b).
+- Column gather: unchanged (whole words, 512 B per tile).
+- Row gather: tile h keeps half h of its own column block: narrowToWide
+  from `col + 16 h` words over levels (1, 16), (32, 4), (128, px / 4) (a
+  pixel's 16 words of the half, 4 pixels a wide word), wideToNarrow with
+  the C 64 row walk at x = h tw. The other halves go over the mesh as
+  strided sends (`o_cnt0` 15, `o_inc1` 17, `o_cnt1` 15, `out_mode` 3):
+  tile 0's half 1 eastward to tile 1, then halves 0 of tiles 1-3 and
+  halves 1 of tiles 2-3 westward, each landed at x = t tw.
+- Forward sync counts: s0 = 1024 k + 4 for a tile's k-th forward (bytes
+  already forwarded, not the hop); s1 = s0 + 56, and s0 + 120 for tile 2
+  passing tile 3's half 1 (as compiled, not derived).
+- Regroup: `tile_mask` 3, other undecoded record values, `sync_en1` with
+  `sync_val` 0xffff. Reduction: `tile_mask` 3, `out_ch` 63.
+- Output: one narrowToWide on both tiles, one descriptor of 128 bytes,
+  then an outfeed and ringProducer per tile (`r0_val` = tile), epilogue
+  `thr5` 2; output layout tile offsets 0, 64, then 128, row size 64.
+- Band loader: the sync before the moves comes with th > 2 only (8x8x128
+  has 512 B per tile and none).
+
+Byte-identical; bit-exact on the TPU (compiler form and TFLite int8
+rounding). A PyTorch net (conv to 8x8x32, 1x1 to 128, pool, FC) runs in
+two calls, 50 / 50 inputs bit-exact: the pool ends the first, as tile 1's
+half cannot feed the FC on tile 0. 4x4x128 needs the band loader below
+256 B per image row, like 8x8x16.

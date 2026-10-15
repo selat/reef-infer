@@ -1,9 +1,10 @@
 //! Global AVERAGE_POOL_2D over an `H x W x C` uint8 tensor (classifier
-//! heads), with no parameters: a mesh reduction into tile 0.
+//! heads), with no parameters: a mesh reduction into tile 0 (and tile 1
+//! for channels 64-127).
 //!
 //! Follows `edgetpu_compiler` 16.0's programs (`pool_C*_H*_W*_opavg_padvalid
-//! _size*` in the ISA corpus), byte-identical for 8x8 (C 32 / 64), 16x16
-//! (C 16 / 32 / 64) and 32x32 (C 16). Described for 8x8x64; every narrow
+//! _size*` in the ISA corpus), byte-identical for 8x8 (C 32 / 64 / 128),
+//! 16x16 (C 16 / 32 / 64) and 32x32 (C 16). Described for 8x8x64; every narrow
 //! address scales with the tile patch `b` ([`GlobalAvgPool::layout`]) and
 //! the wide ones with the image:
 //!
@@ -32,8 +33,14 @@
 //! word they arrive in (`64 / col_words` rows); the regroup's undecoded
 //! sync record is there only when a pixel fills a wide word (C 64); and a
 //! wide address below 0x2000 is given in full instead of its low byte in
-//! the top page (`par_sel`). C 128 and above split the channels over tiles
-//! 0 and 1 (corpus), not derived yet.
+//! the top page (`par_sel`).
+//!
+//! C 128 (8x8) splits the channels over tiles 0 and 1: the column gather
+//! as above, then each keeps its 64-channel half of its own column block
+//! (a strided walk, 16 of every 32 words a pixel) and receives that half of
+//! the other row-0 tiles' (tile 0's upper half eastward, the rest westward);
+//! both regroup, reduce and outfeed 64 bytes. Its output leaves only for
+//! the host (a chain ends with it).
 //!
 //! The compiler uses `w_zp = out_zp` = the zero point and `mult = 1 / 64`,
 //! which rounds ties to even. [`GlobalAvgPool::tflite`] instead centres on
@@ -106,16 +113,17 @@ impl GlobalAvgPool {
     pub fn check(&self) -> Result<(), String> {
         // byte-identical to the compiler (corpus) and bit-exact on the TPU:
         // square 8 / 16 / 32, C 16 / 32 / 64 with an image row of at least
-        // 64 words per 4 tiles (the band loader) and at most 1 KiB per tile
+        // 64 words per 4 tiles (the band loader) and at most 1 KiB per tile;
+        // 8x8x128 on two reducing tiles
         let g = Grid::new(self.height, self.width, self.c);
         let ok = self.height == self.width
             && [8, 16, 32].contains(&self.height)
-            && [16, 32, 64].contains(&self.c)
+            && ([16, 32, 64].contains(&self.c) || (self.c == 128 && self.height == 8))
             && g.slots() >= 1
             && g.b() <= 1024;
         if !ok {
             return Err(format!(
-                "global average pool {}x{}x{}: need square 8 / 16 / 32, C 16 / 32 / 64, 256 B per image row and at most 1 KiB per tile",
+                "global average pool {}x{}x{}: need square 8 / 16 / 32, C 16 / 32 / 64 (or 8x8x128), 256 B per image row and at most 1 KiB per tile",
                 self.height, self.width, self.c
             ));
         }
@@ -123,6 +131,17 @@ impl GlobalAvgPool {
             return Err(format!("centre {} outside 0..=255", self.center));
         }
         Ok(())
+    }
+
+    /// Tiles the reduction runs on: tile h sums channels `64 h ..` (one
+    /// tile up to 64 channels, as compiled).
+    pub(crate) fn halves(&self) -> i64 {
+        self.c.div_ceil(64) as i64
+    }
+
+    /// Channels per reducing tile.
+    fn half_c(&self) -> i64 {
+        self.c as i64 / self.halves()
     }
 
     /// Clamp bounds around the centre: the uint8 range.
@@ -183,7 +202,7 @@ impl GlobalAvgPool {
     fn layout(&self) -> Layout {
         let g = Grid::new(self.height, self.width, self.c);
         let b = g.b();
-        let patch = 16 * b;
+        let patch = (self.height * self.width) as i64 * self.half_c();
         Layout {
             const_n: 8 * g.tw * g.c,
             patch,
@@ -216,7 +235,9 @@ impl GlobalAvgPool {
         self.check()?;
         let above = |at: i64| at >= self.narrow_end() && at % 4 == 0;
         let (at, p) = input_at;
-        let out_ok = output_to.is_none_or(|(o, q)| q == self.output_patch() && above(o));
+        // (on chip only from one reducing tile: tile 0 holds every channel)
+        let out_ok = output_to
+            .is_none_or(|(o, q)| self.halves() == 1 && q == self.output_patch() && above(o));
         if p != self.input_patch() || !above(at) || !out_ok {
             return Err(format!(
                 "chained average pool: input {p:?} at {at:#x}, output {output_to:?}; need {:?} / {:?} above {:#x}",
@@ -249,8 +270,11 @@ impl GlobalAvgPool {
         let image_w = 0x2080 - 4 * (self.width * self.height) as i64 / 4;
         let (const_n, const_w) = (l.const_n, image_w - 4);
         let gather_w = const_w - 8;
-        let row_words = self.width as i64 * g.cw(); // one image row
-        let col_words = g.tw * g.cw(); // one tile column's pixels in a row
+        // tile h of the first `halves` gathers and sums channels 64 h..
+        let (halves, hcw) = (self.halves(), self.half_c() / 4);
+        let reducers = (1 << halves) - 1;
+        let row_words = self.width as i64 * hcw; // one image row
+        let col_words = g.tw * hcw; // one tile column's pixels in a row
 
         // where the tiles' patches are: loaded at `patch`, or chained
         let src = input_at.unwrap_or(patch);
@@ -376,89 +400,199 @@ impl GlobalAvgPool {
             });
             f
         };
-        a.emit(
-            OP_NARROW_TO_WIDE,
-            &[
-                ("tile_mask", 1),
-                ("narrow_addr", col / 4),
-                ("n_inc0", 1),
-                ("n_lim0", 63),
-                ("n_inc1", 1),
-                ("n_lim1", block / 256 - 1),
-                ("n_inc2", -(block / 4 - 1)),
-                ("n_inc3", -(block / 4 - 1)),
-                ("n_inc4", -(block / 4 - 1)),
-                ("n_inc5", -(block / 4 - 1)),
-                ("narrow_lvl_mask", 3),
-                ("wide_addr", gather_w),
-                ("w_lim0", block / 256 - 1),
-                ("wide_rows", 1),
-                ("sync_en0", 1),
-                ("sync_id", 0xb),
-                ("sync_en1", 1),
-                ("sync_val", 0xffff),
-                ("sync_en2", 1),
-                ("sync_f45", 1),
-                ("tail_lvl", 1),
-            ],
-        )?;
-        a.emit(
-            OP_WIDE_TO_NARROW,
-            &[
+        let west = |a: &mut Asm, f: Vec<(&str, i64)>| a.emit(MESH_W, &f).map(|_| ());
+        if halves == 1 {
+            a.emit(
+                OP_NARROW_TO_WIDE,
                 &[
                     ("tile_mask", 1),
+                    ("narrow_addr", col / 4),
+                    ("n_inc0", 1),
+                    ("n_lim0", 63),
+                    ("n_inc1", 1),
+                    ("n_lim1", block / 256 - 1),
+                    ("n_inc2", -(block / 4 - 1)),
+                    ("n_inc3", -(block / 4 - 1)),
+                    ("n_inc4", -(block / 4 - 1)),
+                    ("n_inc5", -(block / 4 - 1)),
+                    ("narrow_lvl_mask", 3),
                     ("wide_addr", gather_w),
                     ("w_lim0", block / 256 - 1),
                     ("wide_rows", 1),
-                ][..],
-                &rows(0),
-                &[
                     ("sync_en0", 1),
-                    ("sync_id", 0xd),
+                    ("sync_id", 0xb),
                     ("sync_en1", 1),
-                    ("sync_val", 0x8000),
+                    ("sync_val", 0xffff),
                     ("sync_en2", 1),
+                    ("sync_f45", 1),
+                    ("tail_lvl", 1),
                 ],
-            ]
-            .concat(),
-        )?;
-        let west = |a: &mut Asm, f: Vec<(&str, i64)>| a.emit(MESH_W, &f).map(|_| ());
-        let bwords = block / 4;
-        let send = |tiles: i64| mesh_send(tiles, col, bwords);
-        let recv = |c: i64| -> Vec<(&str, i64)> {
-            // tile 0 lands tile c's block at x = c tw, row after row
-            let at = 4 * c * col_words;
-            let mut f = vec![("tile_mask", 1), ("i_addr", at)];
-            let inc = ["i_inc0", "i_inc1", "i_inc2", "i_inc3"];
-            let cnt = ["i_cnt0", "i_cnt1"];
-            let levels = [(1, col_words), (row_words, self.height as i64)];
-            for (k, (i, n)) in band::walk(&levels, 4).into_iter().enumerate() {
-                f.push((inc[k], i));
-                if k < 2 {
-                    f.push((cnt[k], n));
+            )?;
+            a.emit(
+                OP_WIDE_TO_NARROW,
+                &[
+                    &[
+                        ("tile_mask", 1),
+                        ("wide_addr", gather_w),
+                        ("w_lim0", block / 256 - 1),
+                        ("wide_rows", 1),
+                    ][..],
+                    &rows(0),
+                    &[
+                        ("sync_en0", 1),
+                        ("sync_id", 0xd),
+                        ("sync_en1", 1),
+                        ("sync_val", 0x8000),
+                        ("sync_en2", 1),
+                    ],
+                ]
+                .concat(),
+            )?;
+            let bwords = block / 4;
+            let send = |tiles: i64| mesh_send(tiles, col, bwords);
+            let recv = |c: i64| -> Vec<(&str, i64)> {
+                // tile 0 lands tile c's block at x = c tw, row after row
+                let at = 4 * c * col_words;
+                let mut f = vec![("tile_mask", 1), ("i_addr", at)];
+                let inc = ["i_inc0", "i_inc1", "i_inc2", "i_inc3"];
+                let cnt = ["i_cnt0", "i_cnt1"];
+                let levels = [(1, col_words), (row_words, self.height as i64)];
+                for (k, (i, n)) in band::walk(&levels, 4).into_iter().enumerate() {
+                    f.push((inc[k], i));
+                    if k < 2 {
+                        f.push((cnt[k], n));
+                    }
                 }
+                f.extend([("i_sdims", 3), ("in_mode", 3)]);
+                f
+            };
+            let fwd = |tiles: i64, hop: i64| mesh_fwd(tiles, fwd_w, bwords, hop, (8, 0x14), block);
+            west(&mut a, send(2))?;
+            west(&mut a, recv(1))?;
+            west(&mut a, send(4))?;
+            west(&mut a, fwd(2, 1))?;
+            west(&mut a, recv(2))?;
+            west(&mut a, send(8))?;
+            west(&mut a, fwd(4, 1))?;
+            west(&mut a, fwd(2, 2))?;
+            west(&mut a, recv(3))?;
+        } else {
+            // Two reducing tiles (as compiled for 8x8x128): every row-0
+            // tile's column block holds both channel halves; tile h keeps
+            // half h of its own block and receives half h of the others'
+            // at x = t tw (tile 0's half 1 eastward, the rest westward
+            // through one-slot buffers).
+            let cw = g.cw();
+            let px = block / self.c as i64; // pixels in a column block
+            let hb = block / halves; // a half block's bytes
+            let n = ["n_inc0", "n_inc1", "n_inc2", "n_inc3", "n_inc4", "n_inc5"];
+            for h in 0..halves {
+                // the half's pixels (hcw words at stride cw), 4 a wide word
+                let mut f: Fields = vec![
+                    ("tile_mask", 1 << h),
+                    ("narrow_addr", col / 4 + h * hcw),
+                    ("narrow_lvl_mask", 7),
+                ];
+                let lims = ["n_lim0", "n_lim1", "n_lim2"];
+                let levels = [(1, hcw), (cw, 4), (4 * cw, px / 4)];
+                for (k, (inc, lim)) in band::walk(&levels, 6).into_iter().enumerate() {
+                    f.push((n[k], inc));
+                    if k < 3 {
+                        f.push((lims[k], lim));
+                    }
+                }
+                f.extend([
+                    ("wide_addr", gather_w),
+                    ("w_lim0", px / 4 - 1),
+                    ("wide_rows", 1),
+                    ("sync_en0", 1),
+                    ("sync_id", 0xb),
+                    ("sync_en1", 1),
+                    ("sync_val", 0xffff),
+                    ("sync_en2", 1),
+                    ("sync_f45", 1),
+                    ("tail_lvl", 2),
+                ]);
+                a.emit(OP_NARROW_TO_WIDE, &f)?;
+                a.emit(
+                    OP_WIDE_TO_NARROW,
+                    &[
+                        &[
+                            ("tile_mask", 1 << h),
+                            ("wide_addr", gather_w),
+                            ("w_lim0", px / 4 - 1),
+                            ("wide_rows", 1),
+                        ][..],
+                        &rows(h * col_words),
+                        &[
+                            ("sync_en0", 1),
+                            ("sync_id", 0xd),
+                            ("sync_en1", 1),
+                            ("sync_val", 0x8000),
+                            ("sync_en2", 1),
+                        ],
+                    ]
+                    .concat(),
+                )?;
             }
-            f.extend([("i_sdims", 3), ("in_mode", 3)]);
-            f
-        };
-        let fwd = |tiles: i64, hop: i64| mesh_fwd(tiles, fwd_w, bwords, hop, (8, 0x14), block);
-        west(&mut a, send(2))?;
-        west(&mut a, recv(1))?;
-        west(&mut a, send(4))?;
-        west(&mut a, fwd(2, 1))?;
-        west(&mut a, recv(2))?;
-        west(&mut a, send(8))?;
-        west(&mut a, fwd(4, 1))?;
-        west(&mut a, fwd(2, 2))?;
-        west(&mut a, recv(3))?;
+            // tile t sends half h of its block: the pixels' hcw words
+            let send = |t: i64, h: i64| -> Fields {
+                let mut f = vec![("tile_mask", 1 << t), ("o_addr", col + 4 * h * hcw)];
+                let inc = ["o_inc0", "o_inc1", "o_inc2", "o_inc3"];
+                let cnt = ["o_cnt0", "o_cnt1"];
+                for (k, (i, n)) in band::walk(&[(1, hcw), (cw, px)], 4).into_iter().enumerate() {
+                    f.push((inc[k], i));
+                    if k < 2 {
+                        f.push((cnt[k], n));
+                    }
+                }
+                f.extend([("o_sdims", 3), ("out_mode", 3)]);
+                f
+            };
+            // tile h lands tile t's half at x = t tw
+            let recv = |h: i64, t: i64| -> Fields {
+                let mut f = vec![("tile_mask", 1 << h), ("i_addr", 4 * t * col_words)];
+                let inc = ["i_inc0", "i_inc1", "i_inc2", "i_inc3"];
+                let cnt = ["i_cnt0", "i_cnt1"];
+                let levels = [(1, col_words), (row_words, self.height as i64)];
+                for (k, (i, n)) in band::walk(&levels, 4).into_iter().enumerate() {
+                    f.push((inc[k], i));
+                    if k < 2 {
+                        f.push((cnt[k], n));
+                    }
+                }
+                f.extend([("i_sdims", 3), ("in_mode", 3)]);
+                f
+            };
+            a.emit(OP_MESH_E, &send(0, 1))?;
+            a.emit(OP_MESH_E, &recv(1, 0))?;
+            // forwards so far per tile: their sync records count on from
+            // the bytes already forwarded
+            let mut done = [0i64; 4];
+            for (h, t) in [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3)] {
+                west(&mut a, send(t, h))?;
+                for m in (h + 1..t).rev() {
+                    let s0 = hb * done[m as usize] + 4;
+                    // (the out side's count: as compiled, not derived)
+                    let s1 = s0 + if (h, t) == (1, 3) { 120 } else { 56 };
+                    done[m as usize] += 1;
+                    west(
+                        &mut a,
+                        mesh_fwd_at(1 << m, fwd_w, hb / 4, (8, 0x14), (s0, s1)),
+                    )?;
+                }
+                west(&mut a, recv(h, t))?;
+            }
+        }
         sync(&mut a, 0x1ffff, 0x3ff, false)?;
 
         // ── The constant 1 on the input path; the image regrouped into wide
-        // words of 4 pixels (the max pool's regroup, one 64-channel block).
+        // words of 4 pixels (the max pool's regroup, one 64-channel block),
+        // on each reducing tile.
         a.emit(
             OP_MESH_N,
             &[
-                ("tile_mask", 1),
+                ("tile_mask", reducers),
                 ("i_addr", one),
                 ("i_inc0", 1),
                 ("fill_en", 1),
@@ -466,7 +600,7 @@ impl GlobalAvgPool {
             ],
         )?;
         sync(&mut a, 0, 0x3ff, false)?;
-        let (cw, px) = (g.cw(), self.width as i64);
+        let (cw, px) = (hcw, self.width as i64);
         let wg = px * self.height as i64 / 4; // wide words
         let levels = [
             (cw, 4),
@@ -475,7 +609,7 @@ impl GlobalAvgPool {
             (px * cw, self.height as i64),
         ];
         let mut f: Vec<(&str, i64)> = vec![
-            ("tile_mask", 1),
+            ("tile_mask", reducers),
             ("narrow_lvl_mask", 0xf),
             ("wide_addr", image_w),
             ("w_inc0", 1),
@@ -503,6 +637,20 @@ impl GlobalAvgPool {
             // the record only when a pixel fills a wide word (as compiled)
             f.retain(|&(n, _)| !n.starts_with("rsv") && n != "sync_val");
             f.push(("sync_en2", 0));
+        } else if halves > 1 {
+            // two reducing tiles: other record values (as compiled)
+            f.retain(|&(n, _)| !n.starts_with("rsv") && n != "sync_val" && n != "sync_en1");
+            f.extend([
+                ("sync_en1", 1),
+                ("sync_val", 0xffff),
+                ("rsv554", 0x1),
+                ("rsv589", 0x1ffff84),
+                ("rsv621", 0xfffe1900),
+                ("rsv653", 0xf8540007),
+                ("rsv685", 0xd0001fff),
+                ("rsv717", 0x7fffe0),
+                ("rsv749", 0x40),
+            ]);
         }
         let n = ["n_inc0", "n_inc1", "n_inc2", "n_inc3", "n_inc4", "n_inc5"];
         let lims = ["n_lim0", "n_lim1", "n_lim2", "n_lim3"];
@@ -519,7 +667,7 @@ impl GlobalAvgPool {
         let (lo, hi) = self.clamp();
         let (wx, wy) = (px - 1, self.height as i64 - 1);
         let mut f: Vec<(&str, i64)> = vec![
-            ("tile_mask", 1),
+            ("tile_mask", reducers),
             ("loop0", wx),
             ("loop1", wy),
             ("in_base", one),
@@ -573,8 +721,8 @@ impl GlobalAvgPool {
             ("w_zp", self.center as i64),
             ("dp_mode", 4),
             ("reduce_mask", 3),
-            ("out_ch_last", self.c as i64 - 1),
-            ("out_ch", self.c as i64 - 1),
+            ("out_ch_last", self.half_c() - 1),
+            ("out_ch", self.half_c() - 1),
             ("mult_bits", self.mult.to_bits() as i64),
             ("clamp_max_bits", hi.to_bits() as i64),
             ("clamp_min_bits", lo.to_bits() as i64),
@@ -598,13 +746,13 @@ impl GlobalAvgPool {
             });
         }
 
-        // ── Output: tile 0's `c` bytes -> wide 0x2078 -> host.
+        // ── Output: each reducing tile's channels -> wide 0x2078 -> host.
         load_output_addr(&mut a, OUT_NAME)?;
         descriptor_addr(&mut a)?;
         a.emit(
             OP_NARROW_TO_WIDE,
             &[
-                &[("tile_mask", 1), ("narrow_addr", patch / 4)][..],
+                &[("tile_mask", reducers), ("narrow_addr", patch / 4)][..],
                 &walk1(cw - 1),
                 &[
                     ("wide_addr", 0x2078),
@@ -624,34 +772,37 @@ impl GlobalAvgPool {
             ]
             .concat(),
         )?;
-        let ob = self.c as i64;
-        descriptor_send(&mut a, ob, TAG_OUTPUT)?;
-        a.emit(
-            OP_OUTFEED,
-            &[("d0_limit", ob / 8 - 1), ("k173", 3), ("f222", 0x7f)],
-        )?;
-        a.emit(
-            OP_RING_PRODUCER,
-            &[
-                ("tile_mask", 1),
-                ("addr", 0x2078),
-                ("inc0", 1),
-                ("sdims", 1),
-                ("cbuf", 1),
-                ("slots", 1),
-                ("mode", 3),
-                ("pcfg", 0x14),
-                ("r0_id", 0x51),
-                ("r0_en_a", 1),
-                ("r0_en_b", 1),
-                ("r1_id", 0x2d),
-                ("r1_val", 1),
-                ("r1_en_a", 1),
-                ("r1_en_b", 1),
-                ("dest", 0x10000),
-            ],
-        )?;
-        epilogue(&mut a, 1, 0)?;
+        descriptor_send(&mut a, self.c as i64, TAG_OUTPUT)?;
+        let ob = self.half_c();
+        for h in 0..halves {
+            a.emit(
+                OP_OUTFEED,
+                &[("d0_limit", ob / 8 - 1), ("k173", 3), ("f222", 0x7f)],
+            )?;
+            a.emit(
+                OP_RING_PRODUCER,
+                &[
+                    ("tile_mask", 1 << h),
+                    ("addr", 0x2078),
+                    ("inc0", 1),
+                    ("sdims", 1),
+                    ("cbuf", 1),
+                    ("slots", 1),
+                    ("mode", 3),
+                    ("pcfg", 0x14),
+                    ("r0_id", 0x51),
+                    ("r0_val", h),
+                    ("r0_en_a", 1),
+                    ("r0_en_b", 1),
+                    ("r1_id", 0x2d),
+                    ("r1_val", 1),
+                    ("r1_en_a", 1),
+                    ("r1_en_b", 1),
+                    ("dest", 0x10000),
+                ],
+            )?;
+        }
+        epilogue(&mut a, halves, 0)?;
 
         Ok(Program {
             chunk: a.finish()?,
@@ -662,13 +813,14 @@ impl GlobalAvgPool {
                 output_layout: Some(OutputLayoutInfo {
                     y_coordinate_to_linear_tile_id_map: vec![0],
                     x_coordinate_to_linear_tile_id_map: vec![0],
-                    // tile 0 holds everything; the others are past its bytes
+                    // the reducing tiles hold `half_c` channels each, in
+                    // order; the others are past their bytes
                     linearized_tile_byte_offset: (0..16)
-                        .map(|t| if t == 0 { 0 } else { self.c as i32 })
+                        .map(|t| (t.min(halves) * ob) as i32)
                         .collect(),
                     x_coordinate_to_local_byte_offset: vec![0],
                     y_coordinate_to_local_y_offset: vec![0],
-                    x_coordinate_to_local_y_row_size: vec![self.c as i32],
+                    x_coordinate_to_local_y_row_size: vec![ob as i32],
                 }),
                 ..layer(OUT_NAME, (1, 1, self.c), self.quant)
             },
@@ -768,8 +920,20 @@ fn mesh_fwd(
     at: i64,
     words: i64,
     hop: i64,
-    (id0, id1): (i64, i64),
+    ids: (i64, i64),
     bytes: i64,
+) -> Vec<(&'static str, i64)> {
+    let vals = (bytes * (hop - 1) + 4, bytes * hop - 4);
+    mesh_fwd_at(tiles, at, words, ids, vals)
+}
+
+/// [`mesh_fwd`] with the sync records' counts given.
+fn mesh_fwd_at(
+    tiles: i64,
+    at: i64,
+    words: i64,
+    (id0, id1): (i64, i64),
+    (val0, val1): (i64, i64),
 ) -> Vec<(&'static str, i64)> {
     vec![
         ("tile_mask", tiles),
@@ -782,11 +946,11 @@ fn mesh_fwd(
         ("out_mode", 1),
         ("in_mode", 1),
         ("s0_id", id0),
-        ("s0_val", bytes * (hop - 1) + 4),
+        ("s0_val", val0),
         ("s0_en_a", 1),
         ("s0_en_b", 1),
         ("s1_id", id1),
-        ("s1_val", bytes * hop - 4),
+        ("s1_val", val1),
         ("s1_en_a", 1),
         ("s1_en_b", 1),
         ("s2_id", 1),

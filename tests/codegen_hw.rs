@@ -235,7 +235,7 @@ async fn generated_programs_on_tpu() {
         GlobalAvgPool::tflite(8, 8, 64, q, true).unwrap(),
         GlobalAvgPool::tflite(8, 8, 64, q, false).unwrap(),
     ];
-    for (hw, c) in [(8, 32), (16, 16), (16, 32), (16, 64), (32, 16)] {
+    for (hw, c) in [(8, 32), (8, 128), (16, 16), (16, 32), (16, 64), (32, 16)] {
         let n = (hw * hw) as f32;
         pools.push(GlobalAvgPool {
             height: hw,

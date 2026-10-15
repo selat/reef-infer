@@ -675,7 +675,15 @@ fn pool_matches_compiler() {
 /// = zero point, mult 1 / n): instructions and output layout.
 #[test]
 fn avg_pool_matches_compiler() {
-    for (hw, c) in [(8, 64), (8, 32), (16, 16), (16, 32), (16, 64), (32, 16)] {
+    for (hw, c) in [
+        (8, 64),
+        (8, 32),
+        (8, 128),
+        (16, 16),
+        (16, 32),
+        (16, 64),
+        (32, 16),
+    ] {
         let name = format!("pool/pool_C{c}_H{hw}_W{hw}_opavg_padvalid_size{hw}_stride{hw}");
         let Some(path) = corpus(&name) else {
             eprintln!("ISA corpus model {name} not found; skipping");

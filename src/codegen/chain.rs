@@ -155,6 +155,10 @@ pub fn plan(nodes: &[Node]) -> Result<Plan, Error> {
         let want = match node.op {
             Op::Conv(..) => 1,
             Op::Add(_) => 2,
+            // (split over two tiles, its output leaves only for the host)
+            Op::AvgPool(p) if p.halves() > 1 && k + 1 < n => {
+                return Err(format!("chain: a {}-channel pool must come last", p.c).into());
+            }
             Op::AvgPool(_) => 1,
             Op::Fc(..) if k + 1 == n => 1,
             Op::Fc(..) => return Err("chain: an FC must come last".into()),
